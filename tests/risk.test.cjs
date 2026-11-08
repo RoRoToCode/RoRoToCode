@@ -5,7 +5,7 @@
 const test = require('node:test')
 const assert = require('node:assert')
 const path = require('node:path')
-const { classifyRisk, hardBlockReason, commandPaths, isOutside } = require('../dist/main/risk.js')
+const { classifyRisk, hardBlockReason, commandPaths, isOutside, tokenizeCommand, resourceCandidates, applyCustomRules } = require('../dist/main/risk.js')
 
 const WS = path.resolve('C:/work/demo')
 
@@ -69,4 +69,69 @@ test('isOutside 判断相对与绝对路径', () => {
   assert.strictEqual(isOutside(WS, 'src/a.ts'), false)
   assert.strictEqual(isOutside(WS, '../a.ts'), true)
   assert.strictEqual(isOutside(WS, path.resolve('C:/elsewhere')), true)
+})
+
+test('tokenizeCommand 把命令切成可执行词 + 参数', () => {
+  assert.deepStrictEqual(tokenizeCommand('npm test --watch'), ['npm', 'test', '--watch'])
+  assert.deepStrictEqual(tokenizeCommand('git commit -m "hello world"'), ['git', 'commit', '-m', 'hello world'])
+  // 命令串联符是分隔符，不参与 token
+  const chained = tokenizeCommand('echo a && echo b')
+  assert.ok(chained.includes('echo'))
+  assert.ok(!chained.includes('&&'))
+})
+
+test('resourceCandidates：run_shell 返回完整串 + 首个可执行词', () => {
+  const got = resourceCandidates('run_shell', { command: 'npm run build' })
+  assert.ok(got.includes('npm run build'))
+  assert.ok(got.includes('npm'))
+})
+
+test('resourceCandidates：patch 逐条取 path / new_path', () => {
+  const got = resourceCandidates('patch', {
+    edits: [{ path: 'src/a.ts', old_string: 'x', new_string: 'y' }, { op: 'move', path: 'b.ts', new_path: 'c.ts' }]
+  })
+  assert.ok(got.includes('src/a.ts'))
+  assert.ok(got.includes('c.ts'))
+})
+
+test('applyCustomRules：deny 命中返回 deny', () => {
+  const r = applyCustomRules('run_shell', { command: 'rm -rf dist' }, [
+    { action: 'run_shell', resource: 'rm*', effect: 'deny' }
+  ])
+  assert.strictEqual(r, 'deny')
+})
+
+test('applyCustomRules：allow 命中返回 allow（按命令名 token 匹配）', () => {
+  const r = applyCustomRules('run_shell', { command: 'npm test' }, [
+    { action: 'run_shell', resource: 'npm', effect: 'allow' }
+  ])
+  assert.strictEqual(r, 'allow')
+})
+
+test('applyCustomRules：action 不匹配不命中', () => {
+  const r = applyCustomRules('patch', { edits: [{ path: 'a.ts' }] }, [
+    { action: 'run_shell', resource: '*', effect: 'deny' }
+  ])
+  assert.strictEqual(r, null)
+})
+
+test('applyCustomRules：最后一条命中的生效（顺序覆盖）', () => {
+  const rules = [
+    { action: 'run_shell', resource: '*', effect: 'deny' },
+    { action: 'run_shell', resource: 'npm*', effect: 'allow' }
+  ]
+  const r = applyCustomRules('run_shell', { command: 'npm test' }, rules)
+  assert.strictEqual(r, 'allow')
+})
+
+test('applyCustomRules：无规则 / 空规则返回 null', () => {
+  assert.strictEqual(applyCustomRules('run_shell', { command: 'x' }, undefined), null)
+  assert.strictEqual(applyCustomRules('run_shell', { command: 'x' }, []), null)
+})
+
+test('applyCustomRules：resource 为 * 通配所有', () => {
+  const r = applyCustomRules('run_shell', { command: 'anything' }, [
+    { action: '*', resource: '*', effect: 'deny' }
+  ])
+  assert.strictEqual(r, 'deny')
 })

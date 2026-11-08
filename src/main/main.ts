@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain, nativeTheme, session, shell } from 'electron'
+import { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, nativeTheme, session, shell, Tray } from 'electron'
 import path from 'node:path'
 import fs from 'node:fs'
 import { defaultProviders, effectiveWorkspace, loadConfig, saveConfig } from './config'
@@ -29,7 +29,8 @@ import { warmWorker, workerPlan } from './worker'
 import { systemSpecs } from './sysinfo'
 import { checkModel, vramfitAvailable } from './vramfit'
 import { appInfo, applySavedAppearance, loadPrefs, openDataDir, savePrefs, setZoom, windowBg } from './appinfo'
-import { startDaemon, stopDaemon } from './daemon'
+import { broadcastAgentEvent, setChatHandler, startDaemon, stopDaemon, subscribeChat } from './daemon'
+import { clearCheckpoint, listInterruptedCheckpoints } from './checkpoint'
 import {
   cancelLocalInstall,
   configureLocal,
@@ -49,6 +50,8 @@ import { imageThumb } from './vision'
 import { checkTools, installTools } from './basetools'
 import { cancelDownload, downloadModel, listCatalog } from './models'
 import { clearMemory, memoryInfo } from './memory'
+import { findInstructions, initAgents } from './instructions'
+import { loadProjectPermissions, saveProjectPermissions } from './permissions'
 import { mt, setMainLang } from './i18n'
 import { changeDetail, clearChanges, listChanges, revertAll, revertChange } from './changes'
 import { gitCommit, gitDiff, gitStatus } from './git'
@@ -67,6 +70,9 @@ import type {
 
 const isDev = process.env.PICODEV === '1'
 let win: BrowserWindow | null = null
+let tray: Tray | null = null
+/** 点了「退出」才置真；点关闭按钮只隐藏窗口，不退出 */
+let quitting = false
 
 /** 把「软件设置 → 网络代理」应用到整个会话：联网工具和页面请求都会走它 */
 async function applyProxy(proxyUrl: string | null | undefined): Promise<void> {
@@ -117,9 +123,24 @@ function emit(sessionId: string, event: AgentEvent): void {
   if (win && !win.isDestroyed()) {
     win.webContents.send('agent:event', { sessionId, event })
   }
+  // 无头 /chat 的 SSE 订阅者也要拿到同一份事件
+  broadcastAgentEvent(sessionId, event)
 }
 
 const engine = new AgentEngine(emit)
+
+// 把 agent 引擎接到 HTTP 控制面，外部进程就能驱动同一个引擎跑无头任务
+setChatHandler({
+  createSession: async (workspace?: string | null) => {
+    const s = await store.createSession(workspace ?? null)
+    return s.id
+  },
+  send: (sessionId, text, options) =>
+    engine.send(sessionId, text, undefined, { nonInteractive: true, approvalPolicy: options?.approvalPolicy ?? 'deny' }),
+  abort: (sessionId) => engine.abort(sessionId),
+  subscribe: (sessionId, cb) => subscribeChat(sessionId, cb),
+  isRunning: (sessionId) => engine.isRunning(sessionId)
+})
 
 function createWindow(): void {
   // 窗口/任务栏图标：打包后从 app.asar 里取，开发时直接读项目根目录
@@ -183,6 +204,49 @@ function createWindow(): void {
   win.on('closed', () => {
     win = null
   })
+
+  // 点关闭按钮 → 隐藏到托盘后台运行，而不是退出。
+  // 只有当用户从托盘菜单选「退出」或系统关闭时才真正退出（quitting 置真）。
+  win.on('close', (e) => {
+    if (!quitting) {
+      e.preventDefault()
+      win?.hide()
+    }
+  })
+}
+
+/** 显示主窗口（从托盘恢复或首次创建） */
+function showWindow(): void {
+  if (!win) {
+    createWindow()
+    return
+  }
+  if (win.isMinimized()) win.restore()
+  win.show()
+  win.focus()
+}
+
+/** 托盘：常驻后台时用户唯一的入口，菜单给「显示」和「退出」 */
+function createTray(): void {
+  if (tray) return
+  const iconPath = path.join(app.getAppPath(), 'build', 'icon.png')
+  const icon = fs.existsSync(iconPath) ? nativeImage.createFromPath(iconPath) : nativeImage.createEmpty()
+  tray = new Tray(icon.isEmpty() ? nativeImage.createEmpty() : icon.resize({ width: 16, height: 16 }))
+  tray.setToolTip('RoRoTo Code')
+  const menu = Menu.buildFromTemplate([
+    { label: '显示 RoRoTo Code', click: () => showWindow() },
+    { type: 'separator' },
+    {
+      label: '退出',
+      click: () => {
+        quitting = true
+        app.quit()
+      }
+    }
+  ])
+  tray.setContextMenu(menu)
+  // 单击托盘图标也恢复窗口
+  tray.on('click', () => showWindow())
 }
 
 /**
@@ -290,6 +354,30 @@ function registerIpc(): void {
     await clearMemory(ws)
     return { ok: true }
   })
+  ipcMain.handle('instructions:info', async () => {
+    const ws = await effectiveWorkspace(await loadConfig())
+    return await findInstructions(ws)
+  })
+  ipcMain.handle('instructions:init', async () => {
+    const ws = await effectiveWorkspace(await loadConfig())
+    return await initAgents(ws)
+  })
+
+  // 项目级权限规则（roroto.json 的 permissions）：读当前规则 + 写回
+  ipcMain.handle('permissions:info', async () => {
+    const ws = await effectiveWorkspace(await loadConfig())
+    const rules = await loadProjectPermissions(ws)
+    return { workspace: ws, path: ws ? path.join(ws, 'roroto.json') : null, rules }
+  })
+  ipcMain.handle('permissions:save', async (_e, rules: unknown) => {
+    const ws = await effectiveWorkspace(await loadConfig())
+    const list = Array.isArray(rules) ? (rules as unknown[]) : []
+    // 主进程侧兜底校验，避免渲染层直接写进非法数据
+    return await saveProjectPermissions(
+      ws,
+      list.map((r) => r as import('./risk').PermissionRule)
+    )
+  })
 
   ipcMain.handle('workspace:choose', async () => {
     const result = await dialog.showOpenDialog({
@@ -337,6 +425,9 @@ function registerIpc(): void {
   ipcMain.handle('sessions:setWorkspace', async (_e, id: string, workspace: string | null) => {
     await store.setSessionWorkspace(id, workspace)
   })
+  ipcMain.handle('sessions:setModel', async (_e, id: string, modelId: string | null) => {
+    await store.setSessionModel(id, modelId)
+  })
   ipcMain.handle('sessions:search', async (_e, query: string) => await store.searchSessions(query))
   ipcMain.handle('sessions:export', async (_e, id: string) => {
     const session = await store.loadSession(id)
@@ -359,6 +450,19 @@ function registerIpc(): void {
       await engine.editAndResend(sessionId, messageId, text)
   )
   ipcMain.handle('chat:resume', async (_e, sessionId: string) => await engine.resume(sessionId))
+
+  // 崩溃自动恢复：查上次没跑完的会话 + 用户选择忽略时清除标记
+  ipcMain.handle('checkpoints:interrupted', async () => {
+    const list = await listInterruptedCheckpoints()
+    return list.map((cp) => ({
+      sessionId: cp.sessionId,
+      workspace: cp.workspace,
+      todos: cp.todos.filter((t) => t.status !== 'completed'),
+      touched: cp.touched,
+      updatedAt: cp.updatedAt
+    }))
+  })
+  ipcMain.handle('checkpoints:dismiss', async (_e, sessionId: string) => await clearCheckpoint(sessionId))
 
   // 文件改动：列 / 看 diff / 撤销
   ipcMain.handle('changes:list', async (_e, sessionId: string) => await listChanges(sessionId))
@@ -385,6 +489,10 @@ function registerIpc(): void {
 
   ipcMain.on('approval:respond', (_e, id: string, approved: boolean, always?: boolean) => {
     engine.respondApproval(id, approved, always)
+  })
+
+  ipcMain.on('question:respond', (_e, id: string, answer: string) => {
+    engine.respondQuestion(id, answer)
   })
 
   ipcMain.handle('models:list', async (_e, providerId: string) => {
@@ -736,14 +844,21 @@ if (!gotLock) {
     }
 
     createWindow()
+    createTray()
   })
 
   app.on('window-all-closed', () => {
-    if (process.platform !== 'darwin') app.quit()
+    // 关窗即后台运行：不退出，保留托盘和控制面。真正退出走托盘「退出」或系统关闭。
+    if (process.platform !== 'darwin' && !quitting) {
+      // 什么都不做：进程常驻后台
+    }
   })
 
   // 退出前释放本地模型显存
   app.on('before-quit', () => {
+    quitting = true
+    tray?.destroy()
+    tray = null
     stopDaemon()
     stopLlamaSync()
     shutdownMcp()

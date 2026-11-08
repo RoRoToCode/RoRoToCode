@@ -8,14 +8,15 @@ import type {
 } from '../shared/types'
 import type { ToolSpec } from './tools/spec'
 import { chat } from './providers'
-import { classifyRisk, executeTool, previewWrite, toolTargetPath } from './tools'
+import { classifyRisk, executeTool, previewWrite, previewPatch, patchTargets, toolTargetPath } from './tools'
 import type { RiskInfo } from './tools'
+import { loadProjectPermissions } from './permissions'
 import { parseTextToolCalls } from './parse'
 import { recordChange } from './changes'
 import { diffLines, diffStats } from './diff'
 
 /** 子 agent 写过的文件类型：只有这些需要留可撤销的快照 */
-const WRITE_TOOLS = new Set(['write_file', 'edit_file'])
+const WRITE_TOOLS = new Set(['write_file', 'edit_file', 'patch'])
 
 /** 子 agent 自己的 token 粗估（与 agent.ts 保持同一口径） */
 function est(text: string): number {
@@ -58,11 +59,11 @@ function trim(messages: ChatMessage[], budget: number): ChatMessage[] {
   return out
 }
 
-function childPrompt(workspace: string, web: boolean): string {
+function childPrompt(workspace: string, web: boolean, instructions?: string | null): string {
   const tools = web
-    ? 'read_file / list_dir / glob / grep 看现状，write_file / edit_file 改文件，run_shell 跑命令，web_search / web_fetch 查资料'
-    : 'read_file / list_dir / glob / grep 看现状，write_file / edit_file 改文件，run_shell 跑命令'
-  return [
+    ? 'read_file / list_dir / glob / grep 看现状，write_file / edit_file / patch 改文件，run_shell 跑命令，web_search / web_fetch 查资料'
+    : 'read_file / list_dir / glob / grep 看现状，write_file / edit_file / patch 改文件，run_shell 跑命令'
+  const rules = [
     '你是子 agent，只负责完成被指派的这一件子任务。你看不到用户的原始对话，也不要向用户提问。',
     `当前工作区：${workspace}`,
     `可用工具：${tools}。`,
@@ -74,7 +75,11 @@ function childPrompt(workspace: string, web: boolean): string {
     '4. 信息不足或做不到就如实说明，不要编造。',
     '',
     '你的这段总结会被原样回传给主 agent，所以要写成能独立读懂的样子。'
-  ].join('\n')
+  ]
+  if (instructions) {
+    rules.splice(rules.length - 1, 0, '', '【项目规则】以下约定必须遵守：', instructions)
+  }
+  return rules.join('\n')
 }
 
 export interface SubAgentOptions {
@@ -96,6 +101,8 @@ export interface SubAgentOptions {
   tools: ToolSpec[]
   signal: AbortSignal
   web: boolean
+  /** 项目级规则（AGENTS.md），注入子 agent 的系统提示 */
+  instructions?: string | null
   /** 这次为什么用/没用工作模型（并行是否生效），随任务一起带给界面 */
   note?: string
   /** 需要用户批准时回调；父 agent 用自己的审批弹窗 */
@@ -133,8 +140,11 @@ export async function runSubAgent(opts: SubAgentOptions): Promise<SubAgentTask> 
     tools: []
   }
 
+  // 项目级权限规则：子代理和主 agent 用同一套边界，安全不能因为「子」就放开
+  const permRules = await loadProjectPermissions(opts.workspace)
+
   const messages: ChatMessage[] = [
-    { id: 'child-system', role: 'system', content: childPrompt(opts.workspace, opts.web), createdAt: Date.now() },
+    { id: 'child-system', role: 'system', content: childPrompt(opts.workspace, opts.web, opts.instructions), createdAt: Date.now() },
     { id: 'child-user', role: 'user', content: opts.prompt, createdAt: Date.now() }
   ]
 
@@ -175,11 +185,21 @@ export async function runSubAgent(opts: SubAgentOptions): Promise<SubAgentTask> 
         const started = Date.now()
 
         // 子 agent 干的是真活：改文件、跑命令一样要过审批，安全边界不能因为「子」就放开
-        const risk = classifyRisk(call.name, call.args, opts.workspace)
+        const risk = classifyRisk(call.name, call.args, opts.workspace, permRules)
         let approved = true
         if (risk) {
           let preview: ApprovalRequest['preview'] | undefined
-          if (WRITE_TOOLS.has(call.name)) {
+          if (call.name === 'patch') {
+            const files = previewPatch(call.args, opts.workspace, risk.kind === 'outside').map((f) => {
+              const lines = diffLines(f.before ?? '', f.after ?? '')
+              const st = diffStats(lines)
+              return { path: f.path, kind: f.kind, added: st.added, removed: st.removed, lines }
+            })
+            if (files.length) {
+              const first = files[0]
+              preview = { ...first, files }
+            }
+          } else if (WRITE_TOOLS.has(call.name)) {
             const pv = await previewWrite(call.name, call.args, opts.workspace).catch(() => null)
             if (pv) {
               const lines = diffLines(pv.before ?? '', pv.after)
@@ -190,15 +210,19 @@ export async function runSubAgent(opts: SubAgentOptions): Promise<SubAgentTask> 
           approved = await opts.approve(call.name, call.args, risk, preview)
         }
 
-        let target = ''
-        if (WRITE_TOOLS.has(call.name)) {
+        // 目标文件：patch 是多文件，单个写工具是单文件
+        const targets: string[] = []
+        if (call.name === 'patch') {
+          targets.push(...patchTargets(opts.workspace, call.args, risk?.kind === 'outside'))
+        } else if (WRITE_TOOLS.has(call.name)) {
           try {
-            target = toolTargetPath(opts.workspace, String(call.args.path ?? ''), risk?.kind === 'outside')
+            targets.push(toolTargetPath(opts.workspace, String(call.args.path ?? ''), risk?.kind === 'outside'))
           } catch {
-            target = ''
+            // 路径非法：不记快照
           }
         }
-        const before = target ? await readOrNull(target) : null
+        const beforeByTarget = new Map<string, string | null>()
+        for (const t of targets) beforeByTarget.set(t, await readOrNull(t))
 
         let output: string
         let ok = true
@@ -219,9 +243,11 @@ export async function runSubAgent(opts: SubAgentOptions): Promise<SubAgentTask> 
         }
 
         // 改动同样进父会话的「变更」列表，用户在右侧面板能撤销子 agent 的修改
-        if (ok && target) {
-          const after = await readOrNull(target)
-          if (after !== null) {
+        if (ok && targets.length) {
+          for (const target of targets) {
+            const after = await readOrNull(target)
+            const before = beforeByTarget.get(target) ?? null
+            if (after === null && before === null) continue
             const change = await recordChange({
               sessionId: opts.sessionId,
               root: opts.workspace,

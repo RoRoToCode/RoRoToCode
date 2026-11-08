@@ -36,33 +36,37 @@ export async function recordChange(input: {
   root: string
   absPath: string
   before: string | null
-  after: string
+  after: string | null
   tool: string
 }): Promise<FileChange | null> {
   const { sessionId, root, absPath, before, after, tool } = input
   const existed = before !== null
+  const deleted = after === null
   // 内容没变就不记，免得列表里全是空改动
   if (existed && before === after) return null
+  // 前后都没内容（异常情况）不记
+  if (!existed && deleted) return null
 
-  const lines = diffLines(before ?? '', after)
+  const lines = diffLines(before ?? '', after ?? '')
   const { added, removed } = diffStats(lines)
-  const tooBig = (before?.length ?? 0) > MAX_SNAPSHOT || after.length > MAX_SNAPSHOT
+  const tooBig =
+    (before?.length ?? 0) > MAX_SNAPSHOT || (after?.length ?? 0) > MAX_SNAPSHOT
   const change: FileChange = {
     id: newId(),
     sessionId,
     path: path.relative(root, absPath).split(path.sep).join('/') || path.basename(absPath),
     absPath,
-    kind: existed ? 'modify' : 'create',
+    kind: deleted ? 'delete' : existed ? 'modify' : 'create',
     at: Date.now(),
     tool,
     added,
     removed,
-    size: Buffer.byteLength(after, 'utf8')
+    size: Buffer.byteLength(after ?? '', 'utf8')
   }
   const rec: ChangeRecord = {
     ...change,
     before: tooBig ? '' : before ?? '',
-    after: tooBig ? '' : after,
+    after: tooBig ? '' : after ?? '',
     revertable: !tooBig
   }
   try {
@@ -126,6 +130,10 @@ export async function revertChange(
   try {
     if (rec.kind === 'create') {
       await fs.rm(rec.absPath, { force: true })
+    } else if (rec.kind === 'delete') {
+      // 删除的撤销：把 before 写回去
+      await fs.mkdir(path.dirname(rec.absPath), { recursive: true })
+      await fs.writeFile(rec.absPath, rec.before, 'utf8')
     } else {
       await fs.mkdir(path.dirname(rec.absPath), { recursive: true })
       await fs.writeFile(rec.absPath, rec.before, 'utf8')

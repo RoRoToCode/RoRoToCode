@@ -1,4 +1,4 @@
-import { promises as fs } from 'node:fs'
+import { promises as fs, readFileSync } from 'node:fs'
 import { existsSync } from 'node:fs'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
@@ -7,6 +7,7 @@ import { toolSpecs } from './spec'
 import { rememberFact } from '../memory'
 import { formatTodos, normalizeTodos } from '../../shared/todos'
 import { webFetchTool, webSearchTool } from './web'
+import { parseApplyPatch } from './applypatch'
 
 const IGNORED = new Set([
   'node_modules', '.git', 'dist', 'build', 'out', '.next', '.nuxt', 'target',
@@ -26,18 +27,23 @@ export interface ToolContext {
 }
 
 // 风险判定与命令拦截都在 risk.ts（纯函数，可单测），这里只做转出，保持既有 import 路径不变
-export { classifyRisk, hardBlockReason, isOutside, type RiskInfo } from '../risk'
+export { classifyRisk, classifyMcpRisk, hardBlockReason, isOutside, applyCustomRules, tokenizeCommand, resourceCandidates, type RiskInfo, type PermissionRule } from '../risk'
 import { classifyRisk, hardBlockReason, isOutside, type RiskInfo } from '../risk'
 import { safeEnv } from './env'
 import { getJob, killJob, listJobs, startBackground, tailLog } from './shellbg'
 
 export function isDangerous(tool: string): boolean {
-  return tool === 'write_file' || tool === 'edit_file' || tool === 'run_shell'
+  return tool === 'write_file' || tool === 'edit_file' || tool === 'patch' || tool === 'run_shell'
 }
 
 export function summarize(tool: string, args: Record<string, unknown>): string {
   if (tool === 'run_shell') return String(args.command ?? '')
   if (tool === 'write_file' || tool === 'edit_file') return String(args.path ?? '')
+  if (tool === 'patch') {
+    const edits = Array.isArray(args.edits) ? args.edits.length : 0
+    const fromText = typeof args.patch === 'string' && args.patch.trim() ? 'patch 文本' : ''
+    return edits > 0 ? `patch ${edits} 处改动` : fromText || 'patch'
+  }
   if (tool === 'web_fetch') return String(args.url ?? '')
   if (tool === 'web_search') return String(args.query ?? '')
   if (tool === 'remember') return String(args.note ?? '').slice(0, 120)
@@ -156,6 +162,236 @@ async function editFileTool(root: string, args: Record<string, unknown>, allowOu
   const updated = args.replace_all ? original.split(oldText).join(newText) : original.replace(oldText, newText)
   await fs.writeFile(target, updated, 'utf8')
   return `已修改 ${path.relative(root, target)}（替换 ${args.replace_all ? count : 1} 处）`
+}
+
+interface PatchEdit {
+  path: string
+  op: 'create' | 'update' | 'delete' | 'move'
+  content?: string
+  old_string?: string
+  new_string?: string
+  replace_all?: boolean
+  new_path?: string
+}
+
+/** 一次 patch 允许的最大编辑数：防止模型把几十上百个改动塞进一次调用，也不好回滚 */
+const MAX_PATCH_EDITS = 50
+
+/**
+ * 把 patch 的 args 解析成统一的 PatchEdit 列表，兼容两种输入：
+ *   - args.patch 为字符串（标准 apply_patch / unified diff 文本）
+ *   - args.edits 为数组（本程序 JSON 格式）
+ * 返回空数组表示没有可解析的编辑。三处共用：patchTool / patchTargets / previewPatch。
+ */
+function resolvePatchEdits(args: Record<string, unknown>): PatchEdit[] {
+  const patchText = args.patch
+  if (typeof patchText === 'string' && patchText.trim()) {
+    return parseApplyPatch(patchText)
+  }
+  if (!Array.isArray(args.edits)) return []
+  return args.edits.map((e) => e as PatchEdit)
+}
+
+/**
+ * 计算一次 patch 的所有落盘结果，但不写盘。
+ * 返回 { [绝对路径]: 新内容或 null（表示删除） }，供执行与预览共用，保证两处逻辑一致。
+ */
+function computePatch(
+  root: string,
+  edits: PatchEdit[],
+  allowOutside: boolean
+): Map<string, string | null> {
+  const results = new Map<string, string | null>()
+  // 先解析出每个 edit 的绝对路径与 op，再统一校验，最后一次性返回写盘计划
+  const planned: Array<{ abs: string; edit: PatchEdit }> = []
+
+  for (const edit of edits) {
+    const abs = safePath(root, edit.path, allowOutside)
+    if (!edit.op || !['create', 'update', 'delete', 'move'].includes(edit.op)) {
+      throw new Error(`patch：未知操作 ${edit.op}（应为 create/update/delete/move）`)
+    }
+    planned.push({ abs, edit })
+  }
+
+  // 校验阶段：全部通过才进入写盘，任一失败抛错、整体不落盘
+  for (const { abs, edit } of planned) {
+    if (edit.op === 'create') {
+      const content = String(edit.content ?? '')
+      results.set(abs, content)
+    } else if (edit.op === 'delete') {
+      results.set(abs, null)
+    } else if (edit.op === 'move') {
+      const dest = safePath(root, String(edit.new_path ?? ''), allowOutside)
+      results.set(dest, null) // 先占位，下面读源内容填进去
+      results.set(abs, null) // 源文件删除
+    } else {
+      // update
+      const original = readFileSync(abs, 'utf8')
+      const oldText = String(edit.old_string ?? '')
+      if (!oldText) throw new Error(`patch：${edit.path} 的 update 缺少 old_string`)
+      const count = original.split(oldText).length - 1
+      if (count === 0) throw new Error(`patch：在 ${edit.path} 未找到 old_string，请先 read_file 确认原文`)
+      if (count > 1 && !edit.replace_all) {
+        throw new Error(`patch：${edit.path} 的 old_string 出现 ${count} 次，请提供更长上下文或设 replace_all`)
+      }
+      const updated = edit.replace_all
+        ? original.split(oldText).join(String(edit.new_string ?? ''))
+        : original.replace(oldText, String(edit.new_string ?? ''))
+      results.set(abs, updated)
+    }
+  }
+
+  // move 需要源内容：在第二次遍历里处理，避免顺序依赖
+  for (const { abs, edit } of planned) {
+    if (edit.op !== 'move') continue
+    const dest = safePath(root, String(edit.new_path ?? ''), allowOutside)
+    let content: string
+    try {
+      content = readFileSync(abs, 'utf8')
+    } catch {
+      throw new Error(`patch：移动源文件不存在 ${edit.path}`)
+    }
+    results.set(dest, content)
+  }
+
+  return results
+}
+
+async function patchTool(root: string, args: Record<string, unknown>, allowOutside = false): Promise<string> {
+  // 兼容两种输入：
+  //   1) 标准 apply_patch 文本：args.patch 是一个 unified diff 字符串
+  //   2) 本程序 JSON 格式：args.edits 是一个编辑数组
+  const dryRun = Boolean(args.dry_run ?? args.dryRun)
+  const patchText = args.patch
+  let edits: PatchEdit[]
+  if (typeof patchText === 'string' && patchText.trim()) {
+    // 标准 diff 文本 → 解析成 edits
+    const parsed = parseApplyPatch(patchText)
+    if (!parsed.length) {
+      throw new Error('patch：无法从这段 diff 文本解析出任何改动。请确认包含 @@ hunk 与 ---/+++ 文件头，或改用 edits 数组格式。')
+    }
+    edits = parsed
+  } else {
+    const rawEdits = args.edits
+    if (!Array.isArray(rawEdits) || rawEdits.length === 0) {
+      throw new Error('patch 需要 edits 数组或 patch 文本（标准 apply_patch 格式），且至少一项')
+    }
+    edits = rawEdits.map((e) => e as PatchEdit)
+  }
+  if (edits.length > MAX_PATCH_EDITS) {
+    throw new Error(`patch 一次最多 ${MAX_PATCH_EDITS} 处改动，请拆成多次调用`)
+  }
+
+  // 校验阶段：所有路径 / op / old_string 唯一性都通过才进入写盘；任一失败抛错、整体不落盘。
+  const results = computePatch(root, edits, allowOutside)
+
+  // dry_run：只校验 + 返回将要发生的改动清单，不写盘
+  if (dryRun) {
+    const rel = (p: string) => path.relative(root, p).split(path.sep).join('/') || path.basename(p)
+    const plan = edits.map((e) => {
+      const extra = e.op === 'move' ? ` → ${e.new_path ?? ''}` : e.op === 'update' ? `（替换 ${String(e.old_string ?? '').split('\n').length} 行片段）` : ''
+      return `  ${e.op} ${rel(e.path)}${extra}`
+    })
+    return `[dry-run] 校验通过，将发生 ${edits.length} 处改动（未写盘）：\n${plan.join('\n')}`
+  }
+
+  // 写盘阶段：先全部写入同目录下的临时文件，全部成功后再统一 rename（写）或 unlink（删）。
+  // 这样「内容准备」与「原子替换」分离——若准备阶段中途失败，目标文件一个都没被动过，
+  // 不会留下半套状态。rename 同盘是原子的，真正落盘只在最后一小步。
+  const staged: Array<{ tmp: string | null; abs: string; delete: boolean }> = []
+  try {
+    for (const [abs, content] of results) {
+      if (content === null) {
+        staged.push({ tmp: null, abs, delete: true })
+        continue
+      }
+      await fs.mkdir(path.dirname(abs), { recursive: true })
+      const tmp = `${abs}.roro-tmp-${cryptoRandom()}`
+      await fs.writeFile(tmp, content, 'utf8')
+      staged.push({ tmp, abs, delete: false })
+    }
+    // 全部临时文件就绪，统一替换
+    for (const s of staged) {
+      if (s.delete) {
+        await fs.unlink(s.abs).catch(() => undefined)
+      } else {
+        await fs.rename(s.tmp!, s.abs)
+      }
+    }
+  } catch (err) {
+    // 清理已写入的临时文件，避免留垃圾；目标文件保持原样
+    for (const s of staged) {
+      if (s.tmp) await fs.unlink(s.tmp).catch(() => undefined)
+    }
+    throw err
+  }
+
+  const rel = (p: string) => path.relative(root, p).split(path.sep).join('/') || path.basename(p)
+  const summary = edits.map((e) => `${e.op} ${rel(e.path)}`).join('；')
+  return `已完成 ${edits.length} 处改动：${summary}`
+}
+
+/** 生成本次 patch 的临时文件后缀，避免并发冲突 */
+function cryptoRandom(): string {
+  return Math.random().toString(36).slice(2) + Date.now().toString(36)
+}
+
+/** patch 涉及的所有目标绝对路径（引擎记快照、统计 touched 用） */
+export function patchTargets(root: string, args: Record<string, unknown>, allowOutside = false): string[] {
+  const edits = resolvePatchEdits(args)
+  if (!edits.length) return []
+  const out = new Set<string>()
+  for (const e of edits) {
+    try {
+      out.add(safePath(root, e.path, allowOutside))
+      if (e.op === 'move' && e.new_path) out.add(safePath(root, String(e.new_path), allowOutside))
+    } catch {
+      // 越界路径跳过，执行时工具会自己报错
+    }
+  }
+  return [...out]
+}
+
+/**
+ * patch 的多文件预览：不写盘，算出每个受影响文件改前/改后内容，
+ * 供审批弹窗逐个展示 diff。与 patchTool 共用 computePatch，保证预览=实际执行。
+ */
+export function previewPatch(
+  args: Record<string, unknown>,
+  root: string,
+  allowOutside = false
+): Array<{ absPath: string; path: string; kind: 'create' | 'modify' | 'delete'; before: string | null; after: string | null }> {
+  const edits = resolvePatchEdits(args)
+  if (!edits.length) return []
+  const results = computePatch(root, edits, allowOutside)
+  const rel = (p: string) => path.relative(root, p).split(path.sep).join('/') || path.basename(p)
+  const out: Array<{ absPath: string; path: string; kind: 'create' | 'modify' | 'delete'; before: string | null; after: string | null }> = []
+
+  // 先收集所有可能涉及的路径（源 + move 目标），再逐个算 before
+  const involved = new Set<string>()
+  for (const e of edits) {
+    try {
+      involved.add(safePath(root, e.path, allowOutside))
+      if (e.op === 'move' && e.new_path) involved.add(safePath(root, String(e.new_path), allowOutside))
+    } catch {
+      // 越界，预览阶段跳过
+    }
+  }
+
+  for (const abs of involved) {
+    let before: string | null = null
+    try {
+      before = readFileSync(abs, 'utf8')
+    } catch {
+      before = null
+    }
+    const after = results.has(abs) ? results.get(abs)! : before
+    let kind: 'create' | 'modify' | 'delete' = 'modify'
+    if (after === null) kind = 'delete'
+    else if (before === null) kind = 'create'
+    out.push({ absPath: abs, path: rel(abs), kind, before, after })
+  }
+  return out
 }
 
 /** 把工具参数里的路径解析成绝对路径（引擎记快照时用） */
@@ -372,6 +608,8 @@ export async function executeTool(
       return writeFileTool(root, args, allowOutside)
     case 'edit_file':
       return editFileTool(root, args, allowOutside)
+    case 'patch':
+      return patchTool(root, args, allowOutside)
     case 'list_dir':
       return listDirTool(root, args, allowOutside)
     case 'glob':

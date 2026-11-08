@@ -785,6 +785,19 @@ select:focus {
   background: var(--panel);
 }
 
+/* 每会话模型绑定下拉 */
+.session-model-select {
+  flex: none;
+  padding: 5px 8px;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  color: var(--text);
+  border-radius: 8px;
+  font-size: calc(11.5px * var(--fs, 1));
+  margin-left: 6px;
+  max-width: 130px;
+}
+
 /* 右上角语言切换：一个按钮点一下在中 / EN 之间切换 */
 .header-lang {
   flex: none;
@@ -2403,6 +2416,38 @@ select:focus {
   background: #2a1618;
   border-color: #5c2b2f;
   color: #ffb4b4;
+}
+
+/* 崩溃自动恢复提示条：启动时检测到上次有任务没跑完，横在输入区上方 */
+.resume-banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 0 16px 10px;
+  padding: 10px 14px;
+  background: var(--panel-2);
+  border: 1px solid var(--accent);
+  border-radius: 10px;
+  color: var(--fg);
+}
+.resume-banner-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+}
+.resume-banner-text strong {
+  font-size: calc(13px * var(--fs, 1));
+}
+.resume-banner-text span {
+  font-size: calc(12px * var(--fs, 1));
+  color: var(--fg-soft, #8b949e);
+}
+.resume-banner-actions {
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
 }
 
 ::-webkit-scrollbar {
@@ -4624,6 +4669,86 @@ a.btn {
   color: var(--dim);
 }
 
+/* 项目权限规则列表 */
+.perm-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 4px;
+}
+.perm-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.perm-effect {
+  flex-shrink: 0;
+  font-size: calc(11px * var(--fs, 1));
+  font-weight: 600;
+  border-radius: 6px;
+  padding: 2px 8px;
+}
+.perm-effect.deny {
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+}
+.perm-effect.allow {
+  color: var(--ok, #3fb950);
+  background: color-mix(in srgb, var(--ok, #3fb950) 12%, transparent);
+}
+.perm-action {
+  flex-shrink: 0;
+  font-size: calc(11.5px * var(--fs, 1));
+  font-family: ui-monospace, Consolas, monospace;
+  color: var(--accent);
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 3px 8px;
+}
+.perm-resource {
+  flex: 1;
+  min-width: 0;
+  font-size: calc(11.5px * var(--fs, 1));
+  font-family: ui-monospace, Consolas, monospace;
+  color: var(--fg);
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 3px 8px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.perm-add {
+  margin-top: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.perm-add-head {
+  font-size: calc(12px * var(--fs, 1));
+  color: var(--muted);
+  font-weight: 500;
+}
+.perm-add-fields {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+.perm-input {
+  flex: 0 0 180px;
+  min-width: 0;
+}
+.perm-input-wide {
+  flex: 1 1 240px;
+}
+.perm-select {
+  flex: 0 0 auto;
+  min-width: 84px;
+}
+
 /* 回收站列表 */
 .trash-list {
   display: flex;
@@ -5369,6 +5494,31 @@ a.btn {
 
 .approval-diff-stat .kind {
   color: var(--muted);
+}
+
+.approval-diff-block {
+  margin-bottom: 12px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.approval-diff-block:last-child {
+  margin-bottom: 0;
+  padding-bottom: 0;
+  border-bottom: none;
+}
+
+/* question 工具弹窗：选项按钮 */
+.question-options {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.question-option {
+  text-align: left;
+  justify-content: flex-start;
+  width: 100%;
 }
 
 /* ---------- 右侧面板标签 ---------- */

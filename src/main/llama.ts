@@ -7,7 +7,7 @@ import type { LlamaErrorCode, LlamaStatus, ProviderConfig, SetupProgress } from 
 import { LLAMA_PORT, LLAMA_PORTS, deviceIndex, isLlamaProvider, llamaPortOf } from '../shared/providers'
 import { ggufLooksVision } from '../shared/vision'
 import { findFreePort, waitPortFree } from './portprobe'
-import { loadConfig, saveConfig } from './config'
+import { CONTEXT_RANGE, loadConfig, saveConfig } from './config'
 import { fitForLaunch } from './vramfit'
 import { readGgufMeta } from './gguf'
 import { MIRRORS, downloadFromGithub } from './ghdl'
@@ -998,7 +998,7 @@ async function serverCtx(providerId?: string): Promise<number> {
     const own = Math.round(p?.contextWindow || 16384)
     // 软件设置里的全局值优先（仅当开了限制），但不能超过这个条目自己写的上限
     const n = cfg.contextLimit === true ? Math.min(Math.round(cfg.contextWindow || 32768), own) : own
-    if (n >= 2048) return Math.min(n, 131072)
+    if (n >= 2048) return Math.min(n, CONTEXT_RANGE.max)
   } catch {
     // 读不到配置就用默认值，不能因为这个起不来
   }
@@ -1057,7 +1057,7 @@ async function applyLlamaConfig(
     if (!target.apiKey) target.apiKey = 'no-key'
     if (model) target.model = model
     // 服务端按 ctx 开了多大，配置就记多大：写小了预算跟着缩水，白开那么多显存
-    if (ctx && ctx >= 2048) target.contextWindow = Math.min(Math.round(ctx), 131072)
+    if (ctx && ctx >= 2048) target.contextWindow = Math.min(Math.round(ctx), CONTEXT_RANGE.max)
   }
 
   // 本地服务有没有真的挂上 mmproj，写进配置：auto 判定直接读这个字段，
@@ -1511,7 +1511,7 @@ export async function startLlama(
     let ctx: number
     let ctxNote = ''
     if (Number.isFinite(want) && want >= 2048) {
-      ctx = Math.min(Math.round(want), 131072)
+      ctx = Math.min(Math.round(want), CONTEXT_RANGE.max)
     } else {
       ctx = await serverCtx(provider?.id)
       const fit = await fitForLaunch(full, deviceIndex(device)).catch(() => null)

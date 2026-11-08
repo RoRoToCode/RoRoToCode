@@ -1,5 +1,5 @@
 import path from 'node:path'
-import type { RiskKind } from '../shared/types'
+import type { PermissionRule, RiskKind } from '../shared/types'
 
 /**
  * 风险判定与命令拦截。
@@ -9,11 +9,115 @@ import type { RiskKind } from '../shared/types'
  * 导致这类最容易出错、最该被测的判断逻辑反而没法测。
  */
 
+export type { PermissionRule }
+
 export interface RiskInfo {
   kind: RiskKind
   reason: string
   /** 高风险操作（网络/删除/越界/外部工具）：不受「之后全允许」影响，必须单独确认 */
   high: boolean
+  /** 被项目规则明确拒绝：decideApproval 直接 deny，不弹确认框 */
+  denied?: boolean
+}
+
+/** 把通配符规则转成正则：* → .*，其余转义 */
+function globToRe(glob: string): RegExp {
+  let out = ''
+  for (const ch of glob) {
+    if (ch === '*') out += '.*'
+    else if (ch === '?') out += '.'
+    else out += ch.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  }
+  return new RegExp(`^${out}$`)
+}
+
+/** 轻量命令分词：把命令切成「可执行词 + 参数」，供规则按命令名或完整串匹配 */
+export function tokenizeCommand(command: string): string[] {
+  const out: string[] = []
+  let cur = ''
+  let quote: '"' | "'" | null = null
+  for (const c of command) {
+    if (quote) {
+      if (c === quote) quote = null
+      else cur += c
+      continue
+    }
+    if (c === '"' || c === "'") {
+      quote = c as '"' | "'"
+      continue
+    }
+    if (/\s/.test(c)) {
+      if (cur) {
+        out.push(cur)
+        cur = ''
+      }
+      continue
+    }
+    if (c === ';' || c === '|' || c === '&' || c === '>' || c === '<') {
+      if (cur) out.push(cur)
+      cur = ''
+      continue
+    }
+    cur += c
+  }
+  if (cur) out.push(cur)
+  return out
+}
+
+/**
+ * 从工具参数里提取「资源」候选串，供规则匹配。
+ * 返回一个数组：规则只要命中其中任意一个即算命中。
+ * - run_shell：完整命令串 + 分词后的第一个可执行词（这样能按 `npm`、`rm` 之类命令名匹配）；
+ * - 文件工具：单个路径；
+ * - patch：逐条 edit 的 path / new_path；
+ * - 其它：空数组（不参与资源匹配，只有 resource 为 '*' 的规则能命中）。
+ */
+export function resourceCandidates(tool: string, args: Record<string, unknown>): string[] {
+  if (tool === 'run_shell') {
+    const cmd = String(args.command ?? '')
+    const tokens = tokenizeCommand(cmd)
+    return tokens.length ? [cmd, tokens[0]] : [cmd]
+  }
+  if (tool === 'write_file' || tool === 'edit_file' || tool === 'read_file' || tool === 'list_dir' || tool === 'grep') {
+    return [String(args.path ?? '')]
+  }
+  if (tool === 'patch') {
+    const out: string[] = []
+    if (Array.isArray(args.edits)) {
+      for (const e of args.edits as Array<{ path?: unknown; new_path?: unknown }>) {
+        if (e?.path != null) out.push(String(e.path))
+        if (e?.new_path != null) out.push(String(e.new_path))
+      }
+    }
+    return out
+  }
+  return []
+}
+
+/** 应用用户规则：返回 'allow' | 'deny' | null（null = 不命中，走内置判定） */
+export function applyCustomRules(
+  tool: string,
+  args: Record<string, unknown>,
+  rules: PermissionRule[] | undefined
+): 'allow' | 'deny' | null {
+  if (!rules || rules.length === 0) return null
+  const resources = resourceCandidates(tool, args)
+
+  let result: 'allow' | 'deny' | null = null
+  for (const rule of rules) {
+    const actionMatch = rule.action === '*' || rule.action === tool
+    if (!actionMatch) continue
+    // resource 通配：* 匹配所有；否则只要命中任一候选资源即可
+    const resMatch =
+      rule.resource === '*' ||
+      resources.some((r) => {
+        // 命令串也尝试前缀匹配：规则写 `npm test*` 能命中 `npm test --watch`
+        return globToRe(rule.resource).test(r) || r.startsWith(rule.resource.replace(/\*$/, ''))
+      })
+    if (!resMatch) continue
+    result = rule.effect
+  }
+  return result
 }
 
 // 访问网络的命令特征
@@ -118,8 +222,16 @@ export function isOutside(root: string, p: string): boolean {
 export function classifyRisk(
   tool: string,
   args: Record<string, unknown>,
-  workspace: string
+  workspace: string,
+  rules?: PermissionRule[]
 ): RiskInfo | null {
+  // 用户项目规则优先：deny 直接拒绝（不可被「之后全允许」覆盖）。
+  // allow 的语义是「明确信任这条原本需要确认的普通操作」：它只放行非高危操作
+  // （普通命令、普通写文件），删除/越界/网络等内置高危仍按原判定走，HARD_BLOCK 更是永远不可绕过。
+  const custom = applyCustomRules(tool, args, rules)
+  if (custom === 'deny') {
+    return { kind: 'shell', reason: '被项目规则拒绝', high: true, denied: true }
+  }
   if (tool === 'run_shell') {
     const cmd = String(args.command ?? '')
     // 删除类优先：即使命令里还包含网络或只读片段，也按最重的判
@@ -134,6 +246,8 @@ export function classifyRisk(
     if (NETWORK_RE.test(cmd)) return { kind: 'network', reason: '访问网络 / 下载依赖', high: true }
     // 纯读取命令（无串联/重定向）不算风险，只读模式也允许
     if (READONLY_RE.test(cmd) && !CHAIN_RE.test(cmd)) return null
+    // 普通命令：若被 allow 显式信任则放行，否则按普通命令确认
+    if (custom === 'allow') return null
     return { kind: 'shell', reason: '执行命令', high: false }
   }
   if (tool === 'shell_bg') {
@@ -145,6 +259,22 @@ export function classifyRisk(
   if (tool === 'write_file' || tool === 'edit_file') {
     const p = String(args.path ?? '')
     if (isOutside(workspace, p)) return { kind: 'outside', reason: '写入工作区之外的文件', high: true }
+    // 普通写文件：allow 显式信任则放行
+    if (custom === 'allow') return null
+    return { kind: 'write', reason: '修改文件', high: false }
+  }
+  if (tool === 'patch') {
+    // 多文件改动：只要有任一路径越界，就整体判为越界（高风险，必须单独确认）
+    const edits = Array.isArray(args.edits) ? (args.edits as Array<{ path?: unknown; new_path?: unknown }>) : []
+    for (const e of edits) {
+      const p = String(e?.path ?? '')
+      if (isOutside(workspace, p)) return { kind: 'outside', reason: `写入工作区之外的文件 ${p}`, high: true }
+      if (e?.new_path != null && isOutside(workspace, String(e.new_path))) {
+        return { kind: 'outside', reason: `移动目标在工作区之外 ${String(e.new_path)}`, high: true }
+      }
+    }
+    // 普通多文件写：allow 显式信任则放行
+    if (custom === 'allow') return null
     return { kind: 'write', reason: '修改文件', high: false }
   }
   if (tool === 'read_file' || tool === 'list_dir' || tool === 'grep') {
@@ -157,4 +287,16 @@ export function classifyRisk(
     return null
   }
   return null
+}
+
+/**
+ * 外部 MCP 工具的风险判定：默认都算高危（需要确认），但项目规则可以明确 deny。
+ * 规则匹配时 resource 用 MCP 工具的完整名（mcp__服务__工具名）。
+ */
+export function classifyMcpRisk(toolName: string, rules?: PermissionRule[]): RiskInfo | null {
+  const custom = applyCustomRules(toolName, {}, rules)
+  if (custom === 'deny') {
+    return { kind: 'shell', reason: '被项目规则拒绝', high: true, denied: true }
+  }
+  return { kind: 'shell', reason: `调用外部 MCP 工具 ${toolName}`, high: true }
 }

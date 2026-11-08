@@ -1,6 +1,6 @@
 import { t as tr } from '../i18n'
 import { useEffect, useRef, useState, type ReactNode } from 'react'
-import type { AppConfig, AppInfo, ApprovalMode, McpServerStatus, ProviderConfig, ThemeKey, TrashEntry } from '../../shared/types'
+import type { AppConfig, AppInfo, ApprovalMode, McpServerStatus, PermissionRule, ProviderConfig, ThemeKey, TrashEntry } from '../../shared/types'
 import { isLlamaProvider } from '../../shared/providers'
 import {
   applyFontScale,
@@ -59,7 +59,7 @@ const KEY_META: Record<KeyAction, { get label(): string; get desc(): string }> =
 }
 
 /** 上下文长度的常用档位（tokens） */
-const CTXS = [8192, 16384, 32768, 65536, 131072]
+const CTXS = [8192, 16384, 32768, 65536, 131072, 262144]
 
 /** 本地运行的模型，全局上下文长度直接作用于它们 */
 function isLocal(p: { kind: string; baseUrl: string }): boolean {
@@ -144,6 +144,16 @@ export function AppSettings({ config, onSave, onClose, notify }: Props) {
   }))
   const [info, setInfo] = useState<AppInfo | null>(null)
   const [mem, setMem] = useState<{ path: string; items: number; chars: number } | null>(null)
+  const [instr, setInstr] = useState<{ path: string | null; text: string; truncated: boolean; name: string | null } | null>(null)
+  /** 项目级权限规则（roroto.json 的 permissions）：当前规则 + 编辑中的新规则 */
+  const [perms, setPerms] = useState<PermissionRule[] | null>(null)
+  const [permsPath, setPermsPath] = useState<string | null>(null)
+  const [permBusy, setPermBusy] = useState(false)
+  const [permDraft, setPermDraft] = useState<{ action: string; resource: string; effect: 'allow' | 'deny' }>({
+    action: '',
+    resource: '',
+    effect: 'deny'
+  })
   const [zoom, setZoom] = useState(1)
   const [theme, setTheme] = useState<ThemeKey>(storedTheme())
   /** 字号：ui 管所有界面文字，chat 为 null 时对话正文跟着 ui 走 */
@@ -211,6 +221,21 @@ export function AppSettings({ config, onSave, onClose, notify }: Props) {
         if (!alive) return
         setInfo(i)
         if (m) setMem(m)
+        void window.pico.instructions
+          .info()
+          .then((r) => {
+            if (alive) setInstr(r)
+          })
+          .catch(() => undefined)
+        void window.pico.permissions
+          .info()
+          .then((r) => {
+            if (alive) {
+              setPerms(r.rules)
+              setPermsPath(r.path)
+            }
+          })
+          .catch(() => undefined)
         setZoom(p.zoom)
         setKeys(normalizeKeys(p.keys))
         // 主进程里的记录为准（换过机器 / 清了 localStorage 时靠它恢复）
@@ -358,6 +383,51 @@ export function AppSettings({ config, onSave, onClose, notify }: Props) {
     } catch (err) {
       notify(tr("清空失败：{0}", { "0": (err as Error).message }))
     }
+  }
+
+  async function initInstr() {
+    try {
+      const r = await window.pico.instructions.init()
+      setInstr(await window.pico.instructions.info())
+      notify(r.created ? tr("已生成 AGENTS.md") : tr("AGENTS.md 已存在，未覆盖"))
+    } catch (err) {
+      notify(tr("生成失败：{0}", { "0": (err as Error).message }))
+    }
+  }
+
+  /** 保存权限规则：把当前列表整体写回 roroto.json（主进程侧校验 + 原子写） */
+  async function savePerms(next: PermissionRule[]) {
+    setPermBusy(true)
+    try {
+      const r = await window.pico.permissions.save(next)
+      setPerms(next)
+      setPermsPath(r.path)
+      notify(r.created ? tr("已生成 roroto.json") : tr("权限规则已保存"))
+    } catch (err) {
+      notify(tr("保存失败：{0}", { "0": (err as Error).message }))
+    } finally {
+      setPermBusy(false)
+    }
+  }
+
+  /** 追加一条规则（清空输入框，回填默认 effect） */
+  async function addPerm() {
+    const a = permDraft.action.trim()
+    const res = permDraft.resource.trim()
+    if (!a || !res) {
+      notify(tr("请先填写工具名和匹配目标"))
+      return
+    }
+    const rule: PermissionRule = { action: a, resource: res, effect: permDraft.effect }
+    const next = [...(perms ?? []), rule]
+    await savePerms(next)
+    setPermDraft({ action: '', resource: '', effect: 'deny' })
+  }
+
+  /** 删除一条规则并保存 */
+  async function removePerm(idx: number) {
+    const next = (perms ?? []).filter((_, i) => i !== idx)
+    await savePerms(next)
   }
 
   /** 邮箱没法直接点击时（部分环境 mailto 不生效）至少能一键复制 */
@@ -856,6 +926,99 @@ export function AppSettings({ config, onSave, onClose, notify }: Props) {
             </div>
             <p className="aset-hint">
               {tr("助手用 remember 记下的项目约定（构建命令、目录习惯、踩过的坑），每次对话自动带上。\n              按工作区各存一份，放在数据目录的 memory/ 下。")}</p>
+
+            <div className="aset-row" style={{ marginTop: 16 }}>
+              <span className="aset-label">{tr("项目规则")}</span>
+              <code className="aset-path" title={instr?.path ?? ''}>
+                {instr
+                  ? instr.path
+                    ? instr.name + (instr.truncated ? tr("（已截断）") : "")
+                    : tr("未设置")
+                  : tr("读取中…")}
+              </code>
+            </div>
+            <div className="aset-actions">
+              <button className="btn sm" onClick={() => void initInstr()}>
+                {instr?.path ? tr("重新读取") : tr("生成 AGENTS.md")}</button>
+            </div>
+            <p className="aset-hint">
+              {tr("项目规则是作者手写、随仓库提交的 AGENTS.md / CLAUDE.md（从工作区根向上逐层查找）。\n              写清构建命令、目录约定、踩过的坑，每次对话都会注入；换机器、换同事都能生效。")}</p>
+          </Sec>
+
+          <Sec
+            id="permissions"
+            title={tr("项目权限")}
+            summary={perms ? tr("{0} 条规则", { "0": perms.length }) : tr("读取中…")}
+          >
+            {permsPath && (
+              <div className="aset-row">
+                <span className="aset-label">{tr("规则文件")}</span>
+                <code className="aset-path" title={permsPath}>{permsPath}</code>
+              </div>
+            )}
+
+            {perms && perms.length === 0 && (
+              <p className="aset-hint">
+                {tr("还没有权限规则。可以给「删除 / 越界 / 联网 / 特定命令」加一条 deny 来收紧，或给常用命令加 allow 来少点确认。")}</p>
+            )}
+
+            {perms && perms.length > 0 && (
+              <div className="perm-list">
+                {perms.map((r, i) => (
+                  <div className="perm-item" key={`${i}-${r.action}-${r.resource}`}>
+                    <span className={`perm-effect ${r.effect}`}>
+                      {r.effect === 'deny' ? tr("拒绝") : tr("放行")}
+                    </span>
+                    <code className="perm-action" title={r.action}>{r.action}</code>
+                    <code className="perm-resource" title={r.resource}>{r.resource}</code>
+                    <button
+                      className="btn sm danger"
+                      disabled={permBusy}
+                      onClick={() => void removePerm(i)}
+                      title={tr("删除这条规则")}
+                    >
+                      {tr("删除")}
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            <div className="perm-add">
+              <div className="perm-add-head">{tr("新增规则")}</div>
+              <div className="perm-add-fields">
+                <input
+                  className="aset-input perm-input"
+                  placeholder={tr("工具名，如 run_shell / patch / *")}
+                  value={permDraft.action}
+                  onChange={(e) => setPermDraft((d) => ({ ...d, action: e.target.value }))}
+                />
+                <input
+                  className="aset-input perm-input perm-input-wide"
+                  placeholder={tr("匹配目标，如 npm / src/secrets* / *")}
+                  value={permDraft.resource}
+                  onChange={(e) => setPermDraft((d) => ({ ...d, resource: e.target.value }))}
+                />
+                <select
+                  className="aset-input perm-select"
+                  value={permDraft.effect}
+                  onChange={(e) =>
+                    setPermDraft((d) => ({ ...d, effect: e.target.value as 'allow' | 'deny' }))
+                  }
+                >
+                  <option value="deny">{tr("拒绝")}</option>
+                  <option value="allow">{tr("放行")}</option>
+                </select>
+                <button className="btn sm primary" disabled={permBusy} onClick={() => void addPerm()}>
+                  {tr("添加")}
+                </button>
+              </div>
+            </div>
+
+            <p className="aset-hint">
+              {tr("权限规则按顺序匹配，写在 roroto.json 的 permissions 里（随仓库提交，团队共享）。\n" +
+                "「拒绝」直接拦截、不弹确认，且无法被「之后全允许」覆盖；「放行」只对普通操作生效，\n" +
+                "删除文件、越界、联网、外部 MCP 以及不可逆命令仍会强制确认，永远不会被放行规则绕过。")}</p>
           </Sec>
 
           <Sec id="trash" title={tr("回收站")} summary={trash ? tr("{0} 条", { "0": trash.length }) : tr("读取中…")}>

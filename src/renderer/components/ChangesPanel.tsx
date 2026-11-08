@@ -102,7 +102,9 @@ export function ChangesPanel({ sessionId, refreshKey, onNotify, onReverted }: Pr
           {list.map((c) => (
             <div className={`change-item ${openId === c.id ? 'open' : ''}`} key={c.id}>
               <button className="change-row" onClick={() => void toggle(c.id)}>
-                <span className={`change-kind ${c.kind}`}>{c.kind === 'create' ? tr("新建") : tr("修改")}</span>
+                <span className={`change-kind ${c.kind}`}>
+                  {c.kind === 'create' ? tr("新建") : c.kind === 'delete' ? tr("删除") : tr("修改")}
+                </span>
                 <span className="change-path" title={c.path}>
                   {c.path}
                 </span>

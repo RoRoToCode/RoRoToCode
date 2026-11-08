@@ -197,6 +197,63 @@ export const toolSpecs: ToolSpec[] = [
       },
       required: ['description', 'prompt']
     }
+  },
+  {
+    name: 'question',
+    description:
+      '任务遇到需要用户决策的分叉时，停下来问用户一个问题（可带选项），等用户作答后再继续。适合：选哪种技术方案、删不删某样东西、迁移到哪个库、用哪个端口这类无法替用户拍板的事。不要拿它问自己能查出来的事实（用 read_file/grep 自己查），也不要频繁打断用户。',
+    parameters: {
+      type: 'object',
+      properties: {
+        question: { type: 'string', description: '要问用户的问题，一句话说清' },
+        options: {
+          type: 'array',
+          description: '可选的答案选项（2-6 个）。不填则让用户自由输入',
+          items: { type: 'string' }
+        },
+        multiSelect: {
+          type: 'boolean',
+          description: '是否允许多选（默认 false，单选）。多选时用户可勾选多个选项，答案以逗号分隔回传'
+        }
+      },
+      required: ['question']
+    }
+  },
+  {
+    name: 'patch',
+    description:
+      '一次对多个文件做改动（增/改/删/移动）。支持两种输入：① 标准 apply_patch 文本（unified diff，含 @@ 行号 hunk 与 ---/+++ 文件头），适合一次贴多文件大段改动；② edits 数组（本程序 JSON 格式，字段见下）。所有改动先整体校验（路径、old_string 唯一性等），全部通过后才统一落盘：内容先写入临时文件、全部就绪后一次性替换，校验或准备阶段任一失败都不会动到任何目标文件。适合跨文件重命名、改接口签名并同步所有引用这类必须一起改才不破坏代码的任务。单个文件的简单改动仍用 edit_file / write_file。',
+    parameters: {
+      type: 'object',
+      properties: {
+        patch: {
+          type: 'string',
+          description: '标准 unified diff 文本（apply_patch 格式），可选。填了它就用这段 diff，忽略 edits。格式：每个文件一个块，以 "--- a/路径" 和 "+++ b/路径" 或 "*** Update File: 路径" 开头，后跟一个或多个 "@@ -旧行号,数量 +新行号,数量 @@" hunk，行首空格=上下文、减号=删除、加号=新增。'
+        },
+        edits: {
+          type: 'array',
+          description: '要做的改动列表，按任意顺序。当 patch 文本为空时使用',
+          items: {
+            type: 'object',
+            properties: {
+              path: { type: 'string', description: '相对工作区的文件路径' },
+              op: {
+                type: 'string',
+                enum: ['create', 'update', 'delete', 'move'],
+                description: 'create=新建(需 content)；update=字符串替换(需 old/new)；delete=删除文件；move=移动/重命名(需 new_path)'
+              },
+              content: { type: 'string', description: 'create 时的完整文件内容' },
+              old_string: { type: 'string', description: 'update 时要替换的原文片段' },
+              new_string: { type: 'string', description: 'update 时替换后的内容；未给视为删除该片段' },
+              replace_all: { type: 'boolean', description: 'update 时是否替换所有匹配，默认 false' },
+              new_path: { type: 'string', description: 'move 时的目标相对路径' }
+            },
+            required: ['path', 'op']
+          }
+        },
+        dry_run: { type: 'boolean', description: '只校验并返回将要发生的改动清单，不写盘。默认 false' }
+      }
+    }
   }
 ]
 

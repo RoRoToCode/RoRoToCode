@@ -206,3 +206,12 @@ export async function saveConfig(next: AppConfig): Promise<AppConfig> {
 export function activeProvider(config: AppConfig): ProviderConfig | null {
   return config.providers.find((p) => p.id === config.activeId) ?? config.providers[0] ?? null
 }
+
+/** 会话级模型绑定优先：会话显式绑了 modelId 就用它，否则回落全局 activeId */
+export function providerForSession(config: AppConfig, modelId?: string | null): ProviderConfig | null {
+  if (modelId) {
+    const found = config.providers.find((p) => p.id === modelId)
+    if (found) return found
+  }
+  return activeProvider(config)
+}

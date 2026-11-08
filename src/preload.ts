@@ -7,6 +7,7 @@ import type {
   CoreProgress,
   DownloadProgress,
   LocalRuntimeKind,
+  PermissionRule,
   PicoAPI,
   ProviderConfig,
   RemoteSkill,
@@ -34,6 +35,8 @@ const api: PicoAPI = {
     rename: (id: string, title: string) => ipcRenderer.invoke('sessions:rename', id, title),
     setWorkspace: (id: string, workspace: string | null) =>
       ipcRenderer.invoke('sessions:setWorkspace', id, workspace),
+    setModel: (id: string, modelId: string | null) =>
+      ipcRenderer.invoke('sessions:setModel', id, modelId),
     search: (query: string) => ipcRenderer.invoke('sessions:search', query),
     export: (id: string) => ipcRenderer.invoke('sessions:export', id),
     trash: () => ipcRenderer.invoke('sessions:trash'),
@@ -72,6 +75,13 @@ const api: PicoAPI = {
   approval: {
     respond: (id: string, approved: boolean, always?: boolean) =>
       ipcRenderer.send('approval:respond', id, approved, always)
+  },
+  question: {
+    respond: (id: string, answer: string) => ipcRenderer.send('question:respond', id, answer)
+  },
+  checkpoints: {
+    interrupted: () => ipcRenderer.invoke('checkpoints:interrupted'),
+    dismiss: (sessionId: string) => ipcRenderer.invoke('checkpoints:dismiss', sessionId)
   },
   models: {
     list: (providerId: string) => ipcRenderer.invoke('models:list', providerId),
@@ -214,6 +224,14 @@ const api: PicoAPI = {
   memory: {
     info: () => ipcRenderer.invoke('memory:info'),
     clear: () => ipcRenderer.invoke('memory:clear')
+  },
+  instructions: {
+    info: () => ipcRenderer.invoke('instructions:info'),
+    init: () => ipcRenderer.invoke('instructions:init')
+  },
+  permissions: {
+    info: () => ipcRenderer.invoke('permissions:info'),
+    save: (rules: PermissionRule[]) => ipcRenderer.invoke('permissions:save', rules)
   },
   onEvent: (cb: (payload: AgentEventEnvelope) => void) => {
     const listener = (_e: unknown, payload: AgentEventEnvelope) => cb(payload)

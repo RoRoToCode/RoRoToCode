@@ -40,6 +40,7 @@ export async function listSessions(): Promise<SessionMeta[]> {
         id: s.id,
         title: s.title,
         workspace: s.workspace ?? null,
+        modelId: s.modelId ?? null,
         createdAt: s.createdAt,
         updatedAt: s.updatedAt
       })
@@ -68,6 +69,14 @@ export async function setSessionWorkspace(id: string, workspace: string | null):
   const session = await loadSession(id)
   if ((session.workspace ?? null) === workspace) return
   session.workspace = workspace
+  session.updatedAt = Date.now()
+  await persist(session)
+}
+
+/** 给会话绑定一个模型（providerId）。传 null 表示跟随全局 activeId */
+export async function setSessionModel(id: string, modelId: string | null): Promise<void> {
+  const session = await loadSession(id)
+  session.modelId = modelId
   session.updatedAt = Date.now()
   await persist(session)
 }

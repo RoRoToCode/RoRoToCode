@@ -21,9 +21,14 @@ export interface ApprovalInput {
   alwaysApprove: boolean
   /** 本会话已显式允许过高危操作 */
   alwaysApproveHigh: boolean
+  /** 被项目规则明确拒绝：直接 deny，不弹确认框 */
+  denied?: boolean
 }
 
 export function decideApproval(input: ApprovalInput): ApprovalDecision {
+  // 项目规则明确拒绝：任何模式、任何放行记录都拦不住，直接 deny
+  if (input.denied) return 'deny'
+
   // 只读且不越界：任何模式下都不用问
   if (!input.hasRisk) return 'allow'
 

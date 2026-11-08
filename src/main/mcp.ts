@@ -15,10 +15,16 @@ import type { ToolSpec } from './tools/spec'
  */
 
 interface ServerConf {
-  command: string
+  command?: string
   args?: string[]
   env?: Record<string, string>
   disabled?: boolean
+  /** Streamable HTTP 传输的服务地址（如 https://host/mcp）。填了就走 HTTP，否则走 stdio */
+  url?: string
+  /** 可选的鉴权头（如 Authorization / 自定义 key） */
+  headers?: Record<string, string>
+  /** 单次请求超时（毫秒），默认 20000 */
+  timeoutMs?: number
 }
 
 interface Pending {
@@ -32,6 +38,10 @@ interface Conn {
   command: string
   args: string[]
   env: Record<string, string>
+  /** http 传输时的地址；空 = stdio */
+  url: string
+  headers: Record<string, string>
+  timeoutMs: number
   proc: ChildProcessWithoutNullStreams | null
   /** ready = 完成 initialize 且拿到工具清单 */
   ready: boolean
@@ -97,6 +107,7 @@ function handleMessage(conn: Conn, line: string): void {
 }
 
 function write(conn: Conn, payload: unknown): void {
+  if (conn.url) return // HTTP 传输不通过 stdin
   if (!conn.proc?.stdin.writable) return
   try {
     conn.proc.stdin.write(`${JSON.stringify(payload)}\n`)
@@ -105,7 +116,61 @@ function write(conn: Conn, payload: unknown): void {
   }
 }
 
+/** HTTP 传输的单次 JSON-RPC：POST 到 url，解析 JSON 或 SSE 响应 */
+async function httpRequest(conn: Conn, method: string, params: unknown, timeout: number): Promise<unknown> {
+  const body = JSON.stringify({ jsonrpc: '2.0', id: 1, method, params })
+  const ctrl = new AbortController()
+  const timer = setTimeout(() => ctrl.abort(), timeout)
+  try {
+    const res = await fetch(conn.url, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        accept: 'application/json, text/event-stream',
+        ...conn.headers
+      },
+      body,
+      signal: ctrl.signal
+    })
+    if (!res.ok) {
+      throw new Error(`MCP HTTP ${res.status} ${res.statusText}`)
+    }
+    const ct = res.headers.get('content-type') ?? ''
+    if (ct.includes('text/event-stream')) {
+      // Streamable HTTP：响应是一段 SSE，逐行取 data: 里的 JSON
+      const text = await res.text()
+      return parseSseJson(text)
+    }
+    return await res.json()
+  } catch (err) {
+    if ((err as Error).name === 'AbortError') throw new Error(`MCP 请求超时（${method}）`)
+    throw err
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+/** 从 SSE 文本里解析出第一个 JSON 消息体（MCP Streamable HTTP 用 data: 承载） */
+function parseSseJson(text: string): unknown {
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim()
+    if (!line.startsWith('data:')) continue
+    const payload = line.slice(5).trim()
+    if (!payload || payload === '[DONE]') continue
+    try {
+      return JSON.parse(payload)
+    } catch {
+      // 不是 JSON，继续找下一行
+    }
+  }
+  throw new Error('MCP HTTP 返回了空 SSE 响应')
+}
+
 function request(conn: Conn, method: string, params: unknown, timeout = 20000): Promise<unknown> {
+  if (conn.url) {
+    // HTTP 传输：直接发，不带 id 机制（单连接顺序请求即可）
+    return httpRequest(conn, method, params, timeout)
+  }
   if (!conn.proc?.stdin.writable) return Promise.reject(new Error('MCP 服务未运行'))
   const id = conn.nextId++
   return new Promise((resolve, reject) => {
@@ -119,11 +184,15 @@ function request(conn: Conn, method: string, params: unknown, timeout = 20000): 
 }
 
 async function connect(name: string, conf: ServerConf): Promise<Conn> {
+  const isHttp = Boolean(conf.url)
   const conn: Conn = {
     name,
-    command: conf.command,
+    command: conf.command ?? '',
     args: conf.args ?? [],
     env: conf.env ?? {},
+    url: conf.url ?? '',
+    headers: conf.headers ?? {},
+    timeoutMs: conf.timeoutMs ?? 20000,
     proc: null,
     ready: false,
     tools: [],
@@ -131,14 +200,41 @@ async function connect(name: string, conf: ServerConf): Promise<Conn> {
     nextId: 1,
     buffer: ''
   }
+  if (isHttp) {
+    // HTTP 传输：直接 initialize + tools/list
+    try {
+      const initRes = (await request(conn, 'initialize', {
+        protocolVersion: '2024-11-05',
+        capabilities: {},
+        clientInfo: { name: 'RoRoToCode', version: '0.1.2' }
+      }, 15000)) as { protocolVersion?: string }
+      // 记录服务端协议版本（若返回），暂时只用于诊断，不强制
+      void initRes
+      // Streamable HTTP 需要发 notifications/initialized
+      try {
+        await httpRequest(conn, 'notifications/initialized', {}, 15000)
+      } catch {
+        // 通知失败不致命
+      }
+      const listed = (await request(conn, 'tools/list', {}, 15000)) as {
+        tools?: Array<{ name: string; description?: string; inputSchema?: ToolSpec['parameters'] }>
+      }
+      conn.tools = listed.tools ?? []
+      conn.ready = true
+    } catch (err) {
+      conn.error = (err as Error).message
+    }
+    return conn
+  }
+
   try {
     const env = { ...process.env, ...conf.env }
     delete env.ELECTRON_RUN_AS_NODE
-    const proc = spawn(conf.command, conf.args ?? [], {
+    const proc = spawn(conf.command ?? '', conf.args ?? [], {
       stdio: ['pipe', 'pipe', 'pipe'],
       env,
       windowsHide: true,
-      shell: process.platform === 'win32' && /\.(cmd|bat)$/i.test(conf.command)
+      shell: process.platform === 'win32' && /\.(cmd|bat)$/i.test(conf.command ?? '')
     }) as ChildProcessWithoutNullStreams
 
     conn.proc = proc
@@ -165,7 +261,7 @@ async function connect(name: string, conf: ServerConf): Promise<Conn> {
       {
         protocolVersion: '2024-11-05',
         capabilities: {},
-        clientInfo: { name: 'RoRoToCode', version: '0.1.1' }
+        clientInfo: { name: 'RoRoToCode', version: '0.1.2' }
       },
       15000
     )
@@ -198,7 +294,7 @@ async function load(force = false): Promise<Conn[]> {
     }
   }
   const servers = await readConfig()
-  const list = Object.entries(servers).filter(([, c]) => c && c.command && !c.disabled)
+  const list = Object.entries(servers).filter(([, c]) => c && (c.command || c.url) && !c.disabled)
   conns = await Promise.all(list.map(([name, conf]) => connect(name, conf)))
   loaded = true
   return conns
@@ -217,7 +313,7 @@ export async function mcpStatus(): Promise<McpServerStatus[]> {
   const list = await ensureMcp()
   return list.map((c) => ({
     name: c.name,
-    command: [c.command, ...c.args].join(' '),
+    command: c.url || [c.command, ...c.args].join(' '),
     ok: c.ready,
     tools: c.tools.map((t) => ({ name: t.name, description: t.description })),
     error: c.error
@@ -281,6 +377,10 @@ export async function openMcpConfig(): Promise<{ ok: boolean; path: string; mess
         filesystem: {
           command: 'npx',
           args: ['-y', '@modelcontextprotocol/server-filesystem', 'C:/your/workspace']
+        },
+        "远程 HTTP 服务示例": {
+          url: 'https://example.com/mcp',
+          headers: { authorization: 'Bearer <你的 token>' }
         }
       }
     }

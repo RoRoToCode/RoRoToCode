@@ -1,4 +1,5 @@
 import { promises as fs } from 'node:fs'
+import path from 'node:path'
 import type {
   AgentEvent,
   ApprovalRequest,
@@ -6,6 +7,7 @@ import type {
   ChatMessage,
   FileChange,
   ProviderConfig,
+  QuestionRequest,
   SendAttachment,
   Session,
   SubAgentTask,
@@ -13,17 +15,19 @@ import type {
   TokenUsage,
   ToolCall
 } from '../shared/types'
-import { activeProvider, effectiveWorkspace, loadConfig, saveConfig } from './config'
+import { effectiveWorkspace, loadConfig, providerForSession, saveConfig } from './config'
 import * as store from './store'
 import { chat, effectiveContextWindow } from './providers'
 import type { StreamResult } from './providers/base'
-import { classifyRisk, executeTool, previewWrite, summarize, toolTargetPath, type RiskInfo } from './tools'
+import { classifyRisk, classifyMcpRisk, executeTool, previewWrite, previewPatch, patchTargets, summarize, toolTargetPath, type RiskInfo } from './tools'
 import { decideApproval } from './approval'
 import { toolSpecs, type ToolSpec } from './tools/spec'
 import { extractAttachment, renderAttachmentBody } from './extract'
 import { isImagePath, providerSupportsVision } from '../shared/vision'
 import { formatTodos, normalizeTodos } from '../shared/todos'
 import { memoryForPrompt } from './memory'
+import { findInstructions, instructionsBlock, type InstructionsResult } from './instructions'
+import { loadProjectPermissions } from './permissions'
 import { detectVerifyPlan, runVerify } from './verify'
 import { asCalls, balancedEnd, parseTextToolCalls, type RawCall } from './parse'
 import { runSubAgent } from './subagent'
@@ -33,8 +37,24 @@ import { callMcpTool, isMcpTool, mcpToolSpecs } from './mcp'
 import { CORE_PROVIDER_ID, coreFallbackProvider, ensureCoreReady } from './core'
 import { workerPlan } from './worker'
 import { estimateCost } from '../shared/pricing'
+import { saveCheckpoint, clearCheckpoint, loadCheckpoint, checkpointBrief, type Checkpoint } from './checkpoint'
 
 type Emit = (sessionId: string, event: AgentEvent) => void
+
+/**
+ * 非交互运行选项（无头 /chat 用）。GUI 不传，行为完全不变。
+ *
+ * 非交互模式下没有窗口可弹，审批和提问都必须有确定性的兜底：
+ * - approvalPolicy: 'deny'（默认，保守）—— 需要确认的操作一律拒绝并回传；
+ *   'allow' —— 放行普通写/命令，但高危（删除/越界/网络/外部 MCP）永不自动放行。
+ * - question 直接跳过，返回空答案，模型拿「未回答」继续或结束。
+ */
+export interface RunOptions {
+  /** 非交互运行：不弹审批/提问，走确定性决策 */
+  nonInteractive?: boolean
+  /** 非交互下遇到需要审批的操作怎么处理（默认 deny）；高危不受此开关影响 */
+  approvalPolicy?: 'deny' | 'allow'
+}
 
 /**
  * 判断一次失败值不值得换下一个供应商。
@@ -67,6 +87,11 @@ interface SubCtx {
   budget: number
   web: boolean
   signal: AbortSignal
+  /** 项目级规则（AGENTS.md）注入给子 agent，避免子 agent 违反项目约定 */
+  instructions?: string | null
+  /** 非交互运行（无头）：子 agent 的审批也要走确定性决策，不能弹框 */
+  nonInteractive?: boolean
+  approvalPolicy?: 'deny' | 'allow'
 }
 
 /** 子 agent 的结论要怎么回灌给主 agent：先给一行统计，再给它的总结 */
@@ -80,7 +105,7 @@ function formatTaskResult(t: SubAgentTask): string {
 }
 
 /** 写文件类工具才需要记快照 */
-const WRITE_TOOLS = new Set(['write_file', 'edit_file'])
+const WRITE_TOOLS = new Set(['write_file', 'edit_file', 'patch'])
 
 async function readTextOrNull(abs: string): Promise<string | null> {
   try {
@@ -100,6 +125,7 @@ const LITE_TOOLS = new Set([
   'grep',
   'write_file',
   'edit_file',
+  'patch',
   'run_shell',
   'shell_bg',
   'web_search',
@@ -200,6 +226,7 @@ function litePrompt(
   opts: {
     web?: boolean
     remember?: boolean
+    instructions?: InstructionsResult | null
     summary?: string | null
     verify?: string | null
     nudge?: string | null
@@ -207,6 +234,7 @@ function litePrompt(
   }
 ): string {
   const ws = workspace || '（未选择工作区）'
+  const instructions = opts.instructions ? instructionsBlock(opts.instructions) : ''
   return [
     '你是 RoRoTo Code，Windows 上的编程助手，用中文回答。回答要具体，不要客套。',
     `当前工作区：${ws}`,
@@ -219,6 +247,7 @@ function litePrompt(
     '4. 需要命令时用 run_shell；工具报错先读错误再换方案。',
     '5. 用户消息里的附件正文直接使用，不要让用户再粘贴。',
     ...(opts.remember === false ? [] : ['6. 值得下次知道的事实用 remember 记一条。']),
+    ...(instructions ? ['', instructions] : []),
     '如果无法原生调用工具，就输出一行 JSON：{"name":"web_search","args":{"query":"关键词"}}',
     '程序会执行并把结果回传给你。',
     ...(opts.nudge ? ['', '【重做】', opts.nudge] : []),
@@ -324,6 +353,7 @@ function systemPrompt(
   provider: ProviderConfig,
   opts: {
     memory?: string | null
+    instructions?: InstructionsResult | null
     summary?: string | null
     verify?: string | null
     /** 联网 / 记忆开关，关掉后提示里不再教它用这些工具 */
@@ -338,6 +368,7 @@ function systemPrompt(
   const ws = workspace || '（未选择工作区）'
   const webOn = opts.web !== false
   const rememberOn = opts.remember !== false
+  const instructions = opts.instructions ? instructionsBlock(opts.instructions) : ''
 
   const rules = [
     '闲聊、常识、日期时间这类问题直接用文字回答：上面已经给了当前时间，不要为了「今天几号／星期几」去执行命令。',
@@ -403,6 +434,9 @@ function systemPrompt(
           '【项目长期记忆】以下是过去会话在这个项目里记下的约定和经验。处理任务时默认遵守，不要重复询问：',
           opts.memory
         ]
+      : []),
+    ...(instructions
+      ? ['', instructions]
       : []),
     ...(opts.summary
       ? [
@@ -553,6 +587,8 @@ export function createDeltaGate(send: (text: string) => void) {
 export class AgentEngine {
   private controllers = new Map<string, AbortController>()
   private approvals = new Map<string, { resolve: (ok: boolean) => void; sessionId: string; high: boolean }>()
+  // question 工具：模型暂停问用户，等应答后继续。value 的 resolve 传回用户答案
+  private questions = new Map<string, { resolve: (answer: string) => void; sessionId: string }>()
   // 用户在本次运行中选择「之后全允许」的会话
   private alwaysApprove = new Set<string>()
   /** 用户显式选择「始终允许高危操作」的会话（不随普通放行一起生效） */
@@ -561,6 +597,8 @@ export class AgentEngine {
   private summaries = new Map<string, { upTo: number; text: string; tokens: number }>()
   /** 各会话当前的执行计划（update_todos 维护，只用于界面展示） */
   private todos = new Map<string, TodoItem[]>()
+  /** resume 时从 checkpoint 还原的「上次改过的文件」，接入本轮 touched 判断 */
+  private resumeTouched = new Map<string, Set<string>>()
 
   constructor(private emit: Emit) {}
 
@@ -582,6 +620,11 @@ export class AgentEngine {
   abort(sessionId: string): void {
     const controller = this.controllers.get(sessionId)
     if (controller) controller.abort(new Error('已取消'))
+    // 挂起的 question 也一起清掉，否则弹窗残留、Promise 永不 resolve、会话卡死
+    // entry.resolve 即 finish，会统一清理并 emit question_dismiss
+    for (const [id, entry] of this.questions) {
+      if (entry.sessionId === sessionId) entry.resolve('')
+    }
   }
 
   respondApproval(id: string, approved: boolean, always = false): void {
@@ -594,6 +637,52 @@ export class AgentEngine {
       else this.alwaysApprove.add(entry.sessionId)
     }
     entry.resolve(approved)
+  }
+
+  /** question 工具：用户点选/输入答案后，resolve 回传给模型继续跑 */
+  respondQuestion(id: string, answer: string): void {
+    const entry = this.questions.get(id)
+    if (!entry) return
+    // resolve 即 finish：统一做清理、解绑 abort、emit question_dismiss
+    entry.resolve(answer)
+  }
+
+  private askQuestion(
+    sessionId: string,
+    question: string,
+    options?: string[],
+    signal?: AbortSignal,
+    multiSelect = false
+  ): Promise<string> {
+    const request: QuestionRequest = { id: store.newId(), question, options, multiSelect }
+    this.emit(sessionId, { type: 'question', request })
+    return new Promise((resolve) => {
+      let settled = false
+      const finish = (answer: string) => {
+        if (settled) return
+        settled = true
+        this.questions.delete(request.id)
+        if (signal) signal.removeEventListener('abort', onAbort)
+        if (timer) clearTimeout(timer)
+        this.emit(sessionId, { type: 'question_dismiss', id: request.id })
+        resolve(answer)
+      }
+      // 中止信号：用户点「停止」或超时，用空答案收尾，让模型拿「未回答」继续或结束
+      const onAbort = () => finish('')
+      if (signal) {
+        if (signal.aborted) {
+          finish('')
+          return
+        }
+        signal.addEventListener('abort', onAbort, { once: true })
+      }
+      // 兜底超时：10 分钟没人回答就自动跳过，避免会话永久挂起
+      const timer = setTimeout(() => finish(''), 10 * 60 * 1000)
+      this.questions.set(request.id, {
+        resolve: finish,
+        sessionId
+      })
+    })
   }
 
   private askApproval(
@@ -619,11 +708,12 @@ export class AgentEngine {
     })
   }
 
-  async send(sessionId: string, text: string, files?: SendAttachment[]): Promise<void> {
+  async send(sessionId: string, text: string, files?: SendAttachment[], options?: RunOptions): Promise<void> {
     if (this.controllers.has(sessionId)) throw new Error('这个会话正在运行中')
 
     const config = await loadConfig()
-    const provider = activeProvider(config)
+    const existing = await store.loadSession(sessionId).catch(() => null)
+    const provider = providerForSession(config, existing?.modelId)
     if (!provider) throw new Error('还没有配置模型')
 
     const controller = new AbortController()
@@ -640,7 +730,7 @@ export class AgentEngine {
           createdAt: Date.now()
         }
       ])
-      await this.runLoop(session, config, provider, controller.signal)
+      await this.runLoop(session, config, provider, controller.signal, options)
     } finally {
       this.controllers.delete(sessionId)
       this.alwaysApprove.delete(sessionId)
@@ -653,7 +743,8 @@ export class AgentEngine {
   private async begin(sessionId: string): Promise<{ config: AppConfig; provider: ProviderConfig; signal: AbortSignal }> {
     if (this.controllers.has(sessionId)) throw new Error('这个会话正在运行中')
     const config = await loadConfig()
-    const provider = activeProvider(config)
+    const existing = await store.loadSession(sessionId).catch(() => null)
+    const provider = providerForSession(config, existing?.modelId)
     if (!provider) throw new Error('还没有配置模型')
     const controller = new AbortController()
     this.controllers.set(sessionId, controller)
@@ -698,9 +789,24 @@ export class AgentEngine {
     }
   }
 
-  /** 中断后接着做：把「继续」当成新的一轮，模型会从断点往下走 */
+  /** 中断后接着做：先还原结构化 checkpoint（计划 + 改过的文件），再让模型从断点往下走 */
   async resume(sessionId: string): Promise<void> {
-    await this.send(sessionId, '继续。上次执行被中断了，请从断点接着做完，不要重复已经完成的部分。')
+    // 崩溃 / 中断后，引擎内存里的计划已经丢了：从 checkpoint 还原，这样「计划还有未完成项」的判断才成立
+    const cp = await loadCheckpoint(sessionId)
+    if (cp) {
+      if (cp.todos.length && !this.todos.has(sessionId)) {
+        this.todos.set(sessionId, cp.todos)
+      }
+      if (cp.touched.length) {
+        this.resumeTouched.set(sessionId, new Set(cp.touched))
+      }
+    }
+    // 把结构化进度拼进「继续」消息：明确告诉模型做到哪、还剩什么、别重复已完成的部分
+    const brief = cp ? `\n\n${checkpointBrief(cp)}` : ''
+    await this.send(
+      sessionId,
+      `继续。上次执行被中断了，请从断点接着做完，不要重复已经完成的部分。${brief}`
+    )
   }
 
   /**
@@ -995,8 +1101,20 @@ export class AgentEngine {
     session: Session,
     config: AppConfig,
     provider: ProviderConfig,
-    signal: AbortSignal
+    signal: AbortSignal,
+    options?: RunOptions
   ): Promise<void> {
+    // 非交互模式下的审批决策：不弹框，按策略确定性返回 allow/deny
+    const nonInteractive = options?.nonInteractive === true
+    const approveDecision = (input: Parameters<typeof decideApproval>[0]): boolean => {
+      const d = decideApproval(input)
+      if (d === 'allow') return true
+      if (d === 'deny') return false
+      // d === 'ask'：非交互下没有窗口可弹。
+      // 高危操作永不自动放行（安全底线），普通操作按策略收口。
+      if (input.high) return false
+      return options?.approvalPolicy === 'allow'
+    }
     // 预算按「服务端真实可用的上下文」算：Ollama 可能被模型自身上限截断，llama.cpp 以 /props 为准；
     // 再跟「软件设置 → 上下文」的上限取小（只有开了「限制上下文」才取）
     const realCtx = await effectiveContextWindow(provider)
@@ -1030,8 +1148,22 @@ export class AgentEngine {
 
     // 跨会话记忆：每个工作区一份，整段注入系统提示（内部有长度上限）
     let memory = memoryOn ? await memoryForPrompt(workspace) : null
+    // 项目级规则（AGENTS.md / CLAUDE.md）：只读发现，向上逐层找，最近的文件优先
+    const instructions = await findInstructions(workspace)
+    // 项目级权限规则（roroto.json 的 permissions）：执行引擎用的机器可读规则
+    const permRules = await loadProjectPermissions(workspace)
     /** 本轮改过的文件：只有动过代码才值得跑验证 */
     const touched = new Set<string>()
+    // resume 还原的「上次改过的文件」接进来：模型从断点续跑时，这些文件也算「动过」，值得接着验证
+    const priorTouched = this.resumeTouched.get(session.id)
+    if (priorTouched) {
+      for (const rel of priorTouched) {
+        // checkpoint 里存的是相对工作区路径，还原成绝对路径
+        const abs = path.resolve(workspace, rel)
+        touched.add(abs)
+      }
+      this.resumeTouched.delete(session.id)
+    }
     // 重开会话后引擎内存里没有计划：从历史里还原最后一次 update_todos，
     // 否则「计划里还有未完成项」这个自动续跑判断就永远不成立
     if (!this.todos.has(session.id)) {
@@ -1076,6 +1208,34 @@ export class AgentEngine {
     const recentCalls: string[] = []
     let pollWarned = false
 
+    /**
+     * 结构化 checkpoint：把「计划 + 改过的文件 + 验证结论」独立落盘，不随对话压缩失真。
+     * 正常完成 / 交还用户时标 done 并清除；抛异常时保留 running 作为「中断」标记，
+     * 下次启动据此提示恢复。写盘失败静默吞掉（checkpoint 是兜底，不拖垮主流程）。
+     */
+    const checkpointStartedAt = Date.now()
+    const persistCheckpoint = (status: Checkpoint['status']): void => {
+      void saveCheckpoint({
+        sessionId: session.id,
+        workspace,
+        status,
+        todos: this.todos.get(session.id) ?? [],
+        touched: [...touched].map((abs) => {
+          try {
+            return path.relative(workspace, abs).replace(/\\/g, '/') || abs
+          } catch {
+            return abs
+          }
+        }),
+        verifyNote,
+        lastCalls: recentCalls.slice(-10),
+        continues,
+        createdAt: checkpointStartedAt,
+        updatedAt: Date.now()
+      })
+    }
+    persistCheckpoint('running')
+
     for (let step = 0; step < stepBudget; step++) {
       if (signal.aborted) throw new Error('已取消')
 
@@ -1090,6 +1250,7 @@ export class AgentEngine {
           ? litePrompt(workspace, {
               web: webOn,
               remember: memoryOn,
+              instructions,
               summary: summaryText,
               verify: verifyNote,
               nudge: nudgeNote,
@@ -1097,6 +1258,7 @@ export class AgentEngine {
             })
           : systemPrompt(workspace, runProvider, {
               memory,
+              instructions,
               summary: summaryText,
               verify: verifyNote,
               web: webOn,
@@ -1395,10 +1557,13 @@ export class AgentEngine {
           }
         }
 
+        // 正常收工：任务完成，清除 checkpoint（不是中断，下次启动不该提示恢复）
+        persistCheckpoint('done')
+        await clearCheckpoint(session.id)
         return
       }
 
-      // 派子 agent 时的运行参数：子 agent 不继承「派活」和「计划」这两个工具，避免自己再派下去
+      // 派子 agent 时的运行参数：子 agent 不继承「派活」「计划」「提问」这三个工具，避免自己再派下去 / 反客为主提问
       const subCtx: SubCtx = {
         session,
         sessionId: session.id,
@@ -1406,11 +1571,14 @@ export class AgentEngine {
         provider: runProvider,
         workspace,
         tools: (isSmallModel(runProvider.model) ? tools : fullTools).filter(
-          (t) => t.name !== 'task' && t.name !== 'update_todos'
+          (t) => t.name !== 'task' && t.name !== 'update_todos' && t.name !== 'question'
         ),
         budget: stepCap,
         web: webOn,
-        signal
+        signal,
+        instructions: instructionsBlock(instructions) || null,
+        nonInteractive,
+        approvalPolicy: options?.approvalPolicy
       }
 
       for (let ci = 0; ci < toolCalls.length; ci++) {
@@ -1435,42 +1603,70 @@ export class AgentEngine {
         const risk = disabled(call.name)
           ? null
           : isMcpTool(call.name)
-            ? ({ kind: 'shell', reason: `调用外部 MCP 工具 ${call.name}`, high: true } as RiskInfo)
-            : classifyRisk(call.name, args, workspace)
+            ? classifyMcpRisk(call.name, permRules)
+            : classifyRisk(call.name, args, workspace, permRules)
         const decision = decideApproval({
           mode: config.approvalMode,
           hasRisk: !!risk,
           high: risk?.high === true,
+          denied: risk?.denied === true,
           alwaysApprove: this.alwaysApprove.has(session.id),
           alwaysApproveHigh: this.alwaysApproveHigh.has(session.id)
         })
         let approved = decision !== 'deny'
         if (decision === 'ask' && risk) {
-          // 写文件的先把 diff 算出来，让用户看清改哪几行再决定
-          let preview: ApprovalRequest['preview'] | undefined
-          if (WRITE_TOOLS.has(call.name)) {
-            const pv = await previewWrite(call.name, args, workspace).catch(() => null)
-            if (pv) {
-              const lines = diffLines(pv.before ?? '', pv.after)
-              const st = diffStats(lines)
-              preview = { path: pv.path, kind: pv.kind, added: st.added, removed: st.removed, lines }
+          if (nonInteractive) {
+            // 无头模式：不弹框，按策略确定性收口（approveDecision 里 ask 分支已处理）
+            approved = approveDecision({
+              mode: config.approvalMode,
+              hasRisk: true,
+              high: risk.high === true,
+              denied: risk.denied === true,
+              alwaysApprove: this.alwaysApprove.has(session.id),
+              alwaysApproveHigh: this.alwaysApproveHigh.has(session.id)
+            })
+          } else {
+            // 写文件的先把 diff 算出来，让用户看清改哪几行再决定
+            let preview: ApprovalRequest['preview'] | undefined
+            if (call.name === 'patch') {
+              const pvs = previewPatch(args, workspace, risk.kind === 'outside')
+              if (pvs.length) {
+                const files = pvs.map((pv) => {
+                  const lines = diffLines(pv.before ?? '', pv.after ?? '')
+                  const st = diffStats(lines)
+                  return { path: pv.path, kind: pv.kind, added: st.added, removed: st.removed, lines }
+                })
+                const first = files[0]
+                preview = { ...first, files }
+              }
+            } else if (WRITE_TOOLS.has(call.name)) {
+              const pv = await previewWrite(call.name, args, workspace).catch(() => null)
+              if (pv) {
+                const lines = diffLines(pv.before ?? '', pv.after)
+                const st = diffStats(lines)
+                preview = { path: pv.path, kind: pv.kind, added: st.added, removed: st.removed, lines }
+              }
             }
+            approved = await this.askApproval(session.id, call.name, args, risk, preview)
           }
-          approved = await this.askApproval(session.id, call.name, args, risk, preview)
         }
 
         const started = Date.now()
         // 写文件的：先留一份改前内容，执行完再记一条可撤销的改动
-        let writeTarget = ''
-        if (WRITE_TOOLS.has(call.name)) {
+        // patch 是多文件，用 patchTargets 取全部目标；单个文件仍用 toolTargetPath
+        const writeTargets: string[] = []
+        if (call.name === 'patch') {
+          writeTargets.push(...patchTargets(workspace, args, risk?.kind === 'outside'))
+        } else if (WRITE_TOOLS.has(call.name)) {
           try {
-            writeTarget = toolTargetPath(workspace, String(args.path ?? ''), risk?.kind === 'outside')
+            const t = toolTargetPath(workspace, String(args.path ?? ''), risk?.kind === 'outside')
+            writeTargets.push(t)
           } catch {
             // 路径非法（越界 / 空）：不记快照，正常执行时工具自己会报错
-            writeTarget = ''
           }
         }
-        const beforeText = writeTarget ? await readTextOrNull(writeTarget) : null
+        const beforeByTarget = new Map<string, string | null>()
+        for (const t of writeTargets) beforeByTarget.set(t, await readTextOrNull(t))
         let output: string
         let ok = true
         if (!approved) {
@@ -1490,6 +1686,16 @@ export class AgentEngine {
           planTouched = true
           this.emit(session.id, { type: 'todos', items })
           output = formatTodos(items)
+        } else if (call.name === 'question') {
+          // 暂停下来问用户，等应答后把答案作为工具结果回传，接着跑
+          const opts = Array.isArray(args.options)
+            ? (args.options as unknown[]).map((o) => String(o)).slice(0, 6)
+            : undefined
+          const multi = Boolean(args.multiSelect)
+          const answer = nonInteractive
+            ? '' // 非交互模式没有用户可问，直接跳过
+            : await this.askQuestion(session.id, String(args.question ?? ''), opts, signal, multi)
+          output = answer ? `用户的回答：${answer}` : '用户没有回答（已跳过）。'
         } else if (isMcpTool(call.name)) {
           try {
             output = await callMcpTool(call.name, args)
@@ -1506,6 +1712,8 @@ export class AgentEngine {
             })
             if (call.name === 'write_file' || call.name === 'edit_file') {
               touched.add(String(args.path ?? ''))
+            } else if (call.name === 'patch') {
+              for (const t of writeTargets) touched.add(t)
             }
             if (call.name === 'remember') {
               // 刚记下的内容立刻生效，不用等下一轮对话
@@ -1518,13 +1726,16 @@ export class AgentEngine {
         }
 
         // 改动落盘成功才记快照；失败或没变化不会进「变更」列表
-        if (ok && writeTarget) {
-          const afterText = await readTextOrNull(writeTarget)
-          if (afterText !== null) {
+        if (ok && writeTargets.length) {
+          for (const target of writeTargets) {
+            const afterText = await readTextOrNull(target)
+            const beforeText = beforeByTarget.get(target) ?? null
+            // 前后都没内容（如 move 的中间态）跳过，不产生无意义快照
+            if (afterText === null && beforeText === null) continue
             const change = await recordChange({
               sessionId: session.id,
               root: workspace,
-              absPath: writeTarget,
+              absPath: target,
               before: beforeText,
               after: afterText,
               tool: call.name
@@ -1578,9 +1789,15 @@ export class AgentEngine {
           })
         }
       }
+
+      // 每轮结束同步一次 checkpoint：计划 / 改动文件 / 验证结论有任何进展都即时落盘，
+      // 这样即使下一秒崩溃，恢复时也能拿到最新的结构化进度
+      persistCheckpoint('running')
     }
 
-    // 步数预算用完了还没收工：这里是真的要交给用户了
+    // 步数预算用完了还没收工：这里是真的要交给用户了（不是崩溃，标 done 清除）
+    persistCheckpoint('done')
+    await clearCheckpoint(session.id)
     this.emit(session.id, { type: 'step_limit', maxSteps: stepBudget })
   }
 
@@ -1659,16 +1876,22 @@ export class AgentEngine {
         signal: ctx.signal,
         web: ctx.web,
         note: plan.reason,
+        instructions: ctx.instructions,
         approve: (tool: string, args: Record<string, unknown>, risk: RiskInfo, preview?: ApprovalRequest['preview']) => {
           const decision = decideApproval({
             mode: ctx.config.approvalMode,
             hasRisk: true,
             high: risk.high === true,
+            denied: risk.denied === true,
             alwaysApprove: this.alwaysApprove.has(ctx.sessionId),
             alwaysApproveHigh: this.alwaysApproveHigh.has(ctx.sessionId)
           })
           if (decision === 'allow') return Promise.resolve(true)
           if (decision === 'deny') return Promise.resolve(false)
+          if (ctx.nonInteractive) {
+            // 高危永不自动放行；普通操作按策略
+            return Promise.resolve(risk.high === true ? false : ctx.approvalPolicy === 'allow')
+          }
           return this.askApproval(ctx.sessionId, tool, args, risk, preview)
         },
         onChange: (change: FileChange) => {

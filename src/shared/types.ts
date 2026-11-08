@@ -202,12 +202,25 @@ export interface SessionMeta {
   workspace: string | null
   createdAt: number
   updatedAt: number
+  /** 本会话绑定的模型（providerId）。不填 = 跟随全局 activeId */
+  modelId?: string | null
 }
 
 export interface Session extends SessionMeta {
   messages: ChatMessage[]
   /** 本会话累计用量（只统计主 agent 的成功轮次） */
   usage?: TokenUsage
+}
+
+/** 崩溃/中断的会话及其结构化进度，供恢复入口展示 */
+export interface InterruptedCheckpoint {
+  sessionId: string
+  workspace: string | null
+  /** 未完成的计划项（completed 已剔除） */
+  todos: TodoItem[]
+  /** 上次已改动的文件（相对工作区路径） */
+  touched: string[]
+  updatedAt: number
 }
 
 /** 删除会话内一轮对话的结果 */
@@ -232,6 +245,20 @@ export interface TokenUsage {
 
 export type RiskKind = 'network' | 'delete' | 'outside' | 'write' | 'shell'
 
+/**
+ * 用户可写的一条权限规则（项目级 roroto.json 里的 permissions 数组）。
+ * 按顺序匹配，最后一条命中的生效；只用于「加严」或「明确放行普通操作」，
+ * 永远无法绕过 HARD_BLOCK 硬拒与高危强制确认。
+ */
+export interface PermissionRule {
+  /** 工具名，'*' 表示所有工具 */
+  action: string
+  /** 匹配资源：命令字符串 / 文件路径（相对工作区），支持 * 通配 */
+  resource: string
+  /** allow = 明确放行（仍受硬拒约束）；deny = 明确拒绝 */
+  effect: 'allow' | 'deny'
+}
+
 export interface ApprovalRequest {
   id: string
   tool: string
@@ -244,11 +271,28 @@ export interface ApprovalRequest {
   /** 写文件类操作先算好改动，弹窗里直接给用户看 */
   preview?: {
     path: string
-    kind: 'create' | 'modify'
+    kind: 'create' | 'modify' | 'delete'
     added: number
     removed: number
     lines: DiffLine[]
+    /** patch 等多文件操作时，逐文件展示，此时上面的字段只代表第一个文件 */
+    files?: Array<{
+      path: string
+      kind: 'create' | 'modify' | 'delete'
+      added: number
+      removed: number
+      lines: DiffLine[]
+    }>
   }
+}
+
+/** question 工具：模型暂停下来向用户提问（可带选项），等待作答后继续 */
+export interface QuestionRequest {
+  id: string
+  question: string
+  options?: string[]
+  /** 多选：用户可选多个选项，答案以逗号分隔回传 */
+  multiSelect?: boolean
 }
 
 /** 一处文件改动（每次 write_file / edit_file 记一条，可单独撤销） */
@@ -816,6 +860,8 @@ export type AgentEvent =
   | { type: 'tool_start'; callId: string; tool: string; args: Record<string, unknown> }
   | { type: 'tool_result'; callId: string; tool: string; result: string; ok: boolean; durationMs: number }
   | { type: 'approval'; request: ApprovalRequest }
+  | { type: 'question'; request: QuestionRequest }
+  | { type: 'question_dismiss'; id: string }
   | { type: 'usage'; usage: TokenUsage; last?: TokenUsage }
   | { type: 'step_limit'; maxSteps: number }
   | { type: 'auto_continue'; round: number; reason: string }
@@ -845,6 +891,8 @@ export interface PicoAPI {
     deleteTurn(id: string, messageId: string): Promise<DeleteTurnResult>
     rename(id: string, title: string): Promise<void>
     setWorkspace(id: string, workspace: string | null): Promise<void>
+    /** 给会话绑定模型（providerId），传 null 跟随全局 */
+    setModel(id: string, modelId: string | null): Promise<void>
     /** 按标题和正文搜索会话 */
     search(query: string): Promise<SessionHit[]>
     /** 导出为 Markdown（弹出保存对话框） */
@@ -896,6 +944,15 @@ export interface PicoAPI {
   }
   approval: {
     respond(id: string, approved: boolean, always?: boolean): void
+  }
+  question: {
+    respond(id: string, answer: string): void
+  }
+  checkpoints: {
+    /** 上次没跑完（崩溃/中断）的会话及其结构化进度 */
+    interrupted(): Promise<InterruptedCheckpoint[]>
+    /** 用户选择忽略，清除中断标记 */
+    dismiss(sessionId: string): Promise<void>
   }
   models: {
     list(providerId: string): Promise<{ ok: boolean; models: string[]; error?: string }>
@@ -1088,6 +1145,15 @@ export interface PicoAPI {
   memory: {
     info(): Promise<{ path: string; items: number; chars: number }>
     clear(): Promise<{ ok: boolean }>
+  }
+  /** 项目规则（AGENTS.md / CLAUDE.md，只读，随仓库提交共享） */
+  instructions: {
+    info(): Promise<{ path: string | null; text: string; truncated: boolean; name: string | null }>
+    init(): Promise<{ created: boolean; path: string }>
+  }
+  permissions: {
+    info(): Promise<{ workspace: string | null; path: string | null; rules: PermissionRule[] }>
+    save(rules: PermissionRule[]): Promise<{ path: string; created: boolean; count: number }>
   }
   onEvent(cb: (payload: AgentEventEnvelope) => void): () => void
 }

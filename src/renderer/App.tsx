@@ -10,6 +10,8 @@ import type {
   ChatMessage,
   FileAttachment,
   FileChange,
+  InterruptedCheckpoint,
+  QuestionRequest,
   Session,
   SessionMeta,
   Skill,
@@ -133,12 +135,19 @@ export function App() {
   // 审批队列：并行派出去的子 agent 可能同时要审批，一条一条处理
   const [approvals, setApprovals] = useState<ApprovalRequest[]>([])
   const approval = approvals[0] ?? null
+  /** question 工具：模型暂停问用户，一次一个 */
+  const [question, setQuestion] = useState<QuestionRequest | null>(null)
+  const [questionAnswer, setQuestionAnswer] = useState('')
+  /** 多选时已勾选的选项（无序集合） */
+  const [questionPicked, setQuestionPicked] = useState<Set<string>>(new Set())
   /** 高危审批要求勾选后才能「始终允许」，切换审批项时重置 */
   const [highAck, setHighAck] = useState(false)
   useEffect(() => setHighAck(false), [approval?.id])
   /** 正在跑的子任务，按父 agent 的 callId 索引 */
   const [subTasks, setSubTasks] = useState<Record<string, SubAgentTask>>({})
   const [toast, setToast] = useState<{ text: string; kind: 'info' | 'warn' | 'error' } | null>(null)
+  /** 上次崩溃/中断未跑完的会话，启动时提示可恢复 */
+  const [interrupted, setInterrupted] = useState<InterruptedCheckpoint[]>([])
   const [probes, setProbes] = useState<Record<string, ProbeInfo>>({})
   // 待确认的工作区删除（连同该分组下的所有会话）
   const [pendingWsDelete, setPendingWsDelete] = useState<{
@@ -324,6 +333,12 @@ export function App() {
         setSessions([created])
         await openSession(created.id)
       }
+
+      // 崩溃自动恢复：查上次没跑完的会话，有就提示（可一键恢复或忽略）
+      void window.pico.checkpoints
+        .interrupted()
+        .then((list) => setInterrupted(list ?? []))
+        .catch(() => undefined)
 
       // 当前选中的是本地 llama.cpp 但服务没跑时自动拉起，
       // 否则一打开程序这个模型必然显示红叉（其实只是没启动）
@@ -535,6 +550,17 @@ export function App() {
           setApprovals((q) => (q.some((a) => a.id === event.request.id) ? q : [...q, event.request]))
           setRunNote(tr("等待你确认操作"))
           break
+        case 'question':
+          setQuestion(event.request)
+          setQuestionAnswer('')
+          setQuestionPicked(new Set())
+          setRunNote(tr("等待你回答"))
+          break
+        case 'question_dismiss':
+          setQuestion((q) => (q && q.id === event.id ? null : q))
+          setQuestionAnswer('')
+          setQuestionPicked(new Set())
+          break
         case 'step_limit':
           notify(tr("已达到单轮最大步数 {maxSteps}，任务可能未完成，可以继续发消息推动。", { maxSteps: event.maxSteps }), 'warn')
           break
@@ -551,6 +577,8 @@ export function App() {
           setRunning(false)
           setRunStart(0)
           setApprovals([])
+          setQuestion(null)
+          setQuestionAnswer('')
           void refreshSessions()
           break
         default:
@@ -776,6 +804,34 @@ export function App() {
       setRunStart(0)
     }
   }, [current, running, notify])
+
+  /** 启动恢复提示条：点「恢复」跳到那个会话并从中断处继续 */
+  const resumeInterrupted = useCallback(
+    async (sessionId: string) => {
+      await openSession(sessionId)
+      setInterrupted((list) => list.filter((c) => c.sessionId !== sessionId))
+      // openSession 是异步的，等 current 就位后再触发 resume；这里直接调 chat.resume 即可，
+      // 主进程会从 checkpoint 还原进度并接着跑
+      if (running) return
+      setRunning(true)
+      setRunStart(Date.now())
+      setRunNote(tr("从断点继续"))
+      try {
+        await window.pico.chat.resume(sessionId)
+      } catch (err) {
+        notify((err as Error).message, 'error')
+        setRunning(false)
+        setRunStart(0)
+      }
+    },
+    [openSession, running, notify]
+  )
+
+  /** 忽略中断提示：清除该会话的 checkpoint 标记 */
+  const dismissInterrupted = useCallback(async (sessionId: string) => {
+    setInterrupted((list) => list.filter((c) => c.sessionId !== sessionId))
+    await window.pico.checkpoints.dismiss(sessionId).catch(() => undefined)
+  }, [])
 
   /** 导出当前会话为 Markdown */
   const exportCurrent = useCallback(async () => {
@@ -1015,6 +1071,39 @@ export function App() {
     [applyConfig, config, notify, refreshProbes, waitLocalReady]
   )
 
+  /** 给当前会话单独绑定模型（空串 = 跟随全局） */
+  const bindSessionModel = useCallback(
+    async (modelId: string) => {
+      if (!current) return
+      const val = modelId || null
+      await window.pico.sessions.setModel(current.id, val)
+      setCurrent((prev) => (prev ? { ...prev, modelId: val } : prev))
+      void refreshSessions()
+      // 绑到本地 llama.cpp provider 时，确保它的服务已启动，
+      // 否则下一条消息会撞连接失败、只能靠自动兜底换模型。
+      const target = config?.providers.find((p) => p.id === val)
+      if (target && isLlamaProvider(target)) {
+        const st = await window.pico.llama.status(target.id).catch(() => null)
+        if (!st?.running) {
+          setLlamaLoading(true)
+          setProbes((prev) => ({ ...prev, [target.id]: { state: 'checking' } }))
+          const r = await window.pico.llama.start(target.model || undefined, undefined, {
+            providerId: target.id
+          })
+          if (!r.ok) notify(r.message, 'error')
+          void (async () => {
+            await waitLocalReady(target.id)
+            setLlamaLoading(false)
+            void refreshProbes()
+          })()
+        } else {
+          void refreshProbes()
+        }
+      }
+    },
+    [current, config, notify, refreshProbes, refreshSessions, waitLocalReady]
+  )
+
   const respondApproval = useCallback(
     (approved: boolean, always = false) => {
       if (!approval) return
@@ -1024,6 +1113,19 @@ export function App() {
       setApprovals((q) => q.filter((a) => a.id !== approval.id))
     },
     [approval]
+  )
+
+  const respondQuestion = useCallback(
+    (answer: string) => {
+      if (!question) return
+      const a = answer.trim()
+      if (!a) return
+      window.pico.question.respond(question.id, a)
+      setQuestion(null)
+      setQuestionAnswer('')
+      setQuestionPicked(new Set())
+    },
+    [question]
   )
 
   const provider = config?.providers.find((p) => p.id === config.activeId) ?? config?.providers[0] ?? null
@@ -1155,6 +1257,21 @@ export function App() {
             title={tr("模型设置：本地模型、模型 API、模型列表")}
           >
             {tr("模型设置")}</button>
+          {current && config && config.providers.length > 1 && (
+            <select
+              className="session-model-select"
+              value={current.modelId ?? ''}
+              onChange={(e) => void bindSessionModel(e.target.value)}
+              title={tr("本会话单独用哪个模型（不影响其他会话）")}
+            >
+              <option value="">{tr("跟随全局")}</option>
+              {config.providers.map((p) => (
+                <option key={p.id} value={p.id}>
+                  {p.name}
+                </option>
+              ))}
+            </select>
+          )}
           <div className="spacer" />
           <button
             className="icon-btn header-lang"
@@ -1330,6 +1447,29 @@ export function App() {
             </div>
           )}
         </div>
+
+        {interrupted.length > 0 && (
+          <div className="resume-banner">
+            <div className="resume-banner-text">
+              <strong>{tr("检测到上次有任务没跑完")}</strong>
+              <span>
+                {interrupted.length === 1
+                  ? tr("有 {n} 个会话在中断时仍在执行，可以接着做。", { n: interrupted.length })
+                  : tr("有 {n} 个会话在中断时仍在执行，可以接着做。", { n: interrupted.length })}
+              </span>
+            </div>
+            {interrupted.slice(0, 1).map((c) => (
+              <div key={c.sessionId} className="resume-banner-actions">
+                <button className="btn primary" onClick={() => void resumeInterrupted(c.sessionId)}>
+                  {tr("恢复执行")}
+                </button>
+                <button className="btn" onClick={() => void dismissInterrupted(c.sessionId)}>
+                  {tr("忽略")}
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
 
         <div className="composer">
           {running && <RunStatus note={runNote} startedAt={runStart} />}
@@ -1671,19 +1811,47 @@ export function App() {
               {tr("模型请求执行")}<b style={{ color: '#e9e9ec' }}>{approval.tool}</b>
             </div>
             {approval.preview ? (
-              <div className="approval-diff">
-                <div className="approval-diff-head">
-                  <span className="approval-diff-path" title={approval.preview.path}>
-                    {approval.preview.path}
-                  </span>
-                  <span className="approval-diff-stat">
-                    {approval.preview.added ? <em className="add">+{approval.preview.added}</em> : null}
-                    {approval.preview.removed ? <em className="del">−{approval.preview.removed}</em> : null}
-                    <em className="kind">{approval.preview.kind === 'create' ? tr("新建") : tr("修改")}</em>
-                  </span>
+              approval.preview.files && approval.preview.files.length > 1 ? (
+                <div className="approval-diff">
+                  {approval.preview.files.map((f) => (
+                    <div className="approval-diff-block" key={f.path}>
+                      <div className="approval-diff-head">
+                        <span className="approval-diff-path" title={f.path}>
+                          {f.path}
+                        </span>
+                        <span className="approval-diff-stat">
+                          {f.added ? <em className="add">+{f.added}</em> : null}
+                          {f.removed ? <em className="del">−{f.removed}</em> : null}
+                          <em className="kind">
+                            {f.kind === 'create' ? tr("新建") : f.kind === 'delete' ? tr("删除") : tr("修改")}
+                          </em>
+                        </span>
+                      </div>
+                      <DiffView lines={f.lines} max={160} />
+                    </div>
+                  ))}
                 </div>
-                <DiffView lines={approval.preview.lines} max={220} />
-              </div>
+              ) : (
+                <div className="approval-diff">
+                  <div className="approval-diff-head">
+                    <span className="approval-diff-path" title={approval.preview.path}>
+                      {approval.preview.path}
+                    </span>
+                    <span className="approval-diff-stat">
+                      {approval.preview.added ? <em className="add">+{approval.preview.added}</em> : null}
+                      {approval.preview.removed ? <em className="del">−{approval.preview.removed}</em> : null}
+                      <em className="kind">
+                        {approval.preview.kind === 'create'
+                          ? tr("新建")
+                          : approval.preview.kind === 'delete'
+                            ? tr("删除")
+                            : tr("修改")}
+                      </em>
+                    </span>
+                  </div>
+                  <DiffView lines={approval.preview.lines} max={220} />
+                </div>
+              )
             ) : (
               <pre className="approval-args">{JSON.stringify(approval.args, null, 2)}</pre>
             )}
@@ -1714,6 +1882,92 @@ export function App() {
                 <button className="btn primary" onClick={() => void respondApproval(true, true)}>
                   {tr("之后全允许")}</button>
               )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {question && (
+        <div className="overlay">
+          <div className="modal modal-sm">
+            <h2>{tr("模型想问你")}</h2>
+            <div style={{ color: '#e9e9ec', fontSize: 'calc(13px * var(--fs, 1))', lineHeight: 1.6, marginBottom: 12 }}>
+              {question.question}
+            </div>
+            {question.options && question.options.length > 0 ? (
+              question.multiSelect ? (
+                <div className="question-options">
+                  {question.options.map((opt) => {
+                    const on = questionPicked.has(opt)
+                    const toggle = () =>
+                      setQuestionPicked((prev) => {
+                        const next = new Set(prev)
+                        if (next.has(opt)) next.delete(opt)
+                        else next.add(opt)
+                        return next
+                      })
+                    return (
+                      <label key={opt} className="btn question-option" style={{ cursor: 'pointer' }} onClick={toggle}>
+                        <input
+                          type="checkbox"
+                          checked={on}
+                          onChange={toggle}
+                          style={{ marginRight: 8 }}
+                        />
+                        {opt}
+                      </label>
+                    )
+                  })}
+                  <button
+                    className="btn primary"
+                    style={{ marginTop: 8 }}
+                    disabled={questionPicked.size === 0}
+                    onClick={() => void respondQuestion([...questionPicked].join('，'))}
+                  >
+                    {tr("确定（已选 {n} 项）", { n: questionPicked.size })}
+                  </button>
+                </div>
+              ) : (
+                <div className="question-options">
+                  {question.options.map((opt) => (
+                    <button
+                      key={opt}
+                      className="btn question-option"
+                      onClick={() => void respondQuestion(opt)}
+                    >
+                      {opt}
+                    </button>
+                  ))}
+                </div>
+              )
+            ) : null}
+            <div className="row" style={{ marginTop: 12 }}>
+              <input
+                className="input"
+                style={{ flex: 1 }}
+                value={questionAnswer}
+                placeholder={tr("或输入你的回答")}
+                onChange={(e) => setQuestionAnswer(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') void respondQuestion(questionAnswer)
+                }}
+              />
+              <button
+                className="btn primary"
+                disabled={!questionAnswer.trim()}
+                onClick={() => void respondQuestion(questionAnswer)}
+              >
+                {tr("发送")}</button>
+              <button
+                className="btn"
+                onClick={() => {
+                  window.pico.question.respond(question.id, '')
+                  setQuestion(null)
+                  setQuestionAnswer('')
+                  setQuestionPicked(new Set())
+                }}
+              >
+                {tr("跳过")}</button>
             </div>
           </div>
         </div>

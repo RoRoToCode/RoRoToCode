@@ -7,7 +7,7 @@ import { loadConfig } from './config'
 import { findFreePort } from './portprobe'
 import { isLoopbackUrl } from './providers/base'
 import { llamaInstances, startLlama, statusLlama, stopLlama } from './llama'
-import type { LlamaStatus, ProviderConfig } from '../shared/types'
+import type { AgentEvent, LlamaStatus, ProviderConfig } from '../shared/types'
 
 /**
  * 本地 HTTP 控制面。
@@ -20,6 +20,65 @@ import type { LlamaStatus, ProviderConfig } from '../shared/types'
  * 这里只暴露只读查询 + 启停，不改任何现有 IPC 的行为：
  * GUI 照旧走 IPC，外部走 HTTP，两边读的是同一个 statusLlama()，不会出现两份状态。
  */
+
+/**
+ * 无头 agent 接口（最小可用）。
+ *
+ * 由 main.ts 通过 `setChatHandler` 注入，让控制面能驱动同一个 AgentEngine：
+ * - chat.send(sessionId, text, options) —— 发一条消息，非交互模式下跑完自动决策；
+ * - chat.abort(sessionId) —— 停止；
+ * - chat.createSession(workspace?) —— 建/续会话，返回 sessionId。
+ * 事件通过 `subscribe(sessionId, cb)` 把 AgentEvent 转成 SSE 推给客户端。
+ */
+export interface ChatHandler {
+  createSession(workspace?: string | null): Promise<string>
+  send(sessionId: string, text: string, options?: { approvalPolicy?: 'deny' | 'allow' }): Promise<void>
+  abort(sessionId: string): void
+  subscribe(sessionId: string, cb: (event: AgentEvent) => void): () => void
+  isRunning(sessionId: string): boolean
+}
+
+let chatHandler: ChatHandler | null = null
+
+/** 由 main.ts 在引擎创建后注入，控制面才能驱动 agent */
+export function setChatHandler(h: ChatHandler): void {
+  chatHandler = h
+}
+
+/** SSE 订阅者表：sessionId -> 回调集合（一个会话可能有多个客户端在听） */
+const chatSubs = new Map<string, Set<(event: AgentEvent) => void>>()
+
+/**
+ * 广播一个 agent 事件给该会话的所有 SSE 订阅者。
+ * main.ts 的 emit() 在发 GUI 的同时也调这里，两边共用同一份事件。
+ */
+export function broadcastAgentEvent(sessionId: string, event: AgentEvent): void {
+  const subs = chatSubs.get(sessionId)
+  if (!subs) return
+  for (const cb of subs) {
+    try {
+      cb(event)
+    } catch {
+      // 订阅者回调自己失败不该影响其它订阅者
+    }
+  }
+}
+
+/** 登记一个会话的 SSE 订阅者，返回取消订阅函数 */
+export function subscribeChat(sessionId: string, cb: (event: AgentEvent) => void): () => void {
+  let subs = chatSubs.get(sessionId)
+  if (!subs) {
+    subs = new Set()
+    chatSubs.set(sessionId, subs)
+  }
+  subs.add(cb)
+  return () => {
+    const set = chatSubs.get(sessionId)
+    if (!set) return
+    set.delete(cb)
+    if (set.size === 0) chatSubs.delete(sessionId)
+  }
+}
 
 export interface DaemonInfo {
   port: number
@@ -173,6 +232,41 @@ function events(req: IncomingMessage, res: ServerResponse): void {
   })
 }
 
+/**
+ * agent 事件 SSE：把一个会话的 AgentEvent 流原样推给客户端。
+ * 事件格式：`event: <type>\ndata: <json>\n\n`；订阅是带心跳的（每 15s 一条注释）。
+ */
+function chatEvents(req: IncomingMessage, res: ServerResponse, sessionId: string): void {
+  res.writeHead(200, {
+    'content-type': 'text/event-stream; charset=utf-8',
+    'cache-control': 'no-cache, no-transform',
+    connection: 'keep-alive'
+  })
+  const send = (type: string, payload: unknown): void => {
+    res.write(`event: ${type}\ndata: ${JSON.stringify(payload)}\n\n`)
+  }
+  send('ready', { sessionId })
+
+  // 订阅该会话的所有事件
+  const unsubscribe = chatHandler!.subscribe(sessionId, (event) => {
+    send(event.type, event)
+  })
+
+  // 心跳：15s 一条注释，让中间代理知道连接还活着
+  const timer = setInterval(() => {
+    res.write(': ping\n\n')
+  }, 15000)
+
+  let closed = false
+  req.on('close', () => {
+    if (closed) return
+    closed = true
+    clearInterval(timer)
+    unsubscribe()
+    res.end()
+  })
+}
+
 async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const url = new URL(req.url ?? '/', 'http://127.0.0.1')
   const pathname = url.pathname.replace(/\/+$/, '') || '/'
@@ -219,6 +313,78 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const body = await readBody(req)
     const r = await stopLlama(typeof body.providerId === 'string' ? body.providerId : undefined)
     json(res, 200, r)
+    return
+  }
+
+  // ---- 无头 agent 接口 ----
+
+  // 建会话：POST /chat/session  body: { workspace? } -> { ok, sessionId }
+  if (req.method === 'POST' && pathname === '/chat/session') {
+    if (!chatHandler) {
+      fail(res, 503, 'NO_CHAT', 'agent 引擎尚未注入')
+      return
+    }
+    const body = await readBody(req)
+    const sessionId = await chatHandler.createSession(
+      typeof body.workspace === 'string' ? body.workspace : null
+    )
+    json(res, 200, { ok: true, sessionId })
+    return
+  }
+
+  // 发消息：POST /chat/send  body: { sessionId, text, approvalPolicy? }
+  // 非交互运行，事件走 SSE（/chat/events），这里只同步回「已接收」
+  if (req.method === 'POST' && pathname === '/chat/send') {
+    if (!chatHandler) {
+      fail(res, 503, 'NO_CHAT', 'agent 引擎尚未注入')
+      return
+    }
+    const body = await readBody(req)
+    const sessionId = String(body.sessionId ?? '')
+    const text = String(body.text ?? '')
+    if (!sessionId || !text) {
+      fail(res, 400, 'BAD_REQUEST', '需要 sessionId 和 text')
+      return
+    }
+    const policy = body.approvalPolicy === 'allow' ? 'allow' : 'deny'
+    // 发消息是异步的：不在这里 await（会阻塞直到整轮跑完），交给 SSE 推结果
+    void chatHandler
+      .send(sessionId, text, { approvalPolicy: policy })
+      .then(() => undefined)
+      .catch((err) => broadcastAgentEvent(sessionId, { type: 'error', message: (err as Error).message }))
+    json(res, 202, { ok: true, sessionId, accepted: true })
+    return
+  }
+
+  // 停止：POST /chat/abort  body: { sessionId }
+  if (req.method === 'POST' && pathname === '/chat/abort') {
+    if (!chatHandler) {
+      fail(res, 503, 'NO_CHAT', 'agent 引擎尚未注入')
+      return
+    }
+    const body = await readBody(req)
+    const sessionId = String(body.sessionId ?? '')
+    if (!sessionId) {
+      fail(res, 400, 'BAD_REQUEST', '需要 sessionId')
+      return
+    }
+    chatHandler.abort(sessionId)
+    json(res, 200, { ok: true, aborted: true })
+    return
+  }
+
+  // 事件流：GET /chat/events?session=<id> -> SSE
+  if (req.method === 'GET' && pathname === '/chat/events') {
+    if (!chatHandler) {
+      fail(res, 503, 'NO_CHAT', 'agent 引擎尚未注入')
+      return
+    }
+    const sessionId = url.searchParams.get('session') ?? ''
+    if (!sessionId) {
+      fail(res, 400, 'BAD_REQUEST', '需要 session 参数')
+      return
+    }
+    chatEvents(req, res, sessionId)
     return
   }
 
