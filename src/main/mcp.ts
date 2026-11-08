@@ -14,6 +14,16 @@ import type { ToolSpec } from './tools/spec'
  * 设计上「失败不影响主流程」：某个服务起不来只是标红，不会拖慢发送消息。
  */
 
+interface OAuth2Conf {
+  type: 'oauth2'
+  /** token 端点，如 https://host/oauth/token */
+  tokenUrl: string
+  clientId: string
+  clientSecret: string
+  /** 可选，scope 字符串（空格分隔） */
+  scope?: string
+}
+
 interface ServerConf {
   command?: string
   args?: string[]
@@ -23,6 +33,8 @@ interface ServerConf {
   url?: string
   /** 可选的鉴权头（如 Authorization / 自定义 key） */
   headers?: Record<string, string>
+  /** OAuth 2.0 client credentials 鉴权：填了自动换 token，无需手动塞 header */
+  auth?: OAuth2Conf
   /** 单次请求超时（毫秒），默认 20000 */
   timeoutMs?: number
 }
@@ -41,6 +53,14 @@ interface Conn {
   /** http 传输时的地址；空 = stdio */
   url: string
   headers: Record<string, string>
+  /** OAuth2 client credentials 配置（有则自动换 token） */
+  auth?: OAuth2Conf
+  /** OAuth2 换到的 access token（内存缓存，401 时自动刷新） */
+  accessToken?: string
+  /** OAuth2 token 的过期时间戳（毫秒） */
+  tokenExpiryMs?: number
+  /** MCP Streamable HTTP 的会话 ID（initialize 响应返回，后续请求带上） */
+  sessionId?: string
   timeoutMs: number
   proc: ChildProcessWithoutNullStreams | null
   /** ready = 完成 initialize 且拿到工具清单 */
@@ -116,32 +136,98 @@ function write(conn: Conn, payload: unknown): void {
   }
 }
 
-/** HTTP 传输的单次 JSON-RPC：POST 到 url，解析 JSON 或 SSE 响应 */
-async function httpRequest(conn: Conn, method: string, params: unknown, timeout: number): Promise<unknown> {
+/** OAuth2 client credentials：从 tokenUrl 换 access token，失败抛错 */
+async function oauthFetchToken(conf: OAuth2Conf): Promise<{ token: string; expiryMs: number }> {
+  const params = new URLSearchParams()
+  params.set('grant_type', 'client_credentials')
+  if (conf.scope) params.set('scope', conf.scope)
+  const res = await fetch(conf.tokenUrl, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/x-www-form-urlencoded',
+      authorization: 'Basic ' + Buffer.from(`${conf.clientId}:${conf.clientSecret}`).toString('base64')
+    },
+    body: params.toString()
+  })
+  if (!res.ok) throw new Error(`OAuth token 请求失败 ${res.status} ${res.statusText}`)
+  const json = (await res.json()) as { access_token?: string; expires_in?: number }
+  if (!json.access_token) throw new Error('OAuth token 响应缺少 access_token')
+  const expiresIn = typeof json.expires_in === 'number' && json.expires_in > 0 ? json.expires_in : 3600
+  return { token: json.access_token, expiryMs: Date.now() + expiresIn * 1000 - 30000 }
+}
+
+/** 确保 conn 有有效的 access token；没有或已过期则重新换取 */
+async function ensureOAuthToken(conn: Conn): Promise<void> {
+  if (!conn.auth) return
+  if (conn.accessToken && conn.tokenExpiryMs && conn.tokenExpiryMs > Date.now()) return
+  const { token, expiryMs } = await oauthFetchToken(conn.auth)
+  conn.accessToken = token
+  conn.tokenExpiryMs = expiryMs
+}
+
+/** 组装 HTTP 请求头：手动 headers + OAuth token + Mcp-Session-Id */
+function httpHeaders(conn: Conn): Record<string, string> {
+  const h: Record<string, string> = { ...conn.headers }
+  if (conn.accessToken) h.authorization = `Bearer ${conn.accessToken}`
+  if (conn.sessionId) h['mcp-session-id'] = conn.sessionId
+  return h
+}
+
+/** HTTP 传输的单次 JSON-RPC：POST 到 url，解析 JSON 或 SSE 响应；401 时刷新 token 重试一次 */
+async function httpRequest(conn: Conn, method: string, params: unknown, timeout: number, allowRetry = true): Promise<unknown> {
+  await ensureOAuthToken(conn)
   const body = JSON.stringify({ jsonrpc: '2.0', id: 1, method, params })
   const ctrl = new AbortController()
   const timer = setTimeout(() => ctrl.abort(), timeout)
   try {
-    const res = await fetch(conn.url, {
+    let res = await fetch(conn.url, {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
         accept: 'application/json, text/event-stream',
-        ...conn.headers
+        ...httpHeaders(conn)
       },
       body,
       signal: ctrl.signal
     })
+    // 401 + 有 OAuth + 还没重试过：强制换 token 后重试一次
+    if (res.status === 401 && conn.auth && allowRetry) {
+      conn.accessToken = undefined
+      conn.tokenExpiryMs = undefined
+      await ensureOAuthToken(conn)
+      res = await fetch(conn.url, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          accept: 'application/json, text/event-stream',
+          ...httpHeaders(conn)
+        },
+        body,
+        signal: ctrl.signal
+      })
+    }
+    // 记录服务端返回的会话 ID（MCP Streamable HTTP 规范）
+    const sid = res.headers.get('mcp-session-id')
+    if (sid) conn.sessionId = sid
     if (!res.ok) {
       throw new Error(`MCP HTTP ${res.status} ${res.statusText}`)
     }
     const ct = res.headers.get('content-type') ?? ''
+    let msg: unknown
     if (ct.includes('text/event-stream')) {
       // Streamable HTTP：响应是一段 SSE，逐行取 data: 里的 JSON
       const text = await res.text()
-      return parseSseJson(text)
+      msg = parseSseJson(text)
+    } else {
+      msg = await res.json()
     }
-    return await res.json()
+    // 与 stdio 的 handleMessage 对齐：解包 JSON-RPC 的 result（error 则抛错）
+    if (msg && typeof msg === 'object') {
+      const rpc = msg as { result?: unknown; error?: { message?: string } }
+      if (rpc.error) throw new Error(rpc.error.message || 'MCP 调用失败')
+      return rpc.result
+    }
+    return msg
   } catch (err) {
     if ((err as Error).name === 'AbortError') throw new Error(`MCP 请求超时（${method}）`)
     throw err
@@ -192,6 +278,7 @@ async function connect(name: string, conf: ServerConf): Promise<Conn> {
     env: conf.env ?? {},
     url: conf.url ?? '',
     headers: conf.headers ?? {},
+    auth: conf.auth,
     timeoutMs: conf.timeoutMs ?? 20000,
     proc: null,
     ready: false,
@@ -381,6 +468,16 @@ export async function openMcpConfig(): Promise<{ ok: boolean; path: string; mess
         "远程 HTTP 服务示例": {
           url: 'https://example.com/mcp',
           headers: { authorization: 'Bearer <你的 token>' }
+        },
+        "远程 OAuth2 服务示例": {
+          url: 'https://example.com/mcp',
+          auth: {
+            type: 'oauth2',
+            tokenUrl: 'https://example.com/oauth/token',
+            clientId: '<你的 client id>',
+            clientSecret: '<你的 client secret>',
+            scope: ''
+          }
         }
       }
     }

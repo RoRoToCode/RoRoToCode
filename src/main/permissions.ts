@@ -14,41 +14,115 @@
 
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
-import type { PermissionRule } from './risk'
+import type { PermissionRule, PermRuleWithSource } from '../shared/types'
 
 const FILE = 'roroto.json'
 
+/** 单次向上查找最多回溯的目录层数，防止在盘符/网络根附近瞎找 */
+const MAX_UP_LEVELS = 16
+
+/** 多层合并后的完整结果 */
+export interface ProjectPermissionResult {
+  /** 合并后的规则列表：外层在前、内层在后（后面的覆盖前面，即内层优先） */
+  rules: PermissionRule[]
+  /** 带来源标注的规则（与 rules 顺序一致），供 UI 展示 */
+  detailed: PermRuleWithSource[]
+  /** 命中的所有 roroto.json 文件（最内层在前） */
+  files: string[]
+}
+
 /** 项目级规则文件在内存里的缓存，带 mtime 失效：文件变了自动重读，不用重启 */
-let cache: { workspace: string; rules: PermissionRule[]; mtimeMs: number } | null = null
+let cache: { workspace: string; result: ProjectPermissionResult; mtimes: Map<string, number> } | null = null
 
-/** 从工作区根读 roroto.json 的 permissions 字段（只读，不创建） */
-export async function loadProjectPermissions(workspace: string | null): Promise<PermissionRule[]> {
-  if (!workspace) return []
+/** 读单个 roroto.json 的 permissions，过滤出合法规则 */
+async function readRules(file: string): Promise<PermissionRule[]> {
+  const parsed = JSON.parse(await fs.readFile(file, 'utf8')) as { permissions?: unknown }
+  if (!Array.isArray(parsed?.permissions)) return []
+  return (parsed.permissions as unknown[]).filter(
+    (r): r is PermissionRule =>
+      !!r && typeof r === 'object' &&
+      typeof (r as PermissionRule).action === 'string' && (r as PermissionRule).action.trim() !== '' &&
+      typeof (r as PermissionRule).resource === 'string' && (r as PermissionRule).resource.trim() !== '' &&
+      ((r as PermissionRule).effect === 'allow' || (r as PermissionRule).effect === 'deny')
+  ) as PermissionRule[]
+}
+
+/**
+ * 从工作区根向上逐层收集 roroto.json，把每层的 permissions 合并。
+ *
+ * 语义（与 instructions.ts 的 AGENTS.md 相反）：
+ * - 规则是「机器可读的执行约束」，越靠近工作区的项目约束应当越具体、越能覆盖外层；
+ * - 合并结果按「外层在前、内层在后」排列，配合 applyCustomRules 的
+ *   「顺序遍历、后命中的覆盖先命中的」语义，正好实现「内层规则覆盖外层规则」。
+ * - 同一 action+resource 在外层是 allow、内层是 deny 时，内层的 deny 生效（更安全）。
+ */
+export async function loadProjectPermissionsDetailed(workspace: string | null): Promise<ProjectPermissionResult> {
+  const empty: ProjectPermissionResult = { rules: [], detailed: [], files: [] }
+  if (!workspace) return empty
   const abs = path.resolve(workspace)
-  const file = path.join(abs, FILE)
 
-  try {
-    const st = await fs.stat(file)
-    if (cache && cache.workspace === abs && cache.mtimeMs === st.mtimeMs) return cache.rules
-    const raw = await fs.readFile(file, 'utf8')
-    const parsed = JSON.parse(raw) as { permissions?: unknown }
-    const rules = Array.isArray(parsed.permissions)
-      ? (parsed.permissions.filter(
-          (r): r is PermissionRule =>
-            !!r && typeof r === 'object' &&
-            typeof (r as PermissionRule).action === 'string' &&
-            typeof (r as PermissionRule).resource === 'string' &&
-            ((r as PermissionRule).effect === 'allow' || (r as PermissionRule).effect === 'deny')
-        ) as PermissionRule[])
-      : []
-    cache = { workspace: abs, rules, mtimeMs: st.mtimeMs }
-    return rules
-  } catch {
-    // 文件不存在 / 读失败：视为无规则，但仍记录「已查过、无文件」的缓存态
-    if (cache && cache.workspace === abs) return cache.rules
-    cache = { workspace: abs, rules: [], mtimeMs: 0 }
-    return []
+  // 收集从根向上所有命中文件（最内层在前）
+  const files: string[] = []
+  let dir = abs
+  for (let i = 0; i < MAX_UP_LEVELS; i++) {
+    const candidate = path.join(dir, FILE)
+    try {
+      const st = await fs.stat(candidate)
+      if (st.isFile()) files.push(candidate)
+    } catch {
+      // 不存在，继续向上
+    }
+    const parent = path.dirname(dir)
+    if (parent === dir) break
+    dir = parent
   }
+
+  // mtime 缓存：所有命中文件的 mtime 都没变才复用
+  if (cache && cache.workspace === abs && cache.result.files.length === files.length) {
+    const mtimes = new Map<string, number>()
+    let allSame = true
+    for (const f of files) {
+      try {
+        const st = await fs.stat(f)
+        mtimes.set(f, st.mtimeMs)
+        if (cache.mtimes.get(f) !== st.mtimeMs) allSame = false
+      } catch {
+        allSame = false
+      }
+    }
+    if (allSame) return cache.result
+  }
+
+  // 逐层读并合并：files 是最内层在前，倒序处理让最外层先进数组
+  const detailed: PermRuleWithSource[] = []
+  for (let i = files.length - 1; i >= 0; i--) {
+    const file = files[i]
+    let rules: PermissionRule[] = []
+    try {
+      rules = await readRules(file)
+    } catch {
+      rules = []
+    }
+    for (const r of rules) detailed.push({ ...r, from: file })
+  }
+
+  const rules: PermissionRule[] = detailed.map(({ from: _from, ...r }) => r)
+  const result: ProjectPermissionResult = { rules, detailed, files }
+  const mtimes = new Map<string, number>()
+  for (const f of files) {
+    try {
+      mtimes.set(f, (await fs.stat(f)).mtimeMs)
+    } catch {
+      // 忽略
+    }
+  }
+  cache = { workspace: abs, result, mtimes }
+  return result
+}
+
+/** 从工作区根向上逐层读 roroto.json 的 permissions，合并后返回（不创建文件） */
+export async function loadProjectPermissions(workspace: string | null): Promise<PermissionRule[]> {
+  return (await loadProjectPermissionsDetailed(workspace)).rules
 }
 
 /** 清空缓存（改过 roroto.json 后调用，下次读盘重新加载） */

@@ -51,7 +51,7 @@ import { checkTools, installTools } from './basetools'
 import { cancelDownload, downloadModel, listCatalog } from './models'
 import { clearMemory, memoryInfo } from './memory'
 import { findInstructions, initAgents } from './instructions'
-import { loadProjectPermissions, saveProjectPermissions } from './permissions'
+import { loadProjectPermissions, loadProjectPermissionsDetailed, saveProjectPermissions } from './permissions'
 import { mt, setMainLang } from './i18n'
 import { changeDetail, clearChanges, listChanges, revertAll, revertChange } from './changes'
 import { gitCommit, gitDiff, gitStatus } from './git'
@@ -390,8 +390,14 @@ function registerIpc(): void {
   // 项目级权限规则（roroto.json 的 permissions）：读当前规则 + 写回
   ipcMain.handle('permissions:info', async () => {
     const ws = await effectiveWorkspace(await loadConfig())
-    const rules = await loadProjectPermissions(ws)
-    return { workspace: ws, path: ws ? path.join(ws, 'roroto.json') : null, rules }
+    const result = await loadProjectPermissionsDetailed(ws)
+    return {
+      workspace: ws,
+      path: ws ? path.join(ws, 'roroto.json') : null,
+      rules: result.rules,
+      detailed: result.detailed,
+      files: result.files
+    }
   })
   ipcMain.handle('permissions:save', async (_e, rules: unknown) => {
     const ws = await effectiveWorkspace(await loadConfig())

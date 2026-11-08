@@ -259,6 +259,12 @@ export interface PermissionRule {
   effect: 'allow' | 'deny'
 }
 
+/** 一条带来源标注的权限规则（多层合并后，供 UI 展示它来自哪个 roroto.json） */
+export interface PermRuleWithSource extends PermissionRule {
+  /** 规则来源文件的绝对路径 */
+  from: string
+}
+
 export interface ApprovalRequest {
   id: string
   tool: string
@@ -1154,7 +1160,13 @@ export interface PicoAPI {
     init(): Promise<{ created: boolean; path: string }>
   }
   permissions: {
-    info(): Promise<{ workspace: string | null; path: string | null; rules: PermissionRule[] }>
+    info(): Promise<{
+      workspace: string | null
+      path: string | null
+      rules: PermissionRule[]
+      detailed: PermRuleWithSource[]
+      files: string[]
+    }>
     save(rules: PermissionRule[]): Promise<{ path: string; created: boolean; count: number }>
   }
   onEvent(cb: (payload: AgentEventEnvelope) => void): () => void

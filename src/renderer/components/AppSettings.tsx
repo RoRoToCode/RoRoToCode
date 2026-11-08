@@ -1,6 +1,6 @@
 import { t as tr } from '../i18n'
 import { useEffect, useRef, useState, type ReactNode } from 'react'
-import type { AppConfig, AppInfo, ApprovalMode, McpServerStatus, PermissionRule, ProviderConfig, ThemeKey, TrashEntry } from '../../shared/types'
+import type { AppConfig, AppInfo, ApprovalMode, McpServerStatus, PermissionRule, PermRuleWithSource, ProviderConfig, ThemeKey, TrashEntry } from '../../shared/types'
 import { isLlamaProvider } from '../../shared/providers'
 import {
   applyFontScale,
@@ -145,9 +145,10 @@ export function AppSettings({ config, onSave, onClose, notify }: Props) {
   const [info, setInfo] = useState<AppInfo | null>(null)
   const [mem, setMem] = useState<{ path: string; items: number; chars: number } | null>(null)
   const [instr, setInstr] = useState<{ path: string | null; text: string; truncated: boolean; name: string | null } | null>(null)
-  /** 项目级权限规则（roroto.json 的 permissions）：当前规则 + 编辑中的新规则 */
-  const [perms, setPerms] = useState<PermissionRule[] | null>(null)
+  /** 项目级权限规则（roroto.json 的 permissions）：带来源标注的规则 + 来源文件列表 */
+  const [perms, setPerms] = useState<PermRuleWithSource[] | null>(null)
   const [permsPath, setPermsPath] = useState<string | null>(null)
+  const [permFiles, setPermFiles] = useState<string[]>([])
   const [permBusy, setPermBusy] = useState(false)
   const [permDraft, setPermDraft] = useState<{ action: string; resource: string; effect: 'allow' | 'deny' }>({
     action: '',
@@ -231,8 +232,9 @@ export function AppSettings({ config, onSave, onClose, notify }: Props) {
           .info()
           .then((r) => {
             if (alive) {
-              setPerms(r.rules)
+              setPerms(Array.isArray(r.detailed) ? r.detailed : (r.rules ?? []).map((x: PermissionRule) => ({ ...x, from: r.path ?? '' })))
               setPermsPath(r.path)
+              setPermFiles(Array.isArray(r.files) ? r.files : [])
             }
           })
           .catch(() => undefined)
@@ -395,13 +397,17 @@ export function AppSettings({ config, onSave, onClose, notify }: Props) {
     }
   }
 
-  /** 保存权限规则：把当前列表整体写回 roroto.json（主进程侧校验 + 原子写） */
+  /** 保存权限规则：把「工作区根」的规则整体写回 roroto.json（主进程侧校验 + 原子写）。
+   *  父目录里继承来的规则只读，不参与保存。 */
   async function savePerms(next: PermissionRule[]) {
     setPermBusy(true)
     try {
       const r = await window.pico.permissions.save(next)
-      setPerms(next)
-      setPermsPath(r.path)
+      // 重新读回完整结果（含父目录继承的规则），保持列表一致
+      const info = await window.pico.permissions.info()
+      setPerms(Array.isArray(info.detailed) ? info.detailed : info.rules.map((x: PermissionRule) => ({ ...x, from: info.path ?? '' })))
+      setPermsPath(info.path)
+      setPermFiles(Array.isArray(info.files) ? info.files : [])
       notify(r.created ? tr("已生成 roroto.json") : tr("权限规则已保存"))
     } catch (err) {
       notify(tr("保存失败：{0}", { "0": (err as Error).message }))
@@ -419,14 +425,14 @@ export function AppSettings({ config, onSave, onClose, notify }: Props) {
       return
     }
     const rule: PermissionRule = { action: a, resource: res, effect: permDraft.effect }
-    const next = [...(perms ?? []), rule]
+    const next = [...(perms ?? []).filter((r) => r.from === permsPath).map(({ from: _f, ...x }) => x), rule]
     await savePerms(next)
     setPermDraft({ action: '', resource: '', effect: 'deny' })
   }
 
-  /** 删除一条规则并保存 */
+  /** 删除一条规则并保存（只删除工作区根的规则） */
   async function removePerm(idx: number) {
-    const next = (perms ?? []).filter((_, i) => i !== idx)
+    const next = (perms ?? []).filter((_, i) => i !== idx).filter((r) => r.from === permsPath).map(({ from: _f, ...x }) => x)
     await savePerms(next)
   }
 
@@ -957,6 +963,12 @@ export function AppSettings({ config, onSave, onClose, notify }: Props) {
               </div>
             )}
 
+            {permFiles.length > 1 && (
+              <p className="aset-hint">
+                {tr("已从工作区向上合并 {0} 份 roroto.json：越靠近工作区的规则优先级越高。\n下方标「继承」的规则来自父目录，需到对应文件里修改。", { "0": permFiles.length })}
+              </p>
+            )}
+
             {perms && perms.length === 0 && (
               <p className="aset-hint">
                 {tr("还没有权限规则。可以给「删除 / 越界 / 联网 / 特定命令」加一条 deny 来收紧，或给常用命令加 allow 来少点确认。")}</p>
@@ -964,23 +976,31 @@ export function AppSettings({ config, onSave, onClose, notify }: Props) {
 
             {perms && perms.length > 0 && (
               <div className="perm-list">
-                {perms.map((r, i) => (
-                  <div className="perm-item" key={`${i}-${r.action}-${r.resource}`}>
-                    <span className={`perm-effect ${r.effect}`}>
-                      {r.effect === 'deny' ? tr("拒绝") : tr("放行")}
-                    </span>
-                    <code className="perm-action" title={r.action}>{r.action}</code>
-                    <code className="perm-resource" title={r.resource}>{r.resource}</code>
-                    <button
-                      className="btn sm danger"
-                      disabled={permBusy}
-                      onClick={() => void removePerm(i)}
-                      title={tr("删除这条规则")}
-                    >
-                      {tr("删除")}
-                    </button>
-                  </div>
-                ))}
+                {perms.map((r, i) => {
+                  const inherited = r.from !== permsPath
+                  return (
+                    <div className="perm-item" key={`${i}-${r.action}-${r.resource}`}>
+                      <span className={`perm-effect ${r.effect}`}>
+                        {r.effect === 'deny' ? tr("拒绝") : tr("放行")}
+                      </span>
+                      <code className="perm-action" title={r.action}>{r.action}</code>
+                      <code className="perm-resource" title={r.resource}>{r.resource}</code>
+                      {inherited && (
+                        <span className="skill-tag hub" title={r.from}>
+                          {tr("继承")}
+                        </span>
+                      )}
+                      <button
+                        className="btn sm danger"
+                        disabled={permBusy || inherited}
+                        onClick={() => void removePerm(i)}
+                        title={inherited ? tr("这条规则继承自父目录，请到 {0} 里修改", { "0": r.from }) : tr("删除这条规则")}
+                      >
+                        {tr("删除")}
+                      </button>
+                    </div>
+                  )
+                })}
               </div>
             )}
 
