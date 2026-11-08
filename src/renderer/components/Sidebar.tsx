@@ -200,7 +200,7 @@ export function Sidebar({
         <input
           id="session-search"
           value={q}
-          placeholder={tr("搜索会话（Ctrl+K）")}
+          placeholder={tr("搜索会话")}
           onChange={(e) => setQ(e.target.value)}
           onKeyDown={(e) => {
             if (e.key === 'Escape') setQ('')

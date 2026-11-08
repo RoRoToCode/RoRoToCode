@@ -4577,63 +4577,6 @@ a.btn {
   color: var(--text);
 }
 
-/* 快捷键行：标签要放下「名字 + 一句说明」，所以不沿用固定宽度 */
-.key-row .aset-label {
-  width: auto;
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  padding-right: 12px;
-}
-
-.aset-sub {
-  font-size: calc(11px * var(--fs, 1));
-  line-height: 1.5;
-  color: var(--dim);
-}
-
-.key-combo {
-  flex: none;
-  min-width: 108px;
-  padding: 5px 10px;
-  border: 1px solid var(--border);
-  border-radius: 7px;
-  background: var(--panel);
-  color: var(--text);
-  font-family: inherit;
-  font-size: calc(11.5px * var(--fs, 1));
-  font-variant-numeric: tabular-nums;
-  cursor: pointer;
-}
-
-.key-combo:hover {
-  border-color: var(--border-strong);
-}
-
-/* 录制中：强调色边框 + 轻微呼吸，明确提示「正在等按键」 */
-.key-combo.recording {
-  border-color: var(--accent);
-  color: var(--accent);
-  background: var(--accent-soft);
-  animation: key-pulse 1.2s ease-in-out infinite;
-}
-
-.key-combo.unbound {
-  color: var(--danger);
-  border-color: rgba(239, 106, 106, 0.45);
-}
-
-@keyframes key-pulse {
-  0%,
-  100% {
-    box-shadow: 0 0 0 0 rgba(110, 168, 254, 0);
-  }
-  50% {
-    box-shadow: 0 0 0 3px rgba(110, 168, 254, 0.16);
-  }
-}
-
 .aset-path {
   flex: 1;
   min-width: 0;

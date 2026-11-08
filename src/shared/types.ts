@@ -156,8 +156,6 @@ export interface AppPrefs {
   fontScale: number
   /** 对话正文字号；null = 跟随界面字体 */
   chatFontScale: number | null
-  /** 自定义快捷键：动作 -> "Ctrl+K" 这种写法；缺省或非法时按默认值 */
-  keys?: Record<string, string>
 }
 
 /** 软件信息，用于「软件设置 → 关于」 */

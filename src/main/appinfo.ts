@@ -2,7 +2,6 @@ import { app, BrowserWindow, shell } from 'electron'
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import type { AppInfo, AppPrefs, ThemeKey } from '../shared/types'
-import { normalizeKeys } from '../shared/keys'
 
 /** 软件偏好单独存一份，别和模型配置搅在一起 */
 const FILE = 'prefs.json'
@@ -11,8 +10,7 @@ const DEFAULTS: AppPrefs = {
   zoom: 1,
   theme: 'dark',
   fontScale: 1,
-  chatFontScale: null,
-  keys: normalizeKeys(null)
+  chatFontScale: null
 }
 
 const THEMES: ThemeKey[] = ['dark', 'light', 'gray', 'stripe', 'contrast']
@@ -62,14 +60,12 @@ export async function loadPrefs(): Promise<AppPrefs> {
   try {
     const raw = await fs.readFile(prefsPath(), 'utf8')
     const parsed = JSON.parse(raw) as Partial<AppPrefs>
+    // 逐项取值：旧版 prefs.json 里的 keys（快捷键）等字段随之丢弃，下次保存即清掉
     cache = {
-      ...DEFAULTS,
-      ...parsed,
       zoom: clampZoom(parsed.zoom ?? DEFAULTS.zoom),
       theme: normTheme(parsed.theme),
       fontScale: clampFontScale(parsed.fontScale ?? DEFAULTS.fontScale),
-      chatFontScale: normChatFontScale(parsed.chatFontScale),
-      keys: normalizeKeys(parsed.keys)
+      chatFontScale: normChatFontScale(parsed.chatFontScale)
     }
   } catch {
     cache = { ...DEFAULTS }
@@ -87,9 +83,7 @@ export async function savePrefs(patch: Partial<AppPrefs>): Promise<AppPrefs> {
     fontScale: clampFontScale(patch.fontScale ?? cur.fontScale),
     // 这里不能用 ??：用户把「跟随界面」重新打开时传的是 null，要能真的写回去
     chatFontScale:
-      'chatFontScale' in patch ? normChatFontScale(patch.chatFontScale) : cur.chatFontScale,
-    // 快捷键整表替换：传进来就重新收敛一遍，非法值自动回默认，不会让界面失去所有快捷键
-    keys: 'keys' in patch ? normalizeKeys(patch.keys) : cur.keys
+      'chatFontScale' in patch ? normChatFontScale(patch.chatFontScale) : cur.chatFontScale
   }
   await fs.mkdir(path.dirname(prefsPath()), { recursive: true })
   await fs.writeFile(prefsPath(), JSON.stringify(next, null, 2), 'utf8')

@@ -5,7 +5,6 @@ import type {
   AgentEvent,
   AgentEventEnvelope,
   AppConfig,
-  AppPrefs,
   ApprovalRequest,
   ChatMessage,
   FileAttachment,
@@ -21,7 +20,6 @@ import type {
   WorkspaceFile
 } from '../shared/types'
 import { isImagePath, providerSupportsVision } from '../shared/vision'
-import { comboMatches, normalizeKeys, type KeyAction } from '../shared/keys'
 import { todosFromArgs } from '../shared/todos'
 import { turnRangeOf } from '../shared/turns'
 import { isLlamaProvider, isLoopbackUrl } from '../shared/providers'
@@ -180,8 +178,6 @@ export function App() {
   } | null>(null)
   /** 本会话累计用量；模型在价格表里时才有 costUsd */
   const [usage, setUsage] = useState<TokenUsage | null>(null)
-  /** 当前生效的快捷键绑定（可由设置页修改） */
-  const [keys, setKeys] = useState<Record<KeyAction, string>>(() => normalizeKeys(null))
   /** 本次会话的文件改动（快照），用于「变更」面板角标 */
   const [changes, setChanges] = useState<FileChange[]>([])
   const [changesKey, setChangesKey] = useState(0)
@@ -1177,42 +1173,6 @@ export function App() {
   const ctxCapped = config ? config.contextLimit === true : true
   const ctxPct = context ? Math.min(100, Math.round((context.used / Math.max(1, context.window)) * 100)) : 0
 
-  // 快捷键绑定来自 prefs.json；设置页保存后通过自定义事件即时同步，不用重启
-  useEffect(() => {
-    void window.pico.app
-      .prefs()
-      .then((p) => setKeys(normalizeKeys(p.keys)))
-      .catch(() => undefined)
-    const onPrefs = (e: Event) => {
-      const p = (e as CustomEvent<AppPrefs | undefined>).detail
-      if (p && p.keys) setKeys(normalizeKeys(p.keys))
-    }
-    window.addEventListener('roroto:prefs', onPrefs)
-    return () => window.removeEventListener('roroto:prefs', onPrefs)
-  }, [])
-
-  // 全局快捷键：默认 Ctrl+K 搜索会话、Ctrl+N 新会话、Ctrl+E 导出、Ctrl+, 软件设置，
-  // 具体绑定可由用户在「软件设置 → 快捷键」里改，存在 prefs.json
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (comboMatches(e, keys.search)) {
-        e.preventDefault()
-        document.getElementById('session-search')?.focus()
-      } else if (comboMatches(e, keys.newSession)) {
-        e.preventDefault()
-        void newSession()
-      } else if (comboMatches(e, keys.export)) {
-        e.preventDefault()
-        void exportCurrent()
-      } else if (comboMatches(e, keys.settings)) {
-        e.preventDefault()
-        setShowAppSettings(true)
-      }
-    }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [keys, newSession, exportCurrent])
-
   return (
     <div
       className="app"
@@ -1608,7 +1568,7 @@ export function App() {
             <button
               className="icon-btn export-btn"
               onClick={() => void exportCurrent()}
-              title={tr("把这次对话导出成 Markdown（Ctrl+E）")}
+              title={tr("把这次对话导出成 Markdown")}
               aria-label={tr("导出对话")}
             >
               <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">

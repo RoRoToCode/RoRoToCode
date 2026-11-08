@@ -16,15 +16,6 @@ import {
   THEMES
 } from '../theme'
 import { Chevron, useCollapse } from './Collapse'
-import {
-  comboFromEvent,
-  DEFAULT_KEYS,
-  findConflict,
-  formatCombo,
-  KEY_ACTIONS,
-  normalizeKeys,
-  type KeyAction
-} from '../../shared/keys'
 
 interface Props {
   config: AppConfig
@@ -37,26 +28,6 @@ const ZOOMS = [0.8, 0.9, 1, 1.1, 1.25, 1.5]
 
 /** 作者联系方式，显示在「关于」里 */
 const AUTHOR_EMAIL = 'su@RoRoTo.com'
-
-/** 快捷键动作的中文名与说明（渲染时再翻译，避免模块加载时就固化语言） */
-const KEY_META: Record<KeyAction, { get label(): string; get desc(): string }> = {
-  search: {
-    get label() { return tr("搜索会话") },
-    get desc() { return tr("把焦点放到左侧的会话搜索框") }
-  },
-  newSession: {
-    get label() { return tr("新建会话") },
-    get desc() { return tr("在当前工作区开一个新对话") }
-  },
-  export: {
-    get label() { return tr("导出对话") },
-    get desc() { return tr("把当前会话导出成 Markdown") }
-  },
-  settings: {
-    get label() { return tr("打开软件设置") },
-    get desc() { return tr("就是现在这个面板") }
-  }
-}
 
 /** 上下文长度的常用档位（tokens） */
 const CTXS = [8192, 16384, 32768, 65536, 131072, 262144]
@@ -172,9 +143,6 @@ export function AppSettings({ config, onSave, onClose, notify }: Props) {
   /** 回收站里的已删除会话 */
   const [trash, setTrash] = useState<TrashEntry[] | null>(null)
   const [trashBusy, setTrashBusy] = useState(false)
-  /** 快捷键绑定；recording 表示正在等待用户按下新的组合键 */
-  const [keys, setKeys] = useState<Record<KeyAction, string>>(() => normalizeKeys(null))
-  const [recording, setRecording] = useState<KeyAction | null>(null)
 
   async function loadTrash() {
     try {
@@ -239,7 +207,6 @@ export function AppSettings({ config, onSave, onClose, notify }: Props) {
           })
           .catch(() => undefined)
         setZoom(p.zoom)
-        setKeys(normalizeKeys(p.keys))
         // 主进程里的记录为准（换过机器 / 清了 localStorage 时靠它恢复）
         if (isTheme(p.theme)) {
           setTheme(p.theme)
@@ -289,49 +256,6 @@ export function AppSettings({ config, onSave, onClose, notify }: Props) {
       notify(tr("配色保存失败：{0}", { "0": (err as Error).message }))
     }
   }
-
-  /** 快捷键整表落盘，并通知主界面立即换绑定 */
-  async function persistKeys(next: Record<KeyAction, string>) {
-    setKeys(next)
-    try {
-      const p = await window.pico.app.setPrefs({ keys: next })
-      const saved = normalizeKeys(p.keys)
-      setKeys(saved)
-      window.dispatchEvent(new CustomEvent('roroto:prefs', { detail: p }))
-    } catch (err) {
-      notify(tr("快捷键保存失败：{0}", { "0": (err as Error).message }))
-    }
-  }
-
-  async function bindKey(action: KeyAction, combo: string) {
-    const conflict = findConflict(keys, action, combo)
-    if (conflict) {
-      notify(tr("「{combo}」已经被「{action}」占用，请先改那一个", { combo, action: KEY_META[conflict].label }))
-      return
-    }
-    await persistKeys({ ...keys, [action]: combo })
-  }
-
-  // 录入组合键：捕获阶段拦下来，别让主界面的全局快捷键同时触发
-  useEffect(() => {
-    if (!recording) return
-    const onKey = (e: KeyboardEvent) => {
-      e.preventDefault()
-      e.stopPropagation()
-      if (e.key === 'Escape') {
-        setRecording(null)
-        return
-      }
-      const combo = comboFromEvent(e)
-      // 只按了 Ctrl / Shift 这种，继续等真正的主键
-      if (!combo) return
-      const action = recording
-      setRecording(null)
-      void bindKey(action, formatCombo(combo))
-    }
-    window.addEventListener('keydown', onKey, true)
-    return () => window.removeEventListener('keydown', onKey, true)
-  })
 
   async function changeZoom(v: number) {
     setZoom(v)
@@ -508,8 +432,6 @@ export function AppSettings({ config, onSave, onClose, notify }: Props) {
                 ))}
               </div>
             </div>
-            <p className="aset-hint">{tr("立即生效。白色适合白天投屏，大条纹是深色底。")}</p>
-
             <div className="aset-row" style={{ marginTop: 12 }}>
               <span className="aset-label">{tr("界面缩放")}</span>
               <div className="aset-zooms">
@@ -525,8 +447,6 @@ export function AppSettings({ config, onSave, onClose, notify }: Props) {
                 ))}
               </div>
             </div>
-            <p className="aset-hint">
-              {tr("字太小可调到 110%～125%，缩放会被记住。")}</p>
 
             {/* 字号独立于缩放：只改文字，不动按钮尺寸与间距 */}
             <div className="aset-row" style={{ marginTop: 16 }}>
@@ -563,8 +483,6 @@ export function AppSettings({ config, onSave, onClose, notify }: Props) {
                 {tr("恢复默认")}
               </button>
             </div>
-            <p className="aset-hint">
-              {tr("只放大文字，不动按钮和间距；可与「界面缩放」叠加。")}</p>
 
             <div className="aset-row" style={{ marginTop: 12 }}>
               <span className="aset-label">{tr("对话正文")}</span>
@@ -597,8 +515,6 @@ export function AppSettings({ config, onSave, onClose, notify }: Props) {
                 </div>
               </div>
             )}
-            <p className="aset-hint">
-              {tr("只调消息、代码块和工具结果；读长回答可再大一号。")}</p>
 
             <div className="aset-font-preview">
               <div className="aset-preview-ui">
@@ -630,8 +546,6 @@ export function AppSettings({ config, onSave, onClose, notify }: Props) {
               >
                 {tr("清除")}</button>
             </div>
-            <p className="aset-hint">
-              {tr("新会话默认在此读写；已有会话保留原目录。")}</p>
           </Sec>
 
           <Sec id="approval" title={tr("审批与执行")} summary={tr("{approvalLabel} · {maxSteps} 步", { approvalLabel: approvalLabel, maxSteps: draft.maxSteps })}>
@@ -766,11 +680,11 @@ export function AppSettings({ config, onSave, onClose, notify }: Props) {
                 ))}
               </div>
             </div>
-            <p className="aset-hint">
-              {draft.contextLimit
-                ? tr("越大记得越多也越占显存（7B 每 1K tokens 约 60MB）。llama.cpp 按此上限启动。")
-                : tr("不限制时灰显：实际按模型自己的窗口跑。")}
-            </p>
+            {draft.contextLimit && (
+              <p className="aset-hint">
+                {tr("越大记得越多也越占显存（7B 每 1K tokens 约 60MB）。llama.cpp 按此上限启动。")}
+              </p>
+            )}
 
             <label className="aset-check">
               <input
@@ -783,8 +697,6 @@ export function AppSettings({ config, onSave, onClose, notify }: Props) {
                 <span>{tr("占到窗口 75% 就把前段压成摘要再继续。")}</span>
               </span>
             </label>
-            <p className="aset-hint">
-              {tr("后台自动压缩，只留目标、结论、改过的文件和待办；会多花一次模型调用。")}</p>
 
             <div className="aset-row" style={{ marginTop: 12 }}>
               <span className="aset-label">{tr("并发槽位")}</span>
@@ -867,41 +779,7 @@ export function AppSettings({ config, onSave, onClose, notify }: Props) {
                   </span>
                 </div>
               ))}
-              <p className="aset-hint">
-                {tr("改完点「重新连接」生效；外部工具仍按「执行命令」审批。")}</p>
             </div>
-          </Sec>
-
-          <Sec
-            id="keys"
-            title={tr("快捷键")}
-            summary={
-              KEY_ACTIONS.filter((a) => keys[a])
-                .map((a) => keys[a])
-                .join(' · ') || tr("未绑定")
-            }
-          >
-            {KEY_ACTIONS.map((action) => (
-              <div className="aset-row key-row" key={action}>
-                <span className="aset-label">
-                  {KEY_META[action].label}
-                  <span className="aset-sub">{KEY_META[action].desc}</span>
-                </span>
-                <button
-                  className={`key-combo ${recording === action ? 'recording' : ''} ${keys[action] ? '' : 'unbound'}`}
-                  onClick={() => setRecording(recording === action ? null : action)}
-                  title={tr("点一下，然后按下新的组合键；Esc 取消")}
-                >
-                  {recording === action ? tr("请按下组合键…") : keys[action] || tr("未绑定")}
-                </button>
-              </div>
-            ))}
-            <div className="aset-actions">
-              <button className="btn sm" onClick={() => void persistKeys(DEFAULT_KEYS)}>
-                {tr("恢复默认快捷键")}</button>
-            </div>
-            <p className="aset-hint">
-              {tr("只支持带 Ctrl 的组合，改完立即生效。")}</p>
           </Sec>
 
           <Sec id="data" title={tr("数据")} summary={tr("{0} 条会话", { "0": info?.sessionCount ?? 0 })}>
@@ -917,8 +795,6 @@ export function AppSettings({ config, onSave, onClose, notify }: Props) {
               <button className="btn sm" onClick={() => void window.pico.app.openLogs()}>
                 {tr("打开日志目录")}</button>
             </div>
-            <p className="aset-hint">
-              {tr("里面有 config.json、sessions/（当前")}{info?.sessionCount ?? 0} {tr("条会话）、prefs.json。卸载不会删这里；要清干净请手动删。")}</p>
 
             <div className="aset-row" style={{ marginTop: 12 }}>
               <span className="aset-label">{tr("长期记忆")}</span>
@@ -930,8 +806,6 @@ export function AppSettings({ config, onSave, onClose, notify }: Props) {
               <button className="btn sm" disabled={!mem?.items} onClick={() => void clearMem()}>
                 {tr("清空记忆")}</button>
             </div>
-            <p className="aset-hint">
-              {tr("remember 记下的项目约定，每次对话自动带上；按工作区存在 memory/ 下。")}</p>
 
             <div className="aset-row" style={{ marginTop: 16 }}>
               <span className="aset-label">{tr("项目规则")}</span>
@@ -947,8 +821,6 @@ export function AppSettings({ config, onSave, onClose, notify }: Props) {
               <button className="btn sm" onClick={() => void initInstr()}>
                 {instr?.path ? tr("重新读取") : tr("生成 AGENTS.md")}</button>
             </div>
-            <p className="aset-hint">
-              {tr("随仓库提交的 AGENTS.md / CLAUDE.md，向上逐层查找，每次对话都注入。")}</p>
           </Sec>
 
           <Sec

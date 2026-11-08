@@ -187,6 +187,8 @@ function createWindow(): void {
           const shotArg = process.argv.find((a) => a.startsWith('--smoke-shot')) ?? ''
           const shotName = shotArg.includes('=') ? shotArg.split('=').slice(1).join('=') : 'gui-full'
           const clickSel = (process.argv.find((a) => a.startsWith('--smoke-click=')) ?? '').split('=').slice(1).join('=')
+          // --smoke-scroll=选择器：截图前把它滚到视口中间（面板内部滚动区也能滚）
+          const scrollSel = (process.argv.find((a) => a.startsWith('--smoke-scroll=')) ?? '').split('=').slice(1).join('=')
           await new Promise((r) => setTimeout(r, 2500))
           if (clickSel && win && !win.isDestroyed()) {
             // 多个选择器用 || 串起来，依次点，方便一层层打开面板
@@ -195,6 +197,12 @@ function createWindow(): void {
               await new Promise((r) => setTimeout(r, 700))
             }
             await new Promise((r) => setTimeout(r, 500))
+          }
+          if (scrollSel && win && !win.isDestroyed()) {
+            await win.webContents.executeJavaScript(
+              `document.querySelector(${JSON.stringify(scrollSel)})?.scrollIntoView({ block: 'center' })`
+            )
+            await new Promise((r) => setTimeout(r, 400))
           }
           const outDir = path.join(app.getAppPath(), 'release', 'gui-smoke')
           fs.mkdirSync(outDir, { recursive: true })

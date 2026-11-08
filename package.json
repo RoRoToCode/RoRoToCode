@@ -11,7 +11,7 @@
     "build:main": "tsc -p tsconfig.main.json",
     "build:renderer": "vite build",
     "build": "npm run build:main && npm run build:renderer",
-    "test": "npm run build:main && node --test tests/approval.test.cjs tests/risk.test.cjs tests/env.test.cjs tests/redact.test.cjs tests/pricing.test.cjs tests/keys.test.cjs tests/turns.test.cjs tests/instructions.test.cjs tests/permissions.test.cjs tests/permissions-merge.test.cjs tests/applypatch.test.cjs tests/checkpoint.test.cjs",
+    "test": "npm run build:main && node --test tests/approval.test.cjs tests/risk.test.cjs tests/env.test.cjs tests/redact.test.cjs tests/pricing.test.cjs tests/turns.test.cjs tests/instructions.test.cjs tests/permissions.test.cjs tests/permissions-merge.test.cjs tests/applypatch.test.cjs tests/checkpoint.test.cjs",
     "typecheck": "npm run typecheck:main && npm run typecheck:renderer",
     "start": "npm run build && electron .",
     "smoke": "npm run build:main && electron dist/main/smoke.js",
