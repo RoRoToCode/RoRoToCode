@@ -268,7 +268,11 @@ export function SkillsPanel({ onClose, onUse, notify }: Props) {
                     <div className="skill-name">
                       {s.name}
                       {s.builtin ? <span className="skill-tag">{tr("内置")}</span> : null}
-                      {s.source ? (
+                      {s.source === 'workbuddy' ? (
+                        <span className="skill-tag hub" title={s.localPath || ''}>
+                          {tr("本机")}
+                        </span>
+                      ) : s.source ? (
                         <span className="skill-tag hub" title={s.sourcePath || s.source}>
                           {tr("来自")}{s.source}
                         </span>

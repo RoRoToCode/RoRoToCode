@@ -233,6 +233,7 @@ export const EN: Record<string, string> = {
   "内存": "RAM",
   "内置": "Built-in",
   "内置清单": "Built-in catalog",
+  "本机": "Local",
   "写文件、删东西、跑命令前都先弹确认": "Ask for confirmation before writing files, deleting things, or running commands",
   "写给模型的具体要求，越具体越好。例如：请为 src/api 下每个接口补一个并发压测脚本，测 100 并发下的 P95 延迟，并输出结果表格。": "The exact instructions for the model — be specific. Example: write a load-test script for every endpoint under src/api, measure P95 at 100 concurrent requests, and output a result table.",
   "准备中…": "Preparing…",

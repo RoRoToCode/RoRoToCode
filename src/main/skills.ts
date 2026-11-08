@@ -3,8 +3,19 @@ import { promises as fs } from 'node:fs'
 import { createHash } from 'node:crypto'
 import path from 'node:path'
 import type { RemoteSkill, Skill } from '../shared/types'
+import { parseSkillMd } from './skillhub'
 
 const FILE = 'skills.json'
+
+/**
+ * 本机技能目录：WorkBuddy / 其它客户端把已安装技能统一放在 `~/.workbuddy/skills/`，
+ * 每个技能一个子目录、里面一个 SKILL.md（YAML frontmatter + 正文指令）。
+ * 主程序直接扫这个目录，就能把平台上架的 vramfit / pdf-workshop 等技能一并列出来用，
+ * 不用再靠 GitHub 拉一份重复副本。
+ */
+function localSkillsDir(): string {
+  return path.join(app.getPath('home'), '.workbuddy', 'skills')
+}
 
 /**
  * 内置技能：都是「直接能发给模型的具体指令」，不是空泛的标签。
@@ -125,10 +136,62 @@ async function writeCustom(list: Skill[]): Promise<void> {
   await fs.writeFile(filePath(), JSON.stringify(list, null, 2), 'utf8')
 }
 
+/**
+ * 扫 `~/.workbuddy/skills/` 下每个子目录的 SKILL.md，转成可用的技能。
+ * 只读：这些技能归 WorkBuddy 管，主程序不写回去、不提供删除（标记 builtin 防误删）。
+ * 目录里可能还有 pdf-workshop 这种「一个技能拆成几十个 action」的结构，一律按 SKILL.md 逐个列出，
+ * 与平台保持一致。
+ */
+async function scanLocalSkills(): Promise<Skill[]> {
+  const dir = localSkillsDir()
+  let entries: import('node:fs').Dirent[]
+  try {
+    entries = await fs.readdir(dir, { withFileTypes: true })
+  } catch {
+    // 目录不存在（没装过平台技能）就当作没有
+    return []
+  }
+
+  const out: Skill[] = []
+  for (const ent of entries) {
+    if (!ent.isDirectory()) continue
+    if (ent.name.startsWith('.')) continue
+    const skillMd = path.join(dir, ent.name, 'SKILL.md')
+    let text: string
+    try {
+      text = await fs.readFile(skillMd, 'utf8')
+    } catch {
+      continue
+    }
+    const parsed = parseSkillMd(text, ent.name)
+    if (!parsed.prompt) continue
+    const skillDir = path.join(dir, ent.name)
+    // 平台技能的正文用 <skill_dir> 占位符引用脚本，这里替换成真实绝对路径，
+    // 否则模型拿到指令也不知道脚本在哪、跑不起来。
+    // Windows 路径里的反斜杠原样保留（传给 node 当命令行参数用），只把占位符换成路径。
+    const prompt = parsed.prompt.split('<skill_dir>').join(skillDir)
+    out.push({
+      // id 由目录名算出来，稳定且不会和 skills.json 里的自定义/内置技能撞名
+      id: `local_${createHash('sha1').update(ent.name).digest('hex').slice(0, 10)}`,
+      name: parsed.name,
+      desc: parsed.desc,
+      prompt,
+      builtin: true,
+      source: 'workbuddy',
+      sourcePath: path.join('.workbuddy', 'skills', ent.name, 'SKILL.md'),
+      localPath: path.join(dir, ent.name),
+      createdAt: 0
+    })
+  }
+  out.sort((a, b) => a.name.localeCompare(b.name))
+  return out
+}
+
 export async function listSkills(): Promise<Skill[]> {
   const custom = await readCustom()
   const builtin: Skill[] = BUILTIN.map((s, i) => ({ ...s, createdAt: i }))
-  return [...builtin, ...custom]
+  const local = await scanLocalSkills()
+  return [...builtin, ...local, ...custom]
 }
 
 export async function saveSkill(input: {

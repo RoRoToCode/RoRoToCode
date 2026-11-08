@@ -695,6 +695,8 @@ export interface Skill {
   sourcePath?: string
   /** 网页地址，方便回去看原文 */
   url?: string
+  /** 本机技能（从 ~/.workbuddy/skills 扫到的 SKILL.md）所在目录，点「使用」时按这个目录找脚本 */
+  localPath?: string
   createdAt: number
 }
 

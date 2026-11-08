@@ -179,6 +179,30 @@ function createWindow(): void {
   // CSS 变量也会跟着重新初始化，所以都挂在 did-finish-load 上
   win.webContents.on('did-finish-load', () => {
     if (win && !win.isDestroyed()) void applySavedAppearance(win)
+    // --smoke-shot：GUI 冒烟截图。加载完成后等恢复提示条渲染，截图存到 release/gui-smoke/ 再退出。
+    if (process.argv.includes('--smoke-shot')) {
+      void (async () => {
+        try {
+          await new Promise((r) => setTimeout(r, 2500))
+          const outDir = path.join(app.getAppPath(), 'release', 'gui-smoke')
+          fs.mkdirSync(outDir, { recursive: true })
+          if (win && !win.isDestroyed()) {
+            const banner = (await win.webContents.executeJavaScript(
+              `(() => { const el = document.querySelector('.resume-banner'); return el ? el.innerText : '' })()`
+            )) as string
+            const img = await win.webContents.capturePage()
+            fs.writeFileSync(path.join(outDir, 'gui-full.png'), img.toPNG())
+            console.log(`[smoke-shot] 窗口截图 -> ${path.join(outDir, 'gui-full.png')}`)
+            console.log(`[smoke-shot] 恢复提示条：${banner ? `已渲染（${banner.replace(/\\s+/g, ' ')}）` : '未出现'}`)
+          }
+        } catch (err) {
+          console.error('[smoke-shot] 截图失败：', (err as Error).message)
+        } finally {
+          quitting = true
+          app.quit()
+        }
+      })()
+    }
   })
 
   win.webContents.setWindowOpenHandler(({ url }) => {
