@@ -1,0 +1,95 @@
+{
+  "name": "roroto-code",
+  "version": "0.1.2",
+  "private": true,
+  "description": "A minimal Windows coding agent with local and online model support",
+  "main": "dist/main/main.js",
+  "scripts": {
+    "dev:renderer": "vite",
+    "dev": "concurrently -k \"vite\" \"npm:dev:electron\"",
+    "dev:electron": "wait-on tcp:5173 && npm run build:main && cross-env PICODEV=1 electron .",
+    "build:main": "tsc -p tsconfig.main.json",
+    "build:renderer": "vite build",
+    "build": "npm run build:main && npm run build:renderer",
+    "test": "npm run build:main && node --test tests/approval.test.cjs tests/risk.test.cjs tests/env.test.cjs tests/redact.test.cjs tests/pricing.test.cjs tests/keys.test.cjs tests/turns.test.cjs",
+    "typecheck": "npm run typecheck:main && npm run typecheck:renderer",
+    "start": "npm run build && electron .",
+    "smoke": "npm run build:main && electron dist/main/smoke.js",
+    "smoke:daemon": "npm run build:main && electron dist/main/smoke-daemon.js",
+    "smoke:gate": "npm run build:main && node dist/main/smoke-gate.js",
+    "smoke:ollama": "npm run build:main && node dist/main/smoke-ollama.js",
+    "dist": "node scripts/pack-portable.mjs",
+    "dist:nobuild": "node scripts/pack-portable.mjs --skip-build",
+    "dist:raw": "npm run build && electron-builder --win portable",
+    "dist:installer": "npm run build && electron-builder --win nsis",
+    "dist:dir": "npm run build && electron-builder --win --dir",
+    "typecheck:main": "tsc -p tsconfig.main.json --noEmit",
+    "typecheck:renderer": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/react": "^18.3.17",
+    "@types/react-dom": "^18.3.5",
+    "@vitejs/plugin-react": "^4.3.4",
+    "concurrently": "^9.1.0",
+    "cross-env": "^7.0.3",
+    "electron": "^33.2.1",
+    "electron-builder": "^25.1.8",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.5",
+    "wait-on": "^8.0.1"
+  },
+  "build": {
+    "appId": "dev.rorotocode.app",
+    "productName": "RoRoTo Code",
+    "asar": true,
+    "electronDist": "node_modules/electron/dist",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/main/**/*",
+      "!dist/main/smoke*.js",
+      "dist/shared/**/*",
+      "dist/preload.js",
+      "dist/renderer/**/*",
+      "build/icon.png",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "tools/vramfit",
+        "to": "vramfit",
+        "filter": [
+          "check.mjs",
+          "core/**/*",
+          "net/**/*",
+          "cli/**/*",
+          "package.json",
+          "LICENSE",
+          "README.md"
+        ]
+      }
+    ],
+    "electronLanguages": [
+      "zh-CN",
+      "en-US"
+    ],
+    "win": {
+      "target": "portable",
+      "icon": "build/icon.png"
+    },
+    "portable": {
+      "artifactName": "RoRoToCode-${version}-portable.exe"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    },
+    "compression": "maximum"
+  }
+}

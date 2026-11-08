@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / node ${{ matrix.node }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        node: [18, 20, 22]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      # 没有任何第三方依赖，不用 npm install
+      - name: 单元测试
+        run: node --test test.mjs
+
+      - name: 命令行能否启动
+        run: node check.mjs --help
+
+      - name: 参数说明能否打印
+        run: node check.mjs --about
+
+      # 网页版在这个仓库里，坏了不能等到部署时才发现。
+      # test 脚本自带构建：dist 过期 → 有一条用例会直接失败
+      - name: 网页版构建 + 渲染
+        working-directory: site
+        run: npm test
+
+  # 架构约束：core/ 必须能在浏览器里跑，一旦有人塞进 node: 模块，网页版会直接崩
+  core-purity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # 值里有冒号就必须加引号：`node: 内置模块` 会被 YAML 当成嵌套键，
+      # 整份工作流在解析阶段就失败 —— 一个 job 都不会启动，报错只指到行号
+      - name: "core 目录不许出现 node 内置模块"
+        run: |
+          if grep -rn "from 'node:" core/ ; then
+            echo "::error::core/ 里出现了 node: 内置模块，这一层必须能在浏览器里运行"
+            exit 1
+          fi
+          echo "core/ 保持纯净"
+
+  # site/ 必须挨着仓库根，否则 build.mjs 按 ../core 找不到解析层
+  layout:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: site/ 是仓库根的直接子目录
+        run: |
+          if [ ! -f core/index.mjs ]; then
+            echo "::error::core/ 不在仓库根，site/build.mjs 会找不到它"
+            exit 1
+          fi
+          if [ ! -d site ]; then
+            echo "::error::site/ 不见了"
+            exit 1
+          fi
+          echo "结构正常"

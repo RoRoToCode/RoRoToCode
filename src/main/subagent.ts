@@ -1,0 +1,276 @@
+import { promises as fs } from 'node:fs'
+import type {
+  ApprovalRequest,
+  ChatMessage,
+  FileChange,
+  ProviderConfig,
+  SubAgentTask
+} from '../shared/types'
+import type { ToolSpec } from './tools/spec'
+import { chat } from './providers'
+import { classifyRisk, executeTool, previewWrite, toolTargetPath } from './tools'
+import type { RiskInfo } from './tools'
+import { parseTextToolCalls } from './parse'
+import { recordChange } from './changes'
+import { diffLines, diffStats } from './diff'
+
+/** 子 agent 写过的文件类型：只有这些需要留可撤销的快照 */
+const WRITE_TOOLS = new Set(['write_file', 'edit_file'])
+
+/** 子 agent 自己的 token 粗估（与 agent.ts 保持同一口径） */
+function est(text: string): number {
+  if (!text) return 0
+  const cjk = (text.match(/[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]/g) ?? []).length
+  return Math.ceil(cjk * 1.05 + (text.length - cjk) / 3.6)
+}
+
+async function readOrNull(abs: string): Promise<string | null> {
+  try {
+    return await fs.readFile(abs, 'utf8')
+  } catch {
+    return null
+  }
+}
+
+/** 单个工具结果进上下文前先砍一刀，别让一次 cat 大文件把子 agent 撑爆 */
+function clip(text: string, max = 8000): string {
+  if (text.length <= max) return text
+  const head = Math.floor(max * 0.7)
+  return `${text.slice(0, head)}\n\n…（中间省略 ${text.length - max} 字）…\n\n${text.slice(-Math.floor(max * 0.3))}`
+}
+
+/**
+ * 裁上下文：只压缩较早的工具结果，不删消息。
+ * 删消息会破坏 assistant.toolCalls 与 tool 消息的配对，OpenAI 和 Ollama 都会直接报 400。
+ */
+function trim(messages: ChatMessage[], budget: number): ChatMessage[] {
+  let total = messages.reduce((n, m) => n + est(m.content || ''), 0)
+  if (total <= budget) return messages
+  const out = messages.map((m) => ({ ...m }))
+  // 最近 6 条保持原样，再往前的工具结果压到 800 字
+  for (let i = 0; i < out.length - 6 && total > budget; i++) {
+    const m = out[i]
+    if (m.role !== 'tool' || m.content.length <= 800) continue
+    const short = `${m.content.slice(0, 800)}\n…（较早的工具结果已省略）`
+    total -= est(m.content) - est(short)
+    m.content = short
+  }
+  return out
+}
+
+function childPrompt(workspace: string, web: boolean): string {
+  const tools = web
+    ? 'read_file / list_dir / glob / grep 看现状，write_file / edit_file 改文件，run_shell 跑命令，web_search / web_fetch 查资料'
+    : 'read_file / list_dir / glob / grep 看现状，write_file / edit_file 改文件，run_shell 跑命令'
+  return [
+    '你是子 agent，只负责完成被指派的这一件子任务。你看不到用户的原始对话，也不要向用户提问。',
+    `当前工作区：${workspace}`,
+    `可用工具：${tools}。`,
+    '',
+    '规则：',
+    '1. 先看清现状再动手，不要假设文件内容或路径存在。',
+    '2. 只做被指派的事，不要顺手改别的地方、不要扩大范围。',
+    '3. 做完用 3-6 句话总结：完成了什么、改了哪些文件（写完整相对路径）、关键结论、还有什么没解决。',
+    '4. 信息不足或做不到就如实说明，不要编造。',
+    '',
+    '你的这段总结会被原样回传给主 agent，所以要写成能独立读懂的样子。'
+  ].join('\n')
+}
+
+export interface SubAgentOptions {
+  id: string
+  /** 父 agent 里那次 task 调用的 id */
+  callId: string
+  /** 归属的父会话，改动快照记在它名下 */
+  sessionId: string
+  description: string
+  prompt: string
+  /** 开始时间，父 agent 已经在 subagent_start 事件里发过同一个值 */
+  startedAt?: number
+  workspace: string
+  provider: ProviderConfig
+  /** token 预算，超了压前面的工具结果 */
+  budget: number
+  maxSteps: number
+  /** 已经过滤好的工具（不含 task / update_todos） */
+  tools: ToolSpec[]
+  signal: AbortSignal
+  web: boolean
+  /** 这次为什么用/没用工作模型（并行是否生效），随任务一起带给界面 */
+  note?: string
+  /** 需要用户批准时回调；父 agent 用自己的审批弹窗 */
+  approve: (
+    tool: string,
+    args: Record<string, unknown>,
+    risk: RiskInfo,
+    preview?: ApprovalRequest['preview']
+  ) => Promise<boolean>
+  /** 子 agent 改了文件，父负责发事件 */
+  onChange: (change: FileChange) => void
+  /** 进度回调：开始、每步、结束都调一次 */
+  onUpdate: (task: SubAgentTask) => void
+}
+
+/**
+ * 跑一个子 agent。
+ * 它有独立的对话历史（不碰父会话的 messages），只把最后的总结回传给父，
+ * 所以中间几十次读文件的噪声不会占用主对话的上下文。
+ */
+export async function runSubAgent(opts: SubAgentOptions): Promise<SubAgentTask> {
+  const task: SubAgentTask = {
+    id: opts.id,
+    callId: opts.callId,
+    description: opts.description,
+    prompt: opts.prompt,
+    status: 'running',
+    // 记下实际用的模型：配了「工人模型」时它和主对话不是同一个，
+    // 界面要能看出这个子任务到底是谁在干
+    model: opts.provider.model,
+    note: opts.note,
+    steps: 0,
+    startedAt: opts.startedAt ?? Date.now(),
+    summary: '',
+    tools: []
+  }
+
+  const messages: ChatMessage[] = [
+    { id: 'child-system', role: 'system', content: childPrompt(opts.workspace, opts.web), createdAt: Date.now() },
+    { id: 'child-user', role: 'user', content: opts.prompt, createdAt: Date.now() }
+  ]
+
+  try {
+    for (let step = 0; step < opts.maxSteps; step++) {
+      if (opts.signal.aborted) throw new Error('已取消')
+      task.steps = step + 1
+
+      const result = await chat({
+        provider: opts.provider,
+        messages: trim(messages, opts.budget),
+        tools: opts.provider.noTools ? [] : opts.tools,
+        signal: opts.signal,
+        // 子 agent 的文字不流到主界面，只留最后那句总结
+        onText: () => undefined
+      })
+
+      const parsed = parseTextToolCalls(result.text)
+      const calls = result.toolCalls.length ? result.toolCalls : parsed.calls
+      const content = result.toolCalls.length ? result.text : parsed.cleanText
+
+      // 不再调工具 = 它认为做完了，这句话就是总结
+      if (!calls.length) {
+        task.summary = content.trim()
+        break
+      }
+
+      messages.push({
+        id: `child-a-${step}`,
+        role: 'assistant',
+        content,
+        toolCalls: calls,
+        createdAt: Date.now()
+      })
+
+      for (const call of calls) {
+        if (opts.signal.aborted) throw new Error('已取消')
+        const started = Date.now()
+
+        // 子 agent 干的是真活：改文件、跑命令一样要过审批，安全边界不能因为「子」就放开
+        const risk = classifyRisk(call.name, call.args, opts.workspace)
+        let approved = true
+        if (risk) {
+          let preview: ApprovalRequest['preview'] | undefined
+          if (WRITE_TOOLS.has(call.name)) {
+            const pv = await previewWrite(call.name, call.args, opts.workspace).catch(() => null)
+            if (pv) {
+              const lines = diffLines(pv.before ?? '', pv.after)
+              const st = diffStats(lines)
+              preview = { path: pv.path, kind: pv.kind, added: st.added, removed: st.removed, lines }
+            }
+          }
+          approved = await opts.approve(call.name, call.args, risk, preview)
+        }
+
+        let target = ''
+        if (WRITE_TOOLS.has(call.name)) {
+          try {
+            target = toolTargetPath(opts.workspace, String(call.args.path ?? ''), risk?.kind === 'outside')
+          } catch {
+            target = ''
+          }
+        }
+        const before = target ? await readOrNull(target) : null
+
+        let output: string
+        let ok = true
+        if (!approved) {
+          ok = false
+          output = '用户拒绝执行该操作。请换一种方式，或直接说明这件事没做成。'
+        } else {
+          try {
+            output = await executeTool(call.name, call.args, {
+              workspace: opts.workspace,
+              signal: opts.signal,
+              allowOutside: risk?.kind === 'outside'
+            })
+          } catch (err) {
+            ok = false
+            output = `执行失败：${(err as Error).message}`
+          }
+        }
+
+        // 改动同样进父会话的「变更」列表，用户在右侧面板能撤销子 agent 的修改
+        if (ok && target) {
+          const after = await readOrNull(target)
+          if (after !== null) {
+            const change = await recordChange({
+              sessionId: opts.sessionId,
+              root: opts.workspace,
+              absPath: target,
+              before,
+              after,
+              tool: call.name
+            })
+            if (change) opts.onChange(change)
+          }
+        }
+
+        const durationMs = Date.now() - started
+        const text = clip(output)
+        messages.push({
+          id: `child-t-${step}-${call.id}`,
+          role: 'tool',
+          content: text,
+          toolCallId: call.id,
+          toolName: call.name,
+          toolArgs: call.args,
+          createdAt: Date.now()
+        })
+
+        task.tools.push({
+          tool: call.name,
+          ok,
+          durationMs,
+          note: `${String(call.args.path ?? call.args.query ?? call.args.command ?? '').slice(0, 60)}`.trim()
+        })
+      }
+
+      // 每步推一次，卡片上能看到它走到第几步、在干什么
+      opts.onUpdate({ ...task, tools: [...task.tools] })
+    }
+
+    if (!task.summary) {
+      task.status = 'fail'
+      task.error = `子 agent 走了 ${opts.maxSteps} 步仍未给出结论`
+      task.summary = `（子任务「${opts.description}」没有产出总结）`
+    } else {
+      task.status = 'ok'
+    }
+  } catch (err) {
+    task.status = 'fail'
+    task.error = (err as Error).message
+    task.summary = `（子任务「${opts.description}」执行失败：${task.error}）`
+  }
+
+  task.endedAt = Date.now()
+  return task
+}

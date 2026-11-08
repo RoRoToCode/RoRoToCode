@@ -1,0 +1,491 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>vramfit —— 这个模型，你这台机器跑得动吗</title>
+<meta name="description" content="贴一个 HuggingFace 链接，不下载模型就能知道它能开多大上下文、能不能驱动 coding agent。基于 GGUF 元数据和你的显卡规格静态推算。">
+<style>
+  :root {
+    --bg: #fbfbf9;
+    --panel: #ffffff;
+    --ink: #1b1b19;
+    --ink-2: #5c5c56;
+    --ink-3: #8b8b83;
+    --line: #e4e3dd;
+    --line-2: #d3d1c7;
+    --accent: #185fa5;
+    --accent-soft: #e6f1fb;
+    --good: #0f6e56;
+    --good-soft: #e1f5ee;
+    --warn: #854f0b;
+    --warn-soft: #faeeda;
+    --bad: #a32d2d;
+    --bad-soft: #fcebeb;
+    --radius: 12px;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #141413;
+      --panel: #1c1c1a;
+      --ink: #f0efe9;
+      --ink-2: #a8a8a0;
+      --ink-3: #78786f;
+      --line: #2e2e2b;
+      --line-2: #3d3d39;
+      --accent: #85b7eb;
+      --accent-soft: #0c447c;
+      --good: #5dcaa5;
+      --good-soft: #04342c;
+      --warn: #ef9f27;
+      --warn-soft: #412402;
+      --bad: #f09595;
+      --bad-soft: #501313;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font: 15px/1.65 system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  main { max-width: 760px; margin: 0 auto; padding: 40px 20px 80px; }
+
+  header.top { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; margin-bottom: 28px; }
+  .brand { font-family: var(--mono); font-size: 15px; letter-spacing: -0.2px; color: var(--ink); }
+  .brand b { font-weight: 600; }
+  .top nav a { color: var(--ink-3); text-decoration: none; font-size: 13px; margin-left: 16px; }
+  .top nav a:hover { color: var(--accent); }
+
+  h1 { font-size: 27px; line-height: 1.35; font-weight: 600; margin: 0 0 8px; letter-spacing: -0.3px; }
+  .lede { color: var(--ink-2); margin: 0 0 26px; font-size: 15px; }
+  .lede code { font-family: var(--mono); font-size: 13px; background: var(--panel); border: 1px solid var(--line); padding: 1px 5px; border-radius: 5px; }
+
+  /* 首屏就把边界说清楚：不加载模型、不跑推理，给的是估算 */
+  .scope { display: flex; flex-wrap: wrap; gap: 6px; margin: -14px 0 22px; }
+  .scope span {
+    font-size: 11.5px; color: var(--ink-3);
+    padding: 3px 9px; border-radius: 99px;
+    border: 1px solid var(--line); background: var(--panel);
+  }
+
+  form { display: flex; gap: 10px; margin-bottom: 14px; }
+  #target {
+    flex: 1; min-width: 0;
+    font: 14px/1.5 var(--mono);
+    padding: 13px 15px;
+    border: 1px solid var(--line-2);
+    border-radius: var(--radius);
+    background: var(--panel);
+    color: var(--ink);
+    outline: none;
+    transition: border-color .15s;
+  }
+  #target:focus { border-color: var(--accent); }
+  #target::placeholder { color: var(--ink-3); font-family: system-ui, sans-serif; }
+  button {
+    font: 500 14px/1 system-ui, sans-serif;
+    padding: 0 22px;
+    border-radius: var(--radius);
+    border: 1px solid var(--accent);
+    background: var(--accent);
+    color: #fff;
+    cursor: pointer;
+    transition: opacity .15s;
+  }
+  @media (prefers-color-scheme: dark) { button { color: #08131f; } }
+  button:hover { opacity: .88; }
+  button:disabled { opacity: .5; cursor: default; }
+  button.ghost { background: transparent; color: var(--ink-2); border-color: var(--line-2); padding: 0 16px; }
+  button.ghost:hover { color: var(--ink); border-color: var(--ink-3); }
+
+  #drop {
+    border: 1px dashed var(--line-2);
+    border-radius: var(--radius);
+    padding: 10px 14px;
+    font-size: 13px;
+    color: var(--ink-3);
+    margin-bottom: 18px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+    transition: border-color .15s, background .15s;
+  }
+  #drop.over { border-color: var(--accent); background: var(--accent-soft); }
+  #drop .hint { font-size: 12px; }
+
+  /* 拖拽选择本地文件：不想要一个「选择文件」按钮的人，可以直接拖 */
+  button.linkbtn {
+    border: 0; background: none; padding: 0; margin: 0;
+    font: inherit; color: var(--accent); cursor: pointer; text-decoration: underline;
+    text-underline-offset: 2px;
+  }
+  button.linkbtn:hover { opacity: .8; }
+
+  /* 拖拽时铺满整页：拖到页面任何地方都能接住，不会让浏览器直接打开文件 */
+  #dragmask {
+    position: fixed; inset: 0; z-index: 50;
+    display: none; align-items: center; justify-content: center;
+    background: color-mix(in srgb, var(--bg) 72%, transparent);
+    backdrop-filter: blur(3px);
+    pointer-events: none;
+  }
+  #dragmask.on { display: flex; }
+  #dragmask .dm-box {
+    padding: 30px 40px;
+    border: 2px dashed var(--accent);
+    border-radius: 18px;
+    background: var(--panel);
+    text-align: center;
+    font-size: 16px; font-weight: 500; color: var(--ink);
+  }
+  #dragmask .dm-box span { display: block; margin-top: 6px; font-size: 12.5px; font-weight: 400; color: var(--ink-3); }
+
+  /* 用 file:// 打开时，这段提示是唯一还能显示的东西 */
+  .filewarn {
+    margin: 0 0 22px; padding: 16px 18px;
+    border-radius: var(--radius);
+    background: var(--bad-soft); color: var(--bad);
+    font-size: 13.5px; line-height: 1.7;
+  }
+  .filewarn code {
+    font-family: var(--mono); font-size: 12.5px;
+    background: var(--panel); border: 1px solid var(--line);
+    padding: 1px 6px; border-radius: 5px; color: var(--ink);
+  }
+
+  .examples {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+    font-size: 12.5px; color: var(--ink-3);
+    margin: -8px 0 20px;
+  }
+  .ex {
+    font: 12.5px/1 system-ui, sans-serif;
+    padding: 6px 11px;
+    border-radius: 99px;
+    border: 1px solid var(--line-2);
+    background: transparent;
+    color: var(--ink-2);
+    cursor: pointer;
+  }
+  .ex:hover { border-color: var(--accent); color: var(--accent); }
+
+  .hwbar {
+    display: flex; flex-wrap: wrap; gap: 10px 14px; align-items: center;
+    padding: 12px 14px;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    font-size: 13px;
+    margin-bottom: 22px;
+  }
+  .hwbar label { color: var(--ink-2); display: flex; align-items: center; gap: 6px; }
+  .hwbar select, .hwbar input {
+    font: 13px/1 system-ui, sans-serif;
+    padding: 6px 8px;
+    border: 1px solid var(--line-2);
+    border-radius: 7px;
+    background: var(--bg);
+    color: var(--ink);
+    outline: none;
+  }
+  .hwbar select:focus, .hwbar input:focus { border-color: var(--accent); }
+  .hwbar input[type=number] { width: 68px; }
+  #detect-note { flex-basis: 100%; font-size: 12px; color: var(--ink-3); font-family: var(--mono); overflow-wrap: anywhere; }
+
+  .status {
+    padding: 14px 16px;
+    border-radius: var(--radius);
+    background: var(--panel);
+    border: 1px solid var(--line);
+    color: var(--ink-2);
+    font-size: 14px;
+    margin-bottom: 18px;
+  }
+  .status.bad { background: var(--bad-soft); border-color: transparent; color: var(--bad); }
+  .status strong { color: inherit; }
+  .status-tip {
+    margin-top: 10px; padding-top: 10px;
+    border-top: 1px solid color-mix(in srgb, currentColor 22%, transparent);
+    font-size: 13px; line-height: 1.7; color: var(--ink-2);
+  }
+
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 16px;
+    overflow: hidden;
+    margin-bottom: 18px;
+  }
+
+  .verdict { display: flex; justify-content: space-between; align-items: center; gap: 20px; padding: 22px 24px; }
+  .verdict[data-level=good] { background: var(--good-soft); }
+  .verdict[data-level=warn] { background: var(--warn-soft); }
+  .verdict[data-level=bad]  { background: var(--bad-soft); }
+  .verdict h2 { font-size: 20px; margin: 0 0 4px; font-weight: 600; letter-spacing: -0.2px; }
+  .verdict[data-level=good] h2 { color: var(--good); }
+  .verdict[data-level=warn] h2 { color: var(--warn); }
+  .verdict[data-level=bad]  h2 { color: var(--bad); }
+  .verdict p { margin: 0; font-size: 13.5px; color: var(--ink-2); max-width: 46ch; }
+  .verdict[data-level=good] p, .verdict[data-level=warn] p, .verdict[data-level=bad] p { color: var(--ink); opacity: .82; }
+  .v-side { text-align: right; flex: none; }
+  .v-num { font: 600 30px/1 var(--mono); letter-spacing: -1px; }
+  .v-cap { font-size: 11px; color: var(--ink-2); margin-top: 5px; }
+
+  .head { padding: 18px 24px 0; }
+  .h-name { font-size: 15px; font-weight: 600; overflow-wrap: anywhere; }
+  .h-meta { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  .chip {
+    font: 12px/1 var(--mono);
+    padding: 5px 8px;
+    border-radius: 6px;
+    background: var(--accent-soft);
+    color: var(--accent);
+  }
+  .chip.ghost { background: transparent; border: 1px solid var(--line-2); color: var(--ink-3); }
+
+  section { padding: 20px 24px 0; }
+  section:last-of-type { padding-bottom: 4px; }
+  section h3 { font-size: 12px; font-weight: 500; color: var(--ink-3); margin: 0 0 12px; letter-spacing: .3px; text-transform: none; }
+
+  .b-head { display: flex; justify-content: space-between; font-size: 13px; margin-bottom: 8px; }
+  .b-head .b-num { font-family: var(--mono); color: var(--ink-2); }
+  .meter { height: 8px; border-radius: 99px; background: var(--line); overflow: hidden; }
+  .meter i { display: block; height: 100%; background: var(--accent); border-radius: 99px; }
+  .b-legend { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 12px; color: var(--ink-2); margin-top: 10px; }
+  .b-legend .spd { margin-left: auto; font-family: var(--mono); color: var(--ink); }
+  .dot { display: inline-block; width: 7px; height: 7px; border-radius: 2px; margin-right: 5px; vertical-align: 1px; }
+  .dot.w { background: var(--accent); }
+  .dot.k { background: #7f77dd; }
+  .dot.o { background: var(--line-2); }
+  .note { font-size: 12px; color: var(--ink-3); margin: 10px 0 0; }
+
+  .tier {
+    display: grid;
+    grid-template-columns: 46px 1fr 78px 60px;
+    gap: 12px;
+    align-items: center;
+    padding: 5px 0;
+    font-size: 13px;
+  }
+  .t-ctx { font-family: var(--mono); color: var(--ink-2); }
+  .t-bar { height: 4px; background: var(--line); border-radius: 99px; overflow: hidden; }
+  .t-bar i { display: block; height: 100%; background: var(--line-2); border-radius: 99px; }
+  .tier.ok .t-bar i { background: var(--good); }
+  .tier.tight .t-bar i { background: var(--warn); }
+  .tier.no .t-bar i { background: var(--bad); opacity: .45; }
+  .tier.beyond .t-bar i { background: var(--line-2); }
+  .t-need { font-family: var(--mono); color: var(--ink-2); text-align: right; }
+  .t-mark { font-size: 12px; text-align: right; color: var(--ink-3); }
+  .tier.ok .t-mark { color: var(--good); }
+  .tier.tight .t-mark { color: var(--warn); }
+  .tier.no .t-mark { color: var(--bad); }
+  .tier.is-best { background: var(--accent-soft); margin: 0 -10px; padding: 5px 10px; border-radius: 7px; }
+  .tier.is-best .t-ctx { color: var(--accent); font-weight: 500; }
+
+  .kv-row { display: grid; grid-template-columns: 96px 1fr auto; gap: 12px; padding: 7px 0; border-bottom: 1px solid var(--line); font-size: 13px; }
+  .kv-row:last-child { border-bottom: 0; }
+  .kv-row .k { color: var(--ink-3); }
+  .kv-row .v { color: var(--ink); overflow-wrap: anywhere; }
+  .kv-row .src { font-size: 11px; color: var(--ink-3); font-family: var(--mono); }
+
+  details.tpl { padding: 16px 24px 0; }
+  details.tpl summary { font-size: 13px; color: var(--ink-2); cursor: pointer; }
+  details.tpl ul { margin: 10px 0 0; padding-left: 18px; font-size: 13px; color: var(--ink-2); }
+  details.tpl li { margin: 3px 0; }
+  details.tpl li .ok { color: var(--good); font-style: normal; }
+
+  table.repo { width: 100%; border-collapse: collapse; margin-top: 16px; font-size: 13.5px; }
+  table.repo th { text-align: left; font-weight: 500; font-size: 12px; color: var(--ink-3); padding: 8px 10px; border-bottom: 1px solid var(--line); }
+  table.repo td { padding: 10px; border-bottom: 1px solid var(--line); }
+  table.repo tbody tr { cursor: pointer; }
+  table.repo tbody tr:hover { background: var(--bg); }
+  table.repo .num { text-align: right; font-family: var(--mono); font-size: 12.5px; }
+  table.repo .q { font-family: var(--mono); font-size: 12.5px; }
+  table.repo .res { text-align: right; font-size: 12.5px; white-space: nowrap; }
+  table.repo tr.good .res { color: var(--good); }
+  table.repo tr.warn .res { color: var(--warn); }
+  table.repo tr.bad .res { color: var(--bad); }
+  table.repo tr.err td { color: var(--bad); font-size: 12px; }
+
+  .disclaimer { padding: 16px 24px 20px; font-size: 12px; color: var(--ink-3); line-height: 1.6; }
+  .disclaimer strong { color: var(--ink-2); }
+
+  /* 参数与假设：默认收起，想看的人展开。内容由 JS 从 core 渲染 */
+  .assumptions {
+    margin: 26px 0 0;
+    padding: 14px 18px;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    font-size: 13px;
+  }
+  .assumptions summary {
+    cursor: pointer; color: var(--ink-2); font-size: 13px;
+    list-style: none;
+  }
+  .assumptions summary::-webkit-details-marker { display: none; }
+  .assumptions summary::before { content: '▸ '; color: var(--ink-3); }
+  .assumptions[open] summary::before { content: '▾ '; }
+  .asm-lead { margin: 12px 0 4px; font-size: 12.5px; color: var(--ink-3); line-height: 1.8; }
+  .asm-lead code { font-family: var(--mono); font-size: 12px; }
+  .asm-group { margin-top: 16px; }
+  .asm-group h4 {
+    margin: 0 0 6px; font-size: 12px; font-weight: 600; color: var(--ink-3);
+    letter-spacing: .3px;
+  }
+  .asm-group dl { margin: 0; display: grid; grid-template-columns: 116px 1fr; gap: 4px 12px; }
+  .asm-group dt { color: var(--ink-2); font-size: 12px; line-height: 1.5; }
+  .asm-group dd { margin: 0; font-size: 12.5px; color: var(--ink); }
+  .asm-group dd b { font-weight: 500; }
+  .asm-group dd span { display: block; color: var(--ink-3); font-size: 12px; margin-top: 1px; }
+
+  .foot .warn-line {
+    padding: 12px 14px;
+    background: var(--warn-soft);
+    border-radius: 10px;
+    color: var(--ink-2);
+    line-height: 1.75;
+  }
+  .foot .warn-line strong { color: var(--ink); }
+
+  .foot { margin-top: 36px; font-size: 12.5px; color: var(--ink-3); line-height: 1.8; }
+  .foot a { color: var(--ink-2); }
+  .foot code { font-family: var(--mono); font-size: 12px; }
+
+  @media (max-width: 620px) {
+    main { padding: 24px 14px 60px; }
+    h1 { font-size: 22px; }
+    form { flex-wrap: wrap; }
+    #go { width: 100%; padding: 12px; }
+    .verdict { flex-direction: column; align-items: flex-start; gap: 14px; }
+    .v-side { text-align: left; }
+    .tier { grid-template-columns: 40px 1fr 66px; }
+    .t-mark { display: none; }
+    .kv-row { grid-template-columns: 78px 1fr; }
+    .kv-row .src { display: none; }
+    .asm-group dl { grid-template-columns: 1fr; gap: 1px 0; }
+    .asm-group dt { margin-top: 7px; }
+  }
+</style>
+</head>
+<body>
+<main>
+  <header class="top">
+    <div class="brand"><b>vram</b>fit</div>
+    <nav>
+      <!-- 改成你自己的仓库地址；没有仓库就把这一行删掉，留个 404 链接更难看 -->
+      <a href="https://github.com/RoRoToCode/vramfit" id="repo-link">GitHub</a>
+      <a href="#about">说明</a>
+    </nav>
+  </header>
+
+  <h1>这个模型，你这台机器跑得动吗</h1>
+  <p class="lede">
+    贴一个 HuggingFace 链接，<strong>不用下载</strong>就能知道它能开多大上下文、能不能驱动 coding agent。
+    只读文件头部十几 MB，几 GB 的模型也不会被整个拉下来。
+  </p>
+  <p class="scope">
+    <span>静态估算</span><span>不加载模型</span><span>不跑推理</span><span>结论仅供参考</span>
+  </p>
+
+  <form id="form" autocomplete="off">
+    <input id="target" type="text" spellcheck="false"
+           placeholder="粘贴 hf-mirror / huggingface 链接，或 owner/repo">
+    <button id="go" type="submit">检查</button>
+  </form>
+
+  <div id="drop">
+    <span>
+      <span id="drop-lead">本地模型：直接拖进来，或</span>
+      <button class="linkbtn" type="button" id="pick">选择文件</button>
+      <span class="hint" id="drop-hint">（文件不出浏览器，只读头部几 MB）</span>
+    </span>
+    <button class="ghost" type="button" id="share" hidden>复制分享链接</button>
+  </div>
+  <input type="file" id="file" accept=".gguf" multiple hidden>
+
+  <div class="examples">
+    <span id="ex-lead">没想好查什么？</span>
+    <button type="button" class="ex" id="ex-qwen" data-target="unsloth/Qwen3-8B-GGUF">看 Qwen3-8B 的全部量化</button>
+  </div>
+
+  <div class="hwbar">
+    <label><span id="lbl-gpu">显卡</span>
+      <select id="gpu"></select>
+    </label>
+    <label id="vram-wrap" hidden><span id="vram-cap">显存</span>
+      <input id="vram" type="number" min="1" max="512" step="1" value="8">
+    </label>
+    <label><span id="lbl-mem">系统内存</span>
+      <input id="ram" type="number" min="4" max="1024" step="4" value="16">
+    </label>
+    <label><span id="lbl-used">已占用</span>
+      <input id="used" type="number" min="0" max="128" step="0.1" value="0.8">
+    </label>
+    <label><span id="lbl-kv">KV 精度</span>
+      <select id="kv">
+        <option value="f16">f16</option>
+        <option value="q8_0">q8_0</option>
+        <option value="q4_0">q4_0</option>
+      </select>
+    </label>
+    <span id="detect-note"></span>
+  </div>
+
+  <div id="status" class="status" hidden></div>
+  <div id="output"></div>
+
+  <!-- 参数与假设：内容由 core/assumptions.mjs 渲染，不在这里写死 -->
+  <div id="assumptions"></div>
+
+  <!-- 独立版的介绍文字，不参与 i18n（母站复用时用自己的一段） -->
+  <div class="foot" id="about">
+    <p class="warn-line">
+      <strong>免责：</strong>本站不加载模型、不跑推理，所有数字都是
+      <strong>静态推算</strong>，不是实测结果，仅供选型参考。
+      它只负责排掉「根本不可能」的选项，不给合格证。
+    </p>
+    <p>
+      权重按文件体积算（分片按「第 1 片 × 片数」），KV 按层数 × KV head × 维度算，
+      速度按显存带宽 ÷ 权重体积算，误差通常 ±15% 以内；不含首字延迟，也不含多卡切分。
+      模板里有 tools 分支，不等于模型真会稳定调用工具 —— 请实际加载跑一次再决定。
+    </p>
+    <p>
+      网页版拿不到真实显存占用（浏览器不允许），已占用按 <code id="used-hint">0.8 GB</code> 估算，
+      可在上面改。笔记本双显卡时浏览器常报核显，请手动选正确的卡。
+      需要在命令行批量扫描本地目录、或接进 CI，用 <code>node check.mjs</code>。
+    </p>
+  </div>
+</main>
+
+<div id="dragmask">
+  <div class="dm-box">松开即可检查<span id="drag-sub">.gguf · 不会上传，只读头部</span></div>
+</div>
+
+<!-- build:file-warning -->
+<script>
+// 双击 index.html 打开时，浏览器禁止 file:// 加载 ES module：
+//   Access to script at 'file:///…/web/app.mjs' from origin 'null' has been blocked by CORS policy
+// 页面看起来完全正常，但所有交互都不会有反应 —— 用户会以为「拖拽坏了」「链接查不了」。
+// 这段必须内联：外部脚本在 file:// 下根本加载不了，写在哪里都没用。
+if (location.protocol === 'file:') {
+  document.addEventListener('DOMContentLoaded', function () {
+    var b = document.createElement('div')
+    b.className = 'filewarn'
+    b.innerHTML = '<strong>这个页面要通过 http 打开，直接双击不行。</strong><br>' +
+      '浏览器不允许 <code>file://</code> 页面加载脚本模块，所以拖拽和检查都不会有反应。' +
+      '在项目目录里运行 <code>node serve.mjs</code>，再打开 <code>http://localhost:8788</code>；' +
+      '或者用单文件版 <code>vramfit.html</code>，双击即可。'
+    document.body.insertBefore(b, document.body.firstChild)
+  })
+}
+</script>
+<!-- /build:file-warning -->
+<script type="module" src="./web/app.mjs"></script>
+</body>
+</html>

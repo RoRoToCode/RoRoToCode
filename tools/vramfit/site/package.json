@@ -1,0 +1,17 @@
+{
+  "name": "vramfit-web",
+  "version": "1.0.1",
+  "private": true,
+  "description": "vramfit 网页版：纯静态，无后端。解析层复用仓库根的 core/，构建产物在 dist/。",
+  "type": "module",
+  "license": "MIT",
+  "homepage": "https://www.roroto.com/tools/vramfit/",
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "node build.mjs && node --test test.mjs",
+    "serve": "node build.mjs && node serve.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

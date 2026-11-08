@@ -1,0 +1,25 @@
+# 依赖
+node_modules/
+
+# 构建产物：site/dist 由 node site/build.mjs 生成，部署时现构建再上传。
+# 不入库的理由 —— 里面的 core/ net/ 是根目录的逐字节副本，vramfit.html 是把所有模块
+# 内联出来的单文件版；两者都会随源码变化，提交进 git 只会制造「忘了重建」这类漂移。
+site/dist/
+
+# 预览与临时产物
+.tmp/
+.preview/
+*.bak
+*.rar
+
+# 测试时生成的临时模型
+*.gguf.tmp
+
+# npm pack / publish-check 的产物
+*.tgz
+
+# 编辑器 / 系统
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

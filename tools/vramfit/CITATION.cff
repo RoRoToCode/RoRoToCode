@@ -1,0 +1,28 @@
+# 别人在文章 / 课程 / 报告里引用这个工具时，GitHub 会从这个文件生成 BibTeX 和 APA。
+# 不强制 —— 只是把「怎么引用」写清楚，省得各人自己编一种格式。
+cff-version: 1.2.0
+message: "If you reference vramfit in an article, course or internal report, cite it like this."
+title: "vramfit"
+abstract: >-
+  A dependency-free command-line and web tool that reads only the GGUF header and
+  estimates whether a local model fits the available VRAM (including Apple unified
+  memory), how much context it can hold, and whether its chat template can drive a
+  coding agent. Estimates are static, not benchmarks.
+type: software
+authors:
+  - name: "RoRoToCode"
+    website: "https://www.roroto.com"
+    email: "su@roroto.com"
+repository-code: "https://github.com/RoRoToCode/vramfit"
+url: "https://www.roroto.com/tools/vramfit/"
+license: MIT
+version: "1.0.1"
+date-released: "2026-11-06"
+keywords:
+  - gguf
+  - vram
+  - local-llm
+  - llama.cpp
+  - apple-silicon
+  - quantization
+  - coding-agent

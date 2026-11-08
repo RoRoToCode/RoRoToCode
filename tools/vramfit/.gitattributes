@@ -1,0 +1,22 @@
+# 换行统一：仓库里存 LF，检出时也一样。
+#
+# 不加这个文件，core.autocrlf=true 的 Windows 机器会在检出一份 CRLF 的工作区，
+# 然后 site_test 里「dist 和源码一致」那类比对就有机会在别处（Linux CI）对不上，
+# 而且 diff 会整文件飘红。
+* text=auto eol=lf
+
+# 批处理必须 CRLF：cmd.exe 处理只有 LF 的 .cmd 时，goto/label 那几行会认错
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# 二进制，别碰
+*.png binary
+*.jpg binary
+*.ico binary
+*.woff2 binary
+
+# 构建产物是文本，但它是生成的 —— 让 GitHub 别在 diff 里展开一个 165 KB 的 HTML
+site/dist/vramfit.html linguist-generated=true
+site/dist/core/** linguist-generated=true
+site/dist/net/** linguist-generated=true
+site/dist/web/** linguist-generated=true

@@ -1,0 +1,54 @@
+{
+  "name": "vramfit",
+  "version": "1.0.1",
+  "description": "判断一个本地大模型文件在你这台机器上跑不跑得动、能开多大上下文、能不能当 coding agent 用。命令行工具，无依赖，只读文件头部元数据。",
+  "type": "module",
+  "license": "MIT",
+  "author": "RoRoToCode <su@roroto.com> (https://www.roroto.com)",
+  "homepage": "https://www.roroto.com/tools/vramfit/",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/RoRoToCode/vramfit.git"
+  },
+  "bugs": {
+    "url": "https://github.com/RoRoToCode/vramfit/issues"
+  },
+  "bin": {
+    "vramfit": "./check.mjs",
+    "gguf-check": "./check.mjs"
+  },
+  "files": [
+    "check.mjs",
+    "check.cmd",
+    "core/",
+    "net/",
+    "cli/",
+    "README.md",
+    "README.en.md",
+    "LICENSE",
+    "CITATION.cff"
+  ],
+  "scripts": {
+    "test": "node --test test.mjs",
+    "test:site": "node --test site/test.mjs",
+    "build:site": "node site/build.mjs",
+    "publish-check": "node publish-check.mjs",
+    "check": "node check.mjs",
+    "about": "node check.mjs --about"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "gguf",
+    "vram",
+    "unified-memory",
+    "apple-silicon",
+    "llama.cpp",
+    "huggingface",
+    "local-llm",
+    "kv-cache",
+    "coding-agent",
+    "quantization"
+  ]
+}

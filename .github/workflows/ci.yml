@@ -1,0 +1,33 @@
+name: CI
+
+# 只跑「编译 + 纯函数单测」，不做打包：便携版出包要签名和本机环境，
+# 放 CI 里又慢又容易假失败，发布还是手动跑 npm run dist。
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: 安装依赖
+        run: npm ci
+
+      - name: 类型检查
+        run: npm run typecheck
+
+      - name: 编译主进程与渲染层
+        run: npm run build
+
+      - name: 单元测试
+        run: npm test
