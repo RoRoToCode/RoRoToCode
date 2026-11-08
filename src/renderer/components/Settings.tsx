@@ -285,11 +285,11 @@ export function Settings({
     setNote({
       text: inherited
         ? model
-          ? tr("已加入「{name}」，沿用了同一接口已填的 API Key（默认作为备用模型）", { name: name })
+          ? tr("已加入「{name}」，沿用同一接口的 Key（默认备用）。", { name: name })
           : tr("已加入「{name}」，沿用了同一接口已填的 API Key", { name: source.name })
         : model
-          ? tr("已加入「{name}」，粘上 API Key 后保存即可（默认作为备用模型）", { name: name })
-          : tr("已加入「{name}」，粘上 API Key 后点「拉取模型列表」选具体模型", { name: source.name }),
+          ? tr("已加入「{name}」，粘上 Key 保存即可（默认备用）。", { name: name })
+          : tr("已加入「{name}」，粘上 Key 后点「拉取模型列表」。", { name: source.name }),
       kind: 'ok'
     })
     setTab('list')
@@ -339,7 +339,7 @@ export function Settings({
       patchProvider(provider.id, { model: result.models[0] })
     }
     setNote({
-      text: tr("已拉取 {length} 个模型，点击「模型名」右侧箭头即可下拉选取", { length: result.models.length }),
+      text: tr("已拉取 {length} 个模型，点模型名右侧箭头选取。", { length: result.models.length }),
       kind: 'ok'
     })
   }
@@ -658,7 +658,7 @@ export function Settings({
                     {rtKind === 'llama' && (
                       <div className="grid2">
                         <div className="field">
-                          <label title={tr("留空即可：启动时自动探测空闲端口（默认从 8080 起）。填了值就锁定这个端口，被占用会直接报错")}>
+                          <label title={tr("留空自动探测空闲端口；填了就锁定，被占用会报错。")}>
                             {tr("实例端口")}
                           </label>
                           <input
@@ -679,7 +679,7 @@ export function Settings({
                           )}
                         </div>
                         <div className="field">
-                          <label title={tr("选定后这个实例只占那一张卡（不跨卡切分），另一张卡留给另一个模型")}>
+                          <label title={tr("只占这张卡，另一张卡留给别的模型。")}>
                             {tr("绑定显卡")}
                           </label>
                           <select
@@ -751,12 +751,12 @@ export function Settings({
                             ? !rtState
                               ? tr("正在扫描本地模型…")
                               : rtState.models.length === 0
-                                ? tr("还没有本地模型：点顶部「获取模型」下载一个，或手动放进 models/ 目录。")
+                                ? tr("还没有本地模型：点顶部「获取模型」下载，或放进 models/。")
                                 : draft.activeId !== p.id
-                                  ? tr("这个供应商不是当前使用的：先点卡片右侧的「使用」再保存，才会让 llama-server 加载它。")
+                                  ? tr("这个供应商不是当前使用的：先点「使用」再保存。")
                                   : p.model && baseName(p.model) !== servedName
                                     ? servedName
-                                      ? tr("保存后会重启这个实例（正在跑 {served}）并加载所选模型，需要几十秒。", { served: servedName })
+                                      ? tr("保存会重启实例并加载所选模型，约几十秒。", { served: servedName })
                                       : tr("保存后会启动 llama-server 加载这个模型。")
                                     : servedName
                                       ? tr("llama-server 正在运行：{served}", { served: servedName })
@@ -764,12 +764,12 @@ export function Settings({
                             : !rtState
                               ? tr("正在检测 {0}…", { "0": RT_LABEL[rtKind] })
                               : !rtState.installed && !rtState.running
-                                ? tr("未检测到 {0}：请先安装（「② 本地模型」页可一键安装），再点「启动服务」。", { "0": RT_LABEL[rtKind] })
+                                ? tr("未检测到 {0}：先到「② 本地模型」安装，再启动服务。", { "0": RT_LABEL[rtKind] })
                                 : !rtState.running
-                                  ? tr("{0} 服务未启动：点「启动服务」，或到「② 本地模型」页一键启动。", { "0": RT_LABEL[rtKind] })
+                                  ? tr("{0} 未启动：点「启动服务」，或到「② 本地模型」一键启动。", { "0": RT_LABEL[rtKind] })
                                   : draft.activeId !== p.id
-                                    ? tr("{0} 运行中（端口 {1}）；这个供应商不是当前使用的，先点「使用」再保存。", { "0": RT_LABEL[rtKind], "1": rtState.port ?? RT_PORT[rtKind] })
-                                    : tr("{0} 运行中（端口 {1}）· 已装 {length} 个模型；保存后即用所选模型对话。", { "0": RT_LABEL[rtKind], "1": rtState.port ?? RT_PORT[rtKind], length: rtState.models.length })}
+                                    ? tr("{0} 运行中（端口 {1}）；先点「使用」再保存。", { "0": RT_LABEL[rtKind], "1": rtState.port ?? RT_PORT[rtKind] })
+                                    : tr("{0} 运行中（端口 {1}）· {length} 个模型；保存后即用所选模型。", { "0": RT_LABEL[rtKind], "1": rtState.port ?? RT_PORT[rtKind], length: rtState.models.length })}
                         </div>
                       </div>
                     ) : (
@@ -783,7 +783,7 @@ export function Settings({
                             options={models ?? []}
                             placeholder={tr("如 qwen2.5-coder:7b")}
                             title={p.model || undefined}
-                            emptyHint={tr("还没有拉取模型列表：点右侧「拉取模型列表」，也可以直接手输模型名")}
+                            emptyHint={tr("还没拉列表：点「拉取模型列表」，或直接手输模型名。")}
                             onChange={(v) => patchProvider(p.id, { model: v })}
                           />
                           <button className="btn" onClick={() => void fetchModels(p)}>
@@ -808,7 +808,7 @@ export function Settings({
                         </select>
                       </label>
                       <span className="note">
-                        {tr("自动按模型名判断；模型名判断错时手动改。上传图片要选「支持看图」的模型才看得见。")}</span>
+                        {tr("按模型名自动判断，判错可手动改；看图要选「支持看图」。")}</span>
                     </div>
                     <div className="row">
                       <label
@@ -835,7 +835,7 @@ export function Settings({
                         />
                         {tr("作为备用模型")}</label>
                       <span className="note">
-                        {tr("主模型额度用完（429/402）、断网或服务 5xx 时自动切到它；同一条回答中途已输出内容则不切换。")}</span>
+                        {tr("额度用完、断网或 5xx 时自动切到它；已输出一半则不切。")}</span>
                     </div>
                     <div className="row">
                       <label
@@ -854,7 +854,7 @@ export function Settings({
                         </select>
                       </label>
                       <span className="note">
-                        {tr("选「工作模型」后，派出去的子代理用它干活：双卡机器上主模型占一张卡、它占另一张，两边才是真并行。全局只设一个。")}</span>
+                        {tr("子代理用它干活：双卡时各占一张卡，才是真并行。全局只设一个。")}</span>
                     </div>
                     {p.role === 'worker' && (
                       <div className="row">
@@ -886,7 +886,7 @@ export function Settings({
               </Fold>
               <Fold id="base-doc" title={tr("手动安装说明")}>
               <p className="guide-lead">
-                {tr("本工具基于 Electron，本地运行依赖以下基础环境。上面没装全的话，点「一键安装」会自己下载并装好；手动装也可以，装完请重启本程序。")}</p>
+                {tr("本地运行依赖以下环境；没装全就点「一键安装」，装完重启本程序。")}</p>
               <h3>{tr("必装")}</h3>
               <ul className="guide-list">
                 <li>
@@ -930,7 +930,7 @@ export function Settings({
           {tab === 'api' && (
             <div className="guide-section">
               <p className="guide-lead">
-                {tr("使用云端模型只需一个 Base URL 和 API Key。点下面的按钮新增一个供应商，填地址与 Key，拉取模型列表后保存即可（在「④ 模型列表」里编辑）。")}</p>
+                {tr("云端模型只要 Base URL 和 API Key：新增供应商 → 填地址与 Key → 拉取模型 → 保存。")}</p>
               <div className="guide-actions">
                 <button className="btn primary" onClick={() => addProviderFromApi()}>
                   {tr("我有 API，添加")}</button>
@@ -946,7 +946,7 @@ export function Settings({
                   />
                   {tr("额度用完 / 连不上时自动切换")}</label>
                 <span className="note">
-                  {tr("按「④ 模型列表」的顺序，依次尝试勾了「备用」的供应商；已经输出一半内容时不切换，避免重复。")}</span>
+                  {tr("按列表顺序依次尝试勾了「备用」的供应商；已输出一半时不切换。")}</span>
               </div>
 
               <FreeModels onAdd={addFreeProvider} />

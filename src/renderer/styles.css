@@ -1714,19 +1714,6 @@ select:focus {
   background: rgba(239, 106, 106, 0.14);
 }
 
-.model-pill {
-  max-width: 44%;
-  cursor: default;
-}
-
-.model-chip {
-  min-width: 0;
-  color: var(--dim);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
 .foot-label {
   flex: none;
   color: var(--dim);

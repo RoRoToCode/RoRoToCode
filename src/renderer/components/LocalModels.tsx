@@ -251,7 +251,7 @@ export const LocalModels = forwardRef<LocalModelsHandle, Props>(function LocalMo
       } else if (action === 'start') {
         const target = picked || llamaModels[0]
         if (!target) {
-          setLlamaMsg(tr("还没有本地模型。先点顶部「获取模型」下载一个，或手动放进 models/ 目录。"))
+          setLlamaMsg(tr("还没有本地模型：点顶部「获取模型」下载，或放进 models/。"))
           return
         }
         setLlamaMsg(tr("正在启动 llama-server（{0}）并创建模型配置…", { "0": baseName(target) }))
@@ -322,11 +322,11 @@ export const LocalModels = forwardRef<LocalModelsHandle, Props>(function LocalMo
         </div>
         {backend?.installed && !backend.gpuReady && (
           <p className="guide-warn">
-            {tr("当前是 CPU 版，不占显存但较慢。重新「一键安装 / 下载」会换成 CUDA 版。")}</p>
+            {tr("当前 CPU 版：不占显存但慢；重装可换 CUDA 版。")}</p>
         )}
         {backend && !backend.installed && (
           <p className="guide-warn">
-            {tr("还没安装 llama.cpp。点下面的「一键安装 / 下载」即可，装完再用本地模型。（若想一步到位，可在「① 基础核心」点「简易核心」。）")}</p>
+            {tr("还没装 llama.cpp：点下面「一键安装 / 下载」即可；或到「① 基础核心」用简易核心。")}</p>
         )}
         <p className="guide-lead">
           {tr("自动下载解压到")}<code>llama.cpp/</code>{tr("，用本机 GGUF 模型启动服务。")}</p>
@@ -416,7 +416,7 @@ export const LocalModels = forwardRef<LocalModelsHandle, Props>(function LocalMo
             )}
             {picked && vision[picked] === 'missing' && (
               <p className="guide-warn">
-                {tr("这个模型是视觉模型，但目录里没有配套的投影器（mmproj），启动后只能当文本模型用，发图片会被忽略。到「获取模型」重新下载它，会连带下载投影器。")}
+                {tr("缺配套投影器（mmproj），发图片会被忽略；重新下载会一起装。")}
               </p>
             )}
 
@@ -530,7 +530,7 @@ export const LocalModels = forwardRef<LocalModelsHandle, Props>(function LocalMo
           </div>
         )}
         <p className="guide-note">
-          {tr("端口留空会自动探测空闲端口（默认从 8080 起）；想一台机器同时跑两个模型，只要给第二个实例绑定另一张显卡，端口会自动避开。模型文件（.gguf）放在")}<code>models/</code> {tr("或")}<code>llama.cpp/</code> {tr("下即可被识别。")}</p>
+          {tr("端口留空自动探测；两个实例绑不同显卡即可同时跑。.gguf 放进")}<code>models/</code> {tr("或")}<code>llama.cpp/</code> {tr("即可识别。")}</p>
         {running.length > 1 && (
           <p className="guide-note">
             {tr("当前有 {n} 个实例在跑：", { n: running.length })}
@@ -543,7 +543,7 @@ export const LocalModels = forwardRef<LocalModelsHandle, Props>(function LocalMo
         kind="ollama"
         step={tr("方式 B")}
         title="Ollama"
-        desc={tr("没装就点「一键安装 / 下载」，装好后点「一键启动」即可拉起服务并选模型。")}
+        desc={tr("没装就先「一键安装 / 下载」，再点「一键启动」。")}
         port={11434}
         canPull
         currentModel={currentModels?.ollama}
@@ -555,7 +555,7 @@ export const LocalModels = forwardRef<LocalModelsHandle, Props>(function LocalMo
         kind="lmstudio"
         step={tr("方式 C")}
         title="LM Studio"
-        desc={tr("自带 Local Server，装好后点「一键启动」即可拉起服务并选模型。")}
+        desc={tr("自带 Local Server：装好后点「一键启动」即可。")}
         port={1234}
         currentModel={currentModels?.lmstudio}
         onSelectModel={(m) => onSelectModel?.(m, 'lmstudio')}

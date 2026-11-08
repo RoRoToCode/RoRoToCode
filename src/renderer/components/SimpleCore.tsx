@@ -100,7 +100,7 @@ export function SimpleCore({ onChanged }: Props) {
       </div>
       <p className="guide-lead">
         {tr("一次点完：在软件根目录建")}<code>core/</code>
-        {tr("目录，下载核心模型，装好 llama.cpp 并自动配置、加载、自检。做的和「② 本地模型」页手动一步步点完全一样，只是不用自己盯着。")}
+        {tr("目录，下核心模型、装 llama.cpp 并自检，等于手动流程全自动。")}
       </p>
       <div className="guide-actions">
         <button

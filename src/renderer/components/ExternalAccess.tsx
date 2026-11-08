@@ -39,7 +39,7 @@ export function ExternalAccess({ providers }: { providers: ProviderConfig[] }) {
   if (!locals.length) {
     return (
       <p className="guide-lead">
-        {tr('还没有正在使用的本地模型。先到「② 本地模型」启动一个，这里会自动出现可粘贴的地址。')}
+        {tr("还没有本地模型：先到「② 本地模型」启动一个。")}
       </p>
     )
   }
@@ -48,7 +48,7 @@ export function ExternalAccess({ providers }: { providers: ProviderConfig[] }) {
     <div>
       <p className="guide-lead">
         {tr(
-          '下面的地址给 Cline / Cursor / Continue / 任意 OpenAI 兼容客户端用。模型要先启动；端口和模型名以当前配置为准。'
+          "给 Cline / Cursor / Continue 等兼容客户端用；模型需先启动。"
         )}
       </p>
       {locals.map((p) => (
@@ -61,7 +61,7 @@ export function ExternalAccess({ providers }: { providers: ProviderConfig[] }) {
       ))}
       <p className="guide-lead" style={{ marginTop: 4 }}>
         {tr(
-          '控制面（查询模型是否加载完、崩溃原因）需要 token，启动程序时控制台会打印，也写在 userData/daemon.json 里。'
+          "控制面需要 token：见启动控制台或 userData/daemon.json。"
         )}
       </p>
       <CopyRow label={tr('控制面')} value="http://127.0.0.1:7788/status" />

@@ -57,7 +57,7 @@ export function FreeModels({ onAdd }: Props) {
         <div>
           <h3>{tr("免费模型")}</h3>
           <p className="free-sub">
-            {tr("额度不够或连不上时，可以在「④ 模型列表」里把某个供应商勾成「备用」，程序会按顺序自动切换。")}</p>
+            {tr("额度不够或连不上时，把某个供应商勾成「备用」即可自动切换。")}</p>
         </div>
         <button className="btn" disabled={busy} onClick={() => void load(true)}>
           {busy ? tr("拉取中…") : tr("刷新目录")}

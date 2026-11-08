@@ -508,7 +508,7 @@ export function AppSettings({ config, onSave, onClose, notify }: Props) {
                 ))}
               </div>
             </div>
-            <p className="aset-hint">{tr("立即生效并记住。白色适合白天和投屏，大条纹是深色底加宽斜纹，高对比是纯黑底白字。")}</p>
+            <p className="aset-hint">{tr("立即生效。白色适合白天投屏，大条纹是深色底。")}</p>
 
             <div className="aset-row" style={{ marginTop: 12 }}>
               <span className="aset-label">{tr("界面缩放")}</span>
@@ -526,7 +526,7 @@ export function AppSettings({ config, onSave, onClose, notify }: Props) {
               </div>
             </div>
             <p className="aset-hint">
-              {tr("字太小就调到 110%～125%。缩放同样会记住，下次启动仍按这个比例显示。")}</p>
+              {tr("字太小可调到 110%～125%，缩放会被记住。")}</p>
 
             {/* 字号独立于缩放：只改文字，不动按钮尺寸与间距 */}
             <div className="aset-row" style={{ marginTop: 16 }}>
@@ -564,7 +564,7 @@ export function AppSettings({ config, onSave, onClose, notify }: Props) {
               </button>
             </div>
             <p className="aset-hint">
-              {tr("只放大文字，不动按钮、间距和布局；和上面的「界面缩放」可以同时用，效果会叠加。设置立即生效并记住。")}</p>
+              {tr("只放大文字，不动按钮和间距；可与「界面缩放」叠加。")}</p>
 
             <div className="aset-row" style={{ marginTop: 12 }}>
               <span className="aset-label">{tr("对话正文")}</span>
@@ -598,7 +598,7 @@ export function AppSettings({ config, onSave, onClose, notify }: Props) {
               </div>
             )}
             <p className="aset-hint">
-              {tr("消息、代码块和工具结果单独调大小，侧栏和按钮保持原样；长时间读长回答时建议比界面字号大一档。")}</p>
+              {tr("只调消息、代码块和工具结果；读长回答可再大一号。")}</p>
 
             <div className="aset-font-preview">
               <div className="aset-preview-ui">
@@ -631,7 +631,7 @@ export function AppSettings({ config, onSave, onClose, notify }: Props) {
                 {tr("清除")}</button>
             </div>
             <p className="aset-hint">
-              {tr("新会话默认在这里读写文件；已有会话各自保留原来的目录，不会被改动。")}</p>
+              {tr("新会话默认在此读写；已有会话保留原目录。")}</p>
           </Sec>
 
           <Sec id="approval" title={tr("审批与执行")} summary={tr("{approvalLabel} · {maxSteps} 步", { approvalLabel: approvalLabel, maxSteps: draft.maxSteps })}>
@@ -663,7 +663,7 @@ export function AppSettings({ config, onSave, onClose, notify }: Props) {
               />
               <span className="aset-unit">{tr("步")}</span>
             </div>
-            <p className="aset-hint">{tr("一次提问里助手最多连续做多少步（读文件、改代码、跑命令都算一步），5～100。")}</p>
+            <p className="aset-hint">{tr("一次提问最多连续做多少步（读文件、改代码、跑命令），5～100。")}</p>
 
             <label className="aset-check">
               <input
@@ -674,7 +674,7 @@ export function AppSettings({ config, onSave, onClose, notify }: Props) {
               <span className="aset-check-main">
                 <b>{tr("任务没做完就自动接着做")}</b>
                 <span>
-                  {tr("一轮结束时如果计划里还有没勾掉的项、或助手只说「接下来我会…」却没动手，程序会自动再推它一轮，不用每次手点「继续」；真的做完了才把控制权交回来。")}</span>
+                  {tr("计划没做完、或助手只说不动手，就自动再推一轮；做完才交回控制权。")}</span>
               </span>
             </label>
           </Sec>
@@ -693,7 +693,7 @@ export function AppSettings({ config, onSave, onClose, notify }: Props) {
               <span className="aset-check-main">
                 <b>{tr("允许联网搜索与读取网页")}</b>
                 <span>
-                  {tr("开启后助手能查官方文档、报错含义、库的最新版本；关闭后只在本地文件和你给的材料里找答案，\n                  需要联网时会直接说明。")}</span>
+                  {tr("开启后可查文档、报错、库版本；关闭后只用本地文件，需要联网会直说。")}</span>
               </span>
             </label>
 
@@ -706,7 +706,7 @@ export function AppSettings({ config, onSave, onClose, notify }: Props) {
               <span className="aset-check-main">
                 <b>{tr("自动验证结果")}</b>
                 <span>
-                  {tr("改完代码自动按项目类型跑测试 / 构建（npm test、tsc、cargo check 等），失败就让助手继续修，最多补两轮。")}</span>
+                  {tr("改完代码自动跑测试 / 构建，失败就继续修，最多两轮。")}</span>
               </span>
             </label>
 
@@ -719,11 +719,11 @@ export function AppSettings({ config, onSave, onClose, notify }: Props) {
               <span className="aset-check-main">
                 <b>{tr("跨对话记忆")}</b>
                 <span>
-                  {tr("助手把构建命令、目录约定、踩过的坑记到项目里，下次开新会话自动带上；关闭后不再记录，也不再注入。")}</span>
+                  {tr("记下构建命令和约定，新会话自动带上；关闭后不再记录。")}</span>
               </span>
             </label>
             <p className="aset-hint">
-              {tr("已经记下的内容不会因为关闭而丢失，在「数据」里可以查看占用并一键清空。")}</p>
+              {tr("已记内容不会因关闭丢失，可在「数据」里清空。")}</p>
           </Sec>
 
           <Sec
@@ -748,7 +748,7 @@ export function AppSettings({ config, onSave, onClose, notify }: Props) {
               </button>
             </div>
             <p className="aset-hint">
-              {tr("默认关闭：模型能记多少就记多少，一直跑下去，直到窗口真的装不下。用在线 API 时一般不用开；\n              开只是主动压小，用来省显存和 token 花销。")}</p>
+              {tr("默认不限制，直到窗口装不下；开启只为省显存和 token。")}</p>
 
             <div className={`aset-row ${draft.contextLimit ? '' : 'off'}`} style={{ marginTop: 12 }}>
               <span className="aset-label">{tr("上限值")}</span>
@@ -768,8 +768,8 @@ export function AppSettings({ config, onSave, onClose, notify }: Props) {
             </div>
             <p className="aset-hint">
               {draft.contextLimit
-                ? tr("保存后同步给 Ollama 与 LM Studio。越大记得越多，也更占显存：7B 每 1K tokens 约 60MB，1.5B 约 28MB。\n              llama.cpp 按「模型设置」里那一项的上限启动，避免显存不够起不来。")
-                : tr("不限制时这一项灰着：实际按模型自己的窗口跑（llama.cpp 读服务端的真实值，Ollama 读模型上限，在线模型用接口声明的值）。")}
+                ? tr("越大记得越多也越占显存（7B 每 1K tokens 约 60MB）。llama.cpp 按此上限启动。")
+                : tr("不限制时灰显：实际按模型自己的窗口跑。")}
             </p>
 
             <label className="aset-check">
@@ -780,11 +780,11 @@ export function AppSettings({ config, onSave, onClose, notify }: Props) {
               />
               <span className="aset-check-main">
                 <b>{tr("自动压缩早期对话")}</b>
-                <span>{tr("记到窗口的 75% 左右就把前段压成摘要再继续，不丢消息，也不会因为太长被服务端截断")}</span>
+                <span>{tr("占到窗口 75% 就把前段压成摘要再继续。")}</span>
               </span>
             </label>
             <p className="aset-hint">
-              {tr("压缩在后台自动进行，顶部会提示「正在压缩早期对话」，完成后只保留目标、结论、改过的文件和待办。\n              压缩会多花一次模型调用；关掉它就只保留最近几轮，更省但会忘掉前面的事。")}</p>
+              {tr("后台自动压缩，只留目标、结论、改过的文件和待办；会多花一次模型调用。")}</p>
 
             <div className="aset-row" style={{ marginTop: 12 }}>
               <span className="aset-label">{tr("并发槽位")}</span>
@@ -802,7 +802,7 @@ export function AppSettings({ config, onSave, onClose, notify }: Props) {
               </div>
             </div>
             <p className="aset-hint">
-              {tr("本机 llama.cpp 一次能同时处理几个请求。子代理并行时用得上：单槽下第二个请求只能排队，界面上看起来就是卡住。选 2 以上会同时开启共享 KV 池，否则上下文会被按槽切分，长 prompt 反而更容易超出窗口。不改就交给 llama.cpp 按显存自己挑。")}</p>
+              {tr("llama.cpp 同时处理几个请求。子代理并行时调 2 以上；不改就按显存自动。")}</p>
           </Sec>
 
           <Sec
@@ -820,7 +820,7 @@ export function AppSettings({ config, onSave, onClose, notify }: Props) {
               />
             </div>
             <p className="aset-hint">
-              {tr("公司网络或需要科学上网时填这里。搜网页、抓文档和下载模型都会走它；本地模型（127.0.0.1）不受影响。")}</p>
+              {tr("搜网页、抓文档、下模型都走它；本地模型不受影响。")}</p>
 
             <label className="aset-check">
               <input
@@ -830,7 +830,7 @@ export function AppSettings({ config, onSave, onClose, notify }: Props) {
               />
               <span className="aset-check-main">
                 <b>{tr("启用 MCP 外部工具")}</b>
-                <span>{tr("读取数据目录里的 mcp.json，把外部服务（文件系统、数据库、浏览器等）的工具挂给模型")}</span>
+                <span>{tr("读 mcp.json，把外部服务的工具挂给模型。")}</span>
               </span>
             </label>
 
@@ -868,7 +868,7 @@ export function AppSettings({ config, onSave, onClose, notify }: Props) {
                 </div>
               ))}
               <p className="aset-hint">
-                {tr("改完 mcp.json 点「重新连接」即可生效。外部工具默认按「执行命令」级别审批，不会绕开确认框。")}</p>
+                {tr("改完点「重新连接」生效；外部工具仍按「执行命令」审批。")}</p>
             </div>
           </Sec>
 
@@ -901,7 +901,7 @@ export function AppSettings({ config, onSave, onClose, notify }: Props) {
                 {tr("恢复默认快捷键")}</button>
             </div>
             <p className="aset-hint">
-              {tr("只支持带 Ctrl 的组合，避免和打字冲突。改完立即生效，不用重启。")}</p>
+              {tr("只支持带 Ctrl 的组合，改完立即生效。")}</p>
           </Sec>
 
           <Sec id="data" title={tr("数据")} summary={tr("{0} 条会话", { "0": info?.sessionCount ?? 0 })}>
@@ -918,7 +918,7 @@ export function AppSettings({ config, onSave, onClose, notify }: Props) {
                 {tr("打开日志目录")}</button>
             </div>
             <p className="aset-hint">
-              {tr("里面有 config.json（模型配置）、sessions/（当前")}{info?.sessionCount ?? 0} {tr("条会话）、prefs.json（软件偏好）。\n              卸载软件不会删这里；想彻底清干净，关掉软件后手动删这个目录即可。")}</p>
+              {tr("里面有 config.json、sessions/（当前")}{info?.sessionCount ?? 0} {tr("条会话）、prefs.json。卸载不会删这里；要清干净请手动删。")}</p>
 
             <div className="aset-row" style={{ marginTop: 12 }}>
               <span className="aset-label">{tr("长期记忆")}</span>
@@ -931,7 +931,7 @@ export function AppSettings({ config, onSave, onClose, notify }: Props) {
                 {tr("清空记忆")}</button>
             </div>
             <p className="aset-hint">
-              {tr("助手用 remember 记下的项目约定（构建命令、目录习惯、踩过的坑），每次对话自动带上。\n              按工作区各存一份，放在数据目录的 memory/ 下。")}</p>
+              {tr("remember 记下的项目约定，每次对话自动带上；按工作区存在 memory/ 下。")}</p>
 
             <div className="aset-row" style={{ marginTop: 16 }}>
               <span className="aset-label">{tr("项目规则")}</span>
@@ -948,7 +948,7 @@ export function AppSettings({ config, onSave, onClose, notify }: Props) {
                 {instr?.path ? tr("重新读取") : tr("生成 AGENTS.md")}</button>
             </div>
             <p className="aset-hint">
-              {tr("项目规则是作者手写、随仓库提交的 AGENTS.md / CLAUDE.md（从工作区根向上逐层查找）。\n              写清构建命令、目录约定、踩过的坑，每次对话都会注入；换机器、换同事都能生效。")}</p>
+              {tr("随仓库提交的 AGENTS.md / CLAUDE.md，向上逐层查找，每次对话都注入。")}</p>
           </Sec>
 
           <Sec
@@ -965,13 +965,13 @@ export function AppSettings({ config, onSave, onClose, notify }: Props) {
 
             {permFiles.length > 1 && (
               <p className="aset-hint">
-                {tr("已从工作区向上合并 {0} 份 roroto.json：越靠近工作区的规则优先级越高。\n下方标「继承」的规则来自父目录，需到对应文件里修改。", { "0": permFiles.length })}
+                {tr("已合并 {0} 份 roroto.json，越近优先级越高；标「继承」的要去父目录改。", { "0": permFiles.length })}
               </p>
             )}
 
             {perms && perms.length === 0 && (
               <p className="aset-hint">
-                {tr("还没有权限规则。可以给「删除 / 越界 / 联网 / 特定命令」加一条 deny 来收紧，或给常用命令加 allow 来少点确认。")}</p>
+                {tr("还没有规则。deny 用来收紧，allow 让常用命令少点确认。")}</p>
             )}
 
             {perms && perms.length > 0 && (
@@ -1036,15 +1036,13 @@ export function AppSettings({ config, onSave, onClose, notify }: Props) {
             </div>
 
             <p className="aset-hint">
-              {tr("权限规则按顺序匹配，写在 roroto.json 的 permissions 里（随仓库提交，团队共享）。\n" +
-                "「拒绝」直接拦截、不弹确认，且无法被「之后全允许」覆盖；「放行」只对普通操作生效，\n" +
-                "删除文件、越界、联网、外部 MCP 以及不可逆命令仍会强制确认，永远不会被放行规则绕过。")}</p>
+              {tr("规则按顺序匹配，写在 roroto.json 的 permissions 里。")}</p>
           </Sec>
 
           <Sec id="trash" title={tr("回收站")} summary={trash ? tr("{0} 条", { "0": trash.length }) : tr("读取中…")}>
             {trash && trash.length === 0 && (
               <p className="aset-hint">
-                {tr("没有已删除的会话。删除的会话会在这里保留 7 天，超期自动清理。")}</p>
+                {tr("没有已删除的会话；这里保留 7 天，超期自动清理。")}</p>
             )}
             {trash && trash.length > 0 && (
               <div className="trash-list">
@@ -1072,7 +1070,7 @@ export function AppSettings({ config, onSave, onClose, notify }: Props) {
               </div>
             )}
             <p className="aset-hint">
-              {tr("删除会话只是移到这里，磁盘上的项目文件不受影响。回收站存在数据目录的 sessions/.trash/ 下。")}</p>
+              {tr("删除只是移到这里，项目文件不受影响；存放在 sessions/.trash/。")}</p>
           </Sec>
 
           <Sec id="about" title={tr("关于")} summary={info?.version ? `v${info.version}` : undefined}>
@@ -1104,7 +1102,7 @@ export function AppSettings({ config, onSave, onClose, notify }: Props) {
               </div>
             </div>
             <p className="aset-hint">
-              {tr("遇到 bug、想提功能建议，或模型跑不起来，把复现步骤和报错发到上面的邮箱就行。")}</p>
+              {tr("遇到 bug 或模型跑不起来，把复现步骤和报错发上面邮箱。")}</p>
           </Sec>
         </div>
 

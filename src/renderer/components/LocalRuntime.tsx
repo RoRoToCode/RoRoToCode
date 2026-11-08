@@ -350,7 +350,7 @@ export function LocalRuntime({
               : tr("还没装好 {title}，", { title: title })}
           {kind === 'ollama'
             ? tr("用下面的输入框拉取，或用本程序已下载的模型直接导入。")
-            : tr("可以在 LM Studio 里下载一个，或用下面「本程序已下载的模型」直接导入。")}
+            : tr("在 LM Studio 里下一个，或用下面已下载的模型导入。")}
         </p>
       )}
 
@@ -380,7 +380,7 @@ export function LocalRuntime({
           <p className="guide-note">
             {kind === 'lmstudio'
               ? tr("硬链接导入，同盘不额外占空间。")
-              : tr("Ollama 会把模型复制进自己的库里，额外占用约 {0}；模板不兼容时会自动退回 Ollama 默认模板。", { "0": pickedGguf ? fmtSize(pickedGguf.sizeBytes) : tr("一份") })}
+              : tr("Ollama 会把模型复制进库，额外占约 {0}。", { "0": pickedGguf ? fmtSize(pickedGguf.sizeBytes) : tr("一份") })}
           </p>
         </div>
       )}

@@ -172,7 +172,7 @@ export function SkillsPanel({ onClose, onUse, notify }: Props) {
           <div className="skills-head-text">
             <h2>{tr("技能")}</h2>
             <span className="skills-sub">
-              {tr("一段可复用的指令。点「使用」会填进输入框，你再补一句具体需求就能发。")}</span>
+              {tr("点「使用」填入输入框，再补一句需求即可发送。")}</span>
           </div>
           <button className="icon-btn" onClick={onClose} title={tr("关闭")}>
             {tr("关闭")}</button>
@@ -223,7 +223,7 @@ export function SkillsPanel({ onClose, onUse, notify }: Props) {
                 className="skill-textarea"
                 rows={10}
                 value={draft.prompt}
-                placeholder={tr("写给模型的具体要求，越具体越好。例如：请为 src/api 下每个接口补一个并发压测脚本，测 100 并发下的 P95 延迟，并输出结果表格。")}
+                placeholder={tr("写给模型的具体要求。例如：给 src/api 每个接口补压测脚本，测 P95。")}
                 onChange={(e) => setDraft({ ...draft, prompt: e.target.value })}
               />
             </label>

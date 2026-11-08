@@ -180,10 +180,22 @@ function createWindow(): void {
   win.webContents.on('did-finish-load', () => {
     if (win && !win.isDestroyed()) void applySavedAppearance(win)
     // --smoke-shot：GUI 冒烟截图。加载完成后等恢复提示条渲染，截图存到 release/gui-smoke/ 再退出。
-    if (process.argv.includes('--smoke-shot')) {
+    if (process.argv.some((a) => a.startsWith('--smoke-shot'))) {
       void (async () => {
         try {
+          // --smoke-shot=名字：换个文件名；--smoke-click=选择器：截图前先点一下（用来看设置面板）
+          const shotArg = process.argv.find((a) => a.startsWith('--smoke-shot')) ?? ''
+          const shotName = shotArg.includes('=') ? shotArg.split('=').slice(1).join('=') : 'gui-full'
+          const clickSel = (process.argv.find((a) => a.startsWith('--smoke-click=')) ?? '').split('=').slice(1).join('=')
           await new Promise((r) => setTimeout(r, 2500))
+          if (clickSel && win && !win.isDestroyed()) {
+            // 多个选择器用 || 串起来，依次点，方便一层层打开面板
+            for (const sel of clickSel.split('||').filter(Boolean)) {
+              await win.webContents.executeJavaScript(`document.querySelector(${JSON.stringify(sel)})?.click()`)
+              await new Promise((r) => setTimeout(r, 700))
+            }
+            await new Promise((r) => setTimeout(r, 500))
+          }
           const outDir = path.join(app.getAppPath(), 'release', 'gui-smoke')
           fs.mkdirSync(outDir, { recursive: true })
           if (win && !win.isDestroyed()) {
@@ -191,8 +203,8 @@ function createWindow(): void {
               `(() => { const el = document.querySelector('.resume-banner'); return el ? el.innerText : '' })()`
             )) as string
             const img = await win.webContents.capturePage()
-            fs.writeFileSync(path.join(outDir, 'gui-full.png'), img.toPNG())
-            console.log(`[smoke-shot] 窗口截图 -> ${path.join(outDir, 'gui-full.png')}`)
+            fs.writeFileSync(path.join(outDir, `${shotName}.png`), img.toPNG())
+            console.log(`[smoke-shot] 窗口截图 -> ${path.join(outDir, `${shotName}.png`)}`)
             console.log(`[smoke-shot] 恢复提示条：${banner ? `已渲染（${banner.replace(/\\s+/g, ' ')}）` : '未出现'}`)
           }
         } catch (err) {

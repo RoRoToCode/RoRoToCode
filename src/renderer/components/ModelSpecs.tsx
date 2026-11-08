@@ -223,7 +223,7 @@ export function ModelSpecs({ onClose }: Props) {
                 <span className="specs-elapsed" aria-hidden="true">{tr("已等待 {0} 秒", { "0": catElapsed })}</span>
               </div>
               <div className="specs-fetching-track" aria-hidden="true"><i /></div>
-              <p className="guide-note">{tr("首次检索可能要等几十秒，网络慢时会自动退回内置清单，请保持窗口打开。")}</p>
+              <p className="guide-note">{tr("首次检索要几十秒，网络慢会退回内置清单。")}</p>
             </div>
           )}
 

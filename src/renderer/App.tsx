@@ -31,7 +31,7 @@ import { RunStatus } from './components/RunStatus'
 import { PlanCard } from './components/PlanCard'
 import { Settings } from './components/Settings'
 import { AppSettings } from './components/AppSettings'
-import { ModelPicker, StatusDot, type ProbeInfo } from './components/ModelPicker'
+import { ModelPicker, type ProbeInfo } from './components/ModelPicker'
 import { SkillsPanel } from './components/SkillsPanel'
 import { OutputPanel, collectOutputs } from './components/OutputPanel'
 import { DiffView } from './components/DiffView'
@@ -1224,7 +1224,7 @@ export function App() {
         <div className="drop-hint">
           <div className="drop-hint-inner">
             <span className="drop-hint-title">{tr("松开就把文件交给模型")}</span>
-            <span className="drop-hint-sub">{tr("PDF / 图片 / 文档 / 表格都可以，会复制一份到工作区 inbox/")}</span>
+            <span className="drop-hint-sub">{tr("PDF / 图片 / 文档 / 表格，会复制到工作区 inbox/")}</span>
           </div>
         </div>
       )}
@@ -1372,8 +1372,8 @@ export function App() {
                   </h1>
                   <div>
                     {noModels
-                      ? tr("还没有任何可用模型。可以在「模型设置 → ② 本地模型」跑本地模型，也可以在「③ 模型 API」填一个接口。")
-                      : tr("本机还没装好模型。点下面的按钮打开模型设置：先在「① 基础核心」点「简易核心」一键装好，再到「② 本地模型」挑一个模型就能开始。")}
+                      ? tr("还没有模型：到「模型设置」跑本地模型或填 API。")
+                      : tr("本机还没装好：先在模型设置点「简易核心」，再挑一个模型。")}
                   </div>
                   <button
                     className="btn primary empty-cta"
@@ -1478,8 +1478,8 @@ export function App() {
               className={`ctx-bar ${ctxCapped ? (ctxPct >= 85 ? 'hot' : ctxPct >= 70 ? 'warm' : '') : 'free'}`}
               title={
                 ctxCapped
-                  ? tr("本轮实际占用约 {used} tokens，窗口 {window} tokens", { used: context.used, window: context.window })
-                  : tr("本轮实际占用约 {used} tokens（未限制上下文，不设上限）", { used: context.used })
+                  ? tr("本轮占用 {used}，窗口 {window}", { used: context.used, window: context.window })
+                  : tr("本轮占用 {used} tokens（未设上限）", { used: context.used })
               }
             >
               <span className="ctx-label">{tr("上下文")}</span>
@@ -1532,13 +1532,13 @@ export function App() {
           )}
           {hasImageAttach && !visionReady && (
             <div className="attach-warn">
-              {tr("当前模型看不了图（")}{activeModelName}{tr("）。发出去模型只能收到文字说明；要看图请在「模型设置」里换成视觉模型。")}</div>
+              {tr("当前模型看不了图（")}{activeModelName}{tr("）。只能收到文字说明；看图请换视觉模型。")}</div>
           )}
           <div className="composer-inner">
             <textarea
               ref={textareaRef}
               rows={1}
-              placeholder={tr("描述你的需求，Enter 发送，Shift+Enter 换行")}
+              placeholder={tr("描述需求 · Enter 发送 · Shift+Enter 换行")}
               value={input}
               onChange={(e) => {
                 setInput(e.target.value)
@@ -1627,7 +1627,7 @@ export function App() {
               className="foot-pill attach-btn"
               onClick={pickFiles}
               disabled={attachBusy}
-              title={tr("添加文件：PDF、图片、文档、表格、代码等（也可以直接把文件拖进窗口）")}
+              title={tr("添加文件：PDF、图片、文档、表格、代码")}
             >
               <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true">
                 <path
@@ -1660,11 +1660,11 @@ export function App() {
                 className="foot-pill usage-pill"
                 title={
                   usage.costUsd === undefined
-                    ? tr("本会话累计：输入 {in} tokens，输出 {out} tokens（模型不在价格表里，不估算花费）", {
+                    ? tr("本会话：输入 {in}、输出 {out} tokens（不计花费）", {
                         in: String(usage.prompt),
                         out: String(usage.completion)
                       })
-                    : tr("本会话累计：输入 {in} tokens，输出 {out} tokens，约 {cost}", {
+                    : tr("本会话：输入 {in}、输出 {out} tokens，约 {cost}", {
                         in: String(usage.prompt),
                         out: String(usage.completion),
                         cost: fmtCost(usage.costUsd)
@@ -1678,16 +1678,6 @@ export function App() {
                 {usage.costUsd !== undefined && <span className="usage-cost">{fmtCost(usage.costUsd)}</span>}
               </span>
             )}
-            <span
-              className="foot-pill model-pill"
-              title={activeProbe.error ? tr("不可用：{error}", { error: activeProbe.error }) : tr("当前使用的模型")}
-            >
-              <span className="foot-label">{tr("模型选择")}</span>
-              <StatusDot state={activeProbe.state} error={activeProbe.error} />
-              <span className="model-chip">
-                {provider ? tr("{name} · {1}", { name: provider.name, "1": provider.model || tr("未选模型") }) : tr("未配置模型")}
-              </span>
-            </span>
           </div>
         </div>
       </main>
@@ -1803,7 +1793,7 @@ export function App() {
               <div className="approval-high">
                 <b>{tr("高危操作")}</b>
                 <span>
-                  {tr("该操作不可撤销，也不会被「之后全允许」或自动模式顺带放行，每次都要单独确认。")}
+                  {tr("不可撤销；也不会被「之后全允许」或自动模式放行。")}
                 </span>
               </div>
             )}
@@ -1981,7 +1971,7 @@ export function App() {
               {tr("将删除会话")}{' '}
               <b style={{ color: '#e9e9ec' }}>{pendingSessionDelete.title}</b>
               。<br />
-              {tr("它会先移入回收站并保留 7 天，期间可以在「设置 → 回收站」里恢复。")}<br />
+              {tr("会先移入回收站保留 7 天，可在「设置 → 回收站」恢复。")}<br />
               {tr("磁盘上的项目文件不受影响。")}
             </div>
             <div className="row" style={{ justifyContent: 'flex-end' }}>
@@ -1999,11 +1989,11 @@ export function App() {
           <div className="modal modal-sm" onClick={(e) => e.stopPropagation()}>
             <h2>{tr("删除这一轮对话")}</h2>
             <div style={{ color: 'var(--dim)', fontSize: 'calc(12.5px * var(--fs, 1))', lineHeight: 1.8 }}>
-              {tr("将删除这一轮共 {n} 条消息（含助手回答与工具输出），后续每轮请求都会少带上它们。", {
+              {tr("将删除这一轮 {n} 条消息，之后每轮都少带这些。", {
                 n: pendingDeleteCount
               })}<br />
-              {tr("此操作不可恢复，也不会移入回收站；磁盘上的项目文件不受影响。")}<br />
-              {tr("已压缩的早期对话摘要会一并作废，下一轮会按剩余历史重新压缩。")}
+              {tr("不可恢复，也不进回收站；项目文件不受影响。")}<br />
+              {tr("已压缩的摘要一并作废，下一轮重新压缩。")}
             </div>
             <div className="row" style={{ justifyContent: 'flex-end' }}>
               <button className="btn" onClick={() => setPendingMessageDelete(null)}>
@@ -2026,7 +2016,7 @@ export function App() {
                   : tr("未指定工作区")}
               </b>{' '}
               {tr("下的")}{pendingWsDelete.count} {tr("个会话。")}<br />
-              {tr("只删除左侧列表里的会话记录，磁盘上的项目文件不受影响。")}{pendingWsDelete.workspace === config?.workspace && (
+              {tr("只删会话记录，项目文件不受影响。")}{pendingWsDelete.workspace === config?.workspace && (
                 <>
                   <br />
                   {tr("该目录将不再作为当前工作区。")}</>

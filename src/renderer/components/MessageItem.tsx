@@ -315,7 +315,7 @@ export function MessageItem({
             {view.chars > 0 && (
               <div className="bubble-note">
                 {message.images?.length
-                  ? tr("附件已处理：{length} 张图片 + 约 {chars} 字说明，此处不展开", { length: message.images.length, chars: view.chars })
+                  ? tr("附件已处理：{length} 张图 + 约 {chars} 字说明", { length: message.images.length, chars: view.chars })
                   : tr("附件正文已读取（约 {chars} 字），此处不展开", { chars: view.chars })}
               </div>
             )}

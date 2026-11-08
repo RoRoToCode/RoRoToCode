@@ -122,7 +122,7 @@ export function GitPanel({ workspace, active, onNotify }: Props) {
           {busy ? tr("提交中…") : tr("提交全部")}
         </button>
       </div>
-      <div className="git-note">{tr("提交等于执行 git add -A 后 commit，只影响本地仓库，不会 push。")}</div>
+      <div className="git-note">{tr("等于 git add -A 后 commit，只影响本地，不会 push。")}</div>
     </div>
   )
 }

@@ -206,7 +206,7 @@ export function OutputPanel({
               </div>
               {files.length === 0 ? (
                 <div className="output-empty">
-                  {tr("让助手新建或修改文件后，成果会列在这里。点文件名用系统默认程序打开，点「目录」定位到资源管理器。")}</div>
+                  {tr("助手写过的文件会列在这里，点文件名打开，点「目录」定位。")}</div>
               ) : (
                 <div className="output-list">
                   {files.map((f) => (

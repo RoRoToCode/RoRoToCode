@@ -112,7 +112,7 @@ export function BaseTools() {
       </div>
 
       <p className="guide-lead">
-        {tr("点「一键安装」会自动从官网下载安装包并静默装好，安装过程会弹一次管理员授权窗口；装完重启本程序即可生效。")}</p>
+        {tr("从官网下载并静默安装，会弹一次管理员授权；装完重启本程序。")}</p>
 
       <ul className="tool-list">
         {(tools ?? []).map((t) => (

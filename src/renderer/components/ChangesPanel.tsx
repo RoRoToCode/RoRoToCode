@@ -96,7 +96,7 @@ export function ChangesPanel({ sessionId, refreshKey, onNotify, onReverted }: Pr
 
       {list.length === 0 ? (
         <div className="panel-empty">
-          {tr("模型每次新建或修改文件都会在这里留一份改前快照。改坏了可以点撤销，不用回到 git 去救。")}</div>
+          {tr("每次改文件前都留快照，改坏了点撤销。")}</div>
       ) : (
         <div className="change-list">
           {list.map((c) => (
