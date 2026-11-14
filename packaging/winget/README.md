@@ -109,10 +109,14 @@ ManifestVersion: 1.9.0
 
 - PR：https://github.com/microsoft/winget-pkgs/pull/479989 ，标题 `RoRoToCode.RoRoToCode version 0.1.3`，
   标签 `New-Package`，3 个文件 / +54 行，`mergeable: true`。
-- **卡在 CLA**：`license/cla` 检查排队中，必须由仓库 owner 账号在 PR 下回一条
-  `@microsoft-github-policy-service agree`（个人身份、无公司）。回完之后才会跑 winget 校验流水线。
+- **自动化全部通过**：`license/cla` → `success（All CLA requirements met）`；
+  标签 `Validation-Completed` 与 `Azure-Pipeline-Passed` 均已打上。
+- **只差版主人工审核**。机器人 07:52 留言：「check-in policies require a moderator to approve PRs from
+  the community」，版主是社区志愿者，耐心等，别反复催。
 - 合并前 `winget search` / `winget show` 一律返回 `NO_APPLICATIONS_FOUND`，`manifests/r/RoRoToCode` 是 404 —— 这是正常的，
   清单只在合并后进 master，之后 winget 客户端才能查到。
+- 小瑕疵：`@microsoft-github-policy-service agree` 误发了两条（08:10:43 / 08:10:57），不影响结果，
+  想清理可 `gh api -X DELETE /repos/microsoft/winget-pkgs/issues/comments/6874344064`。
 
 ## 提交路径（本机已装 gh）
 
