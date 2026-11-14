@@ -89,16 +89,21 @@ ManifestVersion: 1.9.0
 
 改类型要同步改 `template/`，因为后续版本都由它渲染。
 
-## 提交路径（本机没有 gh 时）
+## 提交路径（本机已装 gh）
 
-`wingetcreate` 已装过 winget 就能一条命令装，它会自己 fork 仓库、复制清单、开 PR：
+`wingetcreate` 在 winget 源里就有，它会自己 fork 仓库、复制清单、开 PR。token 不用另建 PAT，
+直接复用 `gh` 的登录凭据：
 
-```powershell
+```cmd
 winget install --id Microsoft.WingetCreate -e
-wingetcreate submit packaging\winget\0.1.3 --token <GitHub PAT，需 public_repo 权限>
+
+:: 取 gh 当前 token（含 repo 权限，够 fork + 开 PR）
+for /f %i in ('gh auth token') do set GHTOKEN=%i
+
+wingetcreate submit F:\RoRoToCode\packaging\winget\0.1.3 --token %GHTOKEN%
 ```
 
-不想给 token 就走网页，五个文件手拖：
+不想给 token 就走网页，三个文件手拖：
 
 1. fork `microsoft/winget-pkgs`；
 2. 在新仓库里依次 `manifests` → `r` → `RoRoToCode` → `RoRoToCode` → 新建 `0.1.3` 目录；
