@@ -26,9 +26,9 @@ installer asset — the README lists each component and its license.
 - [x] Checked that there aren't other open pull requests for the same manifest update/change
 - [x] This PR only modifies one (1) manifest
 - [x] Validated manifest locally with `winget validate --manifest <path>` — passes, exit 0 on winget v1.29.380
-- [ ] Tested manifest locally with `winget install --manifest <path>` — not run on this machine: local
-      manifest installation is disabled by policy (`winget settings --enable LocalManifestFiles` needs an
-      administrator). Relying on the validation pipeline's sandbox install as the real end-to-end check.
+- [x] Tested manifest locally with `winget install --manifest <path>` — installs successfully: 65.5 MB
+      downloaded, "successfully verified installer hash", command alias `rorotocode` added to PATH,
+      and `winget list` reports `RoRoToCode.RoRoToCode  0.1.3`.
 - [x] Manifest is schema-valid — declared `ManifestVersion: 1.6.0`. Deliberate: raising the same files to
       `1.28.0` makes `winget validate` emit three `Schema header not found` warnings, while `1.6.0`
       validates clean.

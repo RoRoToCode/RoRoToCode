@@ -45,6 +45,22 @@ winget install --manifest packaging\winget\0.1.3
 要以管理员身份开一次（写进 `%LOCALAPPDATA%\Packages\Microsoft.DesktopAppInstaller_8wekyb3d8bbwe\LocalState\settings.json`），
 之后 `winget install --manifest` 才可用。`winget validate` 不需要这个开关。
 
+**2026-11-14 端到端验证通过**（本机 winget v1.29.380）：
+
+```
+已找到 RoRoTo Code [RoRoToCode.RoRoToCode] 版本 0.1.3
+正在下载 .../RoRoToCode-0.1.3-portable.exe    65.5 MB / 65.5 MB
+已成功验证安装程序哈希
+添加了命令行别名： "rorotocode"
+已成功安装
+```
+
+落盘结果：`%LOCALAPPDATA%\Microsoft\WinGet\Packages\RoRoToCode.RoRoToCode__DefaultSource\rorotocode.exe`（65.6 MB），
+`WinGet\Links\rorotocode.exe` 是指向它的符号链接，`winget list` 显示 `0.1.3`。
+
+顺带确认了 `Commands: rorotocode` 的实际效果：winget 会把 exe 重命名为 `rorotocode.exe` 并建别名，
+不是空声明。程序数据仍落在 userData（`datadir.ts` 的默认分支），换版本不会丢模型。
+
 ## 提交到 winget-pkgs（第一次必须手工）
 
 1. fork `microsoft/winget-pkgs`；
