@@ -30,11 +30,20 @@ CI 里由 `.github/workflows/release.yml` 自动完成这三步，并把清单�
 
 ```powershell
 winget validate --manifest packaging\winget\0.1.3
-# 端到端（需能访问 GitHub Release，中国大陆常失败）：
+# 端到端：
 winget install --manifest packaging\winget\0.1.3
 ```
 
 `validate` 只查 schema 和字段一致性。winget-pkgs 的 CI 还会下载 installer、校验 SHA256、在 Windows Sandbox 里装一遍。
+
+**`--manifest` 本地安装默认是关着的**（安全策略所致，与清单内容无关）。直接跑会提示：
+
+```
+此功能需要由管理员启用。若要启用它，请以管理员身份运行 "winget settings --enable LocalManifestFiles"
+```
+
+要以管理员身份开一次（写进 `%LOCALAPPDATA%\Packages\Microsoft.DesktopAppInstaller_8wekyb3d8bbwe\LocalState\settings.json`），
+之后 `winget install --manifest` 才可用。`winget validate` 不需要这个开关。
 
 ## 提交到 winget-pkgs（第一次必须手工）
 
@@ -80,7 +89,23 @@ ManifestVersion: 1.9.0
 
 改类型要同步改 `template/`，因为后续版本都由它渲染。
 
+## 提交路径（本机没有 gh 时）
+
+`wingetcreate` 已装过 winget 就能一条命令装，它会自己 fork 仓库、复制清单、开 PR：
+
+```powershell
+winget install --id Microsoft.WingetCreate -e
+wingetcreate submit packaging\winget\0.1.3 --token <GitHub PAT，需 public_repo 权限>
+```
+
+不想给 token 就走网页，五个文件手拖：
+
+1. fork `microsoft/winget-pkgs`；
+2. 在新仓库里依次 `manifests` → `r` → `RoRoToCode` → `RoRoToCode` → 新建 `0.1.3` 目录；
+3. 把 `packaging\winget\0.1.3\` 下三个 yaml 拖进去，commit；
+4. 回原仓库点 `Contribute` → `Open pull request`。
+
 ## 中国大陆网络
 
-本机直连 GitHub Release 下载失败（TLS 握手超时），所以没跑 `winget install --manifest` 的端到端验证。
-请在能访问的网络环境复核哈希并实装一次再提 PR；主 README 也保留了「手动下载 exe」的兜底路径。
+2026-11-14 复测：GitHub Release 资产已可正常下载（96 字节的 `.sha256` 与 66 MB 的 exe 都能取），
+上传/下载不再是障碍。唯一的阻塞是 `LocalManifestFiles` 策略，见上面「本地验证」。
