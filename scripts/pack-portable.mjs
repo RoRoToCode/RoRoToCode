@@ -120,9 +120,15 @@ try {
   const size = fs.statSync(dest).size
   const a = md5(built)
   const b = md5(dest)
+  // winget 清单和 GitHub Release 需要 SHA256；顺手落一份校验文件，发布时直接当资产上传。
+  const sha = crypto.createHash('sha256').update(fs.readFileSync(dest)).digest('hex')
+  const sumsFile = path.join(releaseDir, `${artifactName}.sha256`)
+  fs.writeFileSync(sumsFile, `${sha}  ${artifactName}\n`)
   console.log(`\n\u001b[32m✓ 打包完成\u001b[0m`)
   console.log(`  ${dest}`)
   console.log(`  大小 ${human(size)}　md5 ${b}`)
+  console.log(`  sha256 ${sha}`)
+  console.log(`  校验文件 ${sumsFile}`)
   console.log(`  校验 ${a === b ? '一致' : '不一致（拷贝可能不完整，请重试）'}`)
 
   cleanupTmp(outDir)

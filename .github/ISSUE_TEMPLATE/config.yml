@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 安全问题
+    url: https://github.com/RoRoToCode/RoRoToCode/security/policy
+    about: 涉及密钥泄漏、命令执行边界等，请按 SECURITY.md 私下报告，不要开公开 issue。
+  - name: 使用与配置问题
+    url: https://github.com/RoRoToCode/RoRoToCode#安装
+    about: 安装、首次启动、模型与显卡后端选择，先看 README 的安装与快速开始。

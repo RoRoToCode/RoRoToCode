@@ -23,6 +23,8 @@ export function SimpleCore({ onChanged }: Props) {
   const [err, setErr] = useState('')
 
   const alive = useRef(true)
+  /** 这轮准备是不是本面板发起的（不是的话只能靠轮询判断什么时候结束） */
+  const owned = useRef(false)
   useEffect(
     () => () => {
       alive.current = false
@@ -34,11 +36,45 @@ export function SimpleCore({ onChanged }: Props) {
     const off = window.pico.core.onProgress((p) => {
       if (alive.current) setProg(p)
     })
+    // 切走再切回来：准备流程（含下载 llama.cpp / 核心模型）还在主进程里跑，把进度接上
+    void window.pico.downloads
+      .snapshot()
+      .then((s) => {
+        if (!alive.current || !s.core.running) return
+        if (s.core.progress) setProg(s.core.progress)
+        setBusy(true)
+      })
+      .catch(() => undefined)
     return off
   }, [])
 
+  /**
+   * 这轮准备是别的面板发起的（本面板是切回来的）：没有本地 Promise 可等，
+   * 只能隔几秒问一次主进程还跑不跑，跑完了把按钮解锁。
+   */
+  useEffect(() => {
+    if (!busy || owned.current) return
+    const timer = window.setInterval(() => {
+      void window.pico.downloads
+        .snapshot()
+        .then((s) => {
+          if (!alive.current) return
+          if (s.core.running) {
+            if (s.core.progress) setProg(s.core.progress)
+            return
+          }
+          setBusy(false)
+          setProg(null)
+          setErr(tr("上一轮准备已结束。需要看结果就再点一次「简易核心」，已装好的部分会跳过。"))
+        })
+        .catch(() => undefined)
+    }, 4000)
+    return () => window.clearInterval(timer)
+  }, [busy])
+
   async function run() {
     if (busy) return
+    owned.current = true
     setBusy(true)
     setErr('')
     setRes(null)
@@ -51,6 +87,7 @@ export function SimpleCore({ onChanged }: Props) {
     } catch (e) {
       if (alive.current) setErr(tr("准备失败：{0}", { "0": (e as Error).message }))
     } finally {
+      owned.current = false
       if (alive.current) {
         setBusy(false)
         setProg(null)

@@ -15,16 +15,18 @@ Thumbs.db
 .env.local
 
 # 本地模型与运行时（体积巨大，绝不入库）
-llama.cpp/
-core/
-models/
+# 加前导 / 只匹配根目录：不带斜杠的 core/ 会误伤 tools/vramfit/core/ 源码
+/llama.cpp/
+/core/
+/models/
 *.gguf
 *.ggml
 
-# 本地工作数据与内部调研/审计文档：保留在磁盘，但不入库
-# 默认整个 docs/ 不对外发布；若要公开某份文档，用 git add -f <路径> 显式放行
+# 本地工作数据与内部调研/审计文档：保留在磁盘，永不入库
+# docs/ 与 .workbuddy/ 含本机环境实测数据与内部笔记，不要用 git add -f 放行
 .workbuddy/
 docs/
+workspace/
 
 # 调试临时文件
 .c[0-9]*.json

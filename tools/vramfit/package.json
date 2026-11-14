@@ -1,7 +1,7 @@
 {
   "name": "vramfit",
-  "version": "1.0.1",
-  "description": "判断一个本地大模型文件在你这台机器上跑不跑得动、能开多大上下文、能不能当 coding agent 用。命令行工具，无依赖，只读文件头部元数据。",
+  "version": "1.0.2",
+  "description": "Will this GGUF model fit in your VRAM? Check fit, context size, tok/s and agent-readiness before downloading — reads only the file header, zero dependencies. 零依赖显存体检：只读文件头，判断本地大模型在你机器上跑不跑得动、能开多大上下文、能不能当 coding agent 用。",
   "type": "module",
   "license": "MIT",
   "author": "RoRoToCode <su@roroto.com> (https://www.roroto.com)",
@@ -14,8 +14,8 @@
     "url": "https://github.com/RoRoToCode/vramfit/issues"
   },
   "bin": {
-    "vramfit": "./check.mjs",
-    "gguf-check": "./check.mjs"
+    "vramfit": "check.mjs",
+    "gguf-check": "check.mjs"
   },
   "files": [
     "check.mjs",
@@ -33,6 +33,7 @@
     "test:site": "node --test site/test.mjs",
     "build:site": "node site/build.mjs",
     "publish-check": "node publish-check.mjs",
+    "verify-publish": "node verify-publish.mjs",
     "check": "node check.mjs",
     "about": "node check.mjs --about"
   },

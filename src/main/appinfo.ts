@@ -1,7 +1,7 @@
 import { app, BrowserWindow, shell } from 'electron'
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
-import type { AppInfo, AppPrefs, ThemeKey } from '../shared/types'
+import type { AppInfo, AppPrefs, CloseAction, ThemeKey } from '../shared/types'
 
 /** 软件偏好单独存一份，别和模型配置搅在一起 */
 const FILE = 'prefs.json'
@@ -10,10 +10,18 @@ const DEFAULTS: AppPrefs = {
   zoom: 1,
   theme: 'dark',
   fontScale: 1,
-  chatFontScale: null
+  chatFontScale: null,
+  // 默认收进托盘：正在跑的任务不该因为点了个 × 就断掉
+  closeAction: 'tray',
+  trayHinted: false
 }
 
 const THEMES: ThemeKey[] = ['dark', 'light', 'gray', 'stripe', 'contrast']
+const CLOSE_ACTIONS: CloseAction[] = ['tray', 'minimize', 'quit']
+
+function normCloseAction(v: unknown): CloseAction {
+  return CLOSE_ACTIONS.includes(v as CloseAction) ? (v as CloseAction) : DEFAULTS.closeAction
+}
 
 /** 渲染层 localStorage 里也留一份：首屏渲染前就能套上，不闪一下默认字号 */
 export const FONT_KEY = 'roroto.fontScale'
@@ -65,7 +73,9 @@ export async function loadPrefs(): Promise<AppPrefs> {
       zoom: clampZoom(parsed.zoom ?? DEFAULTS.zoom),
       theme: normTheme(parsed.theme),
       fontScale: clampFontScale(parsed.fontScale ?? DEFAULTS.fontScale),
-      chatFontScale: normChatFontScale(parsed.chatFontScale)
+      chatFontScale: normChatFontScale(parsed.chatFontScale),
+      closeAction: normCloseAction(parsed.closeAction),
+      trayHinted: parsed.trayHinted === true
     }
   } catch {
     cache = { ...DEFAULTS }
@@ -83,7 +93,9 @@ export async function savePrefs(patch: Partial<AppPrefs>): Promise<AppPrefs> {
     fontScale: clampFontScale(patch.fontScale ?? cur.fontScale),
     // 这里不能用 ??：用户把「跟随界面」重新打开时传的是 null，要能真的写回去
     chatFontScale:
-      'chatFontScale' in patch ? normChatFontScale(patch.chatFontScale) : cur.chatFontScale
+      'chatFontScale' in patch ? normChatFontScale(patch.chatFontScale) : cur.chatFontScale,
+    closeAction: normCloseAction(patch.closeAction ?? cur.closeAction),
+    trayHinted: patch.trayHinted === undefined ? cur.trayHinted : patch.trayHinted === true
   }
   await fs.mkdir(path.dirname(prefsPath()), { recursive: true })
   await fs.writeFile(prefsPath(), JSON.stringify(next, null, 2), 'utf8')

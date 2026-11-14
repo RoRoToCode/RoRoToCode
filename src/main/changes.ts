@@ -4,6 +4,7 @@ import path from 'node:path'
 import crypto from 'node:crypto'
 import type { ChangeDetail, FileChange, DiffLine } from '../shared/types'
 import { diffLines, diffStats } from './diff'
+import { buildWithHunks, diffHunks } from '../shared/hunks'
 
 /**
  * 每次 write_file / edit_file 都把「改前」和「改后」存下来。
@@ -17,6 +18,8 @@ interface ChangeRecord extends FileChange {
   after: string
   revertable: boolean
   reverted?: boolean
+  /** 记录这条改动时的工作区根：撤销时据此确认目标没被改到工作区之外 */
+  root?: string
 }
 
 function dirOf(sessionId: string): string {
@@ -24,7 +27,22 @@ function dirOf(sessionId: string): string {
 }
 
 function fileOf(sessionId: string, id: string): string {
+  /**
+   * id 必须校验。sessionId 已经清洗过，id 却是渲染层直接传进来的字符串，
+   * 拼进路径就是一次穿越（`..\..\..\x`）。store.ts 那边对会话 id 有白名单，
+   * 这里没有 —— 同一个程序里两套标准，迟早会有人从松的那边进来。
+   */
+  if (!/^[A-Za-z0-9_-]{6,80}$/.test(id)) throw new Error('非法的变更 ID')
   return path.join(dirOf(sessionId), `${id}.json`)
+}
+
+/** 目标必须还在记录的根目录里：撤销是一条「把旧内容写回去」的写盘操作，不能盲信记录里的路径 */
+function insideRoot(rec: ChangeRecord): boolean {
+  if (!rec.root || !rec.absPath) return false
+  const root = path.resolve(rec.root)
+  const abs = path.resolve(rec.absPath)
+  const rel = path.relative(root, abs)
+  return rel !== '' && !rel.startsWith('..') && !path.isAbsolute(rel)
 }
 
 function newId(): string {
@@ -67,7 +85,8 @@ export async function recordChange(input: {
     ...change,
     before: tooBig ? '' : before ?? '',
     after: tooBig ? '' : after ?? '',
-    revertable: !tooBig
+    revertable: !tooBig,
+    root
   }
   try {
     await fs.mkdir(dirOf(sessionId), { recursive: true })
@@ -127,6 +146,14 @@ export async function revertChange(
   const rec = await readRecord(sessionId, id)
   if (!rec) return { ok: false, message: '找不到这条改动记录' }
   if (!rec.revertable) return { ok: false, message: '这条改动太大，没有保存原文，不能撤销' }
+  if (!path.isAbsolute(rec.absPath)) return { ok: false, message: '改动记录里的路径不合法' }
+  /**
+   * 「撤销新建」等于删文件。目标如果是记录之外的路径（记录被改过、或工作区已经
+   * 搬走），就不执行删除：删错了没有第二次机会，宁可让用户自己去删。
+   */
+  if (rec.kind === 'create' && !insideRoot(rec)) {
+    return { ok: false, message: '这条改动记录的目标已不在当前工作区内，为安全起见没有删除文件' }
+  }
   try {
     if (rec.kind === 'create') {
       await fs.rm(rec.absPath, { force: true })
@@ -145,8 +172,55 @@ export async function revertChange(
   }
 }
 
-/** 从最新往回撤，最终回到本轮最开始的状态 */
-export async function revertAll(sessionId: string): Promise<{ ok: boolean; message: string; count: number }> {
+/**
+ * 只应用选中的块：其余改动当成没发生。
+ *
+ * 重建用的是「原 diff + 选中集合」，不重新读盘 —— 这样用户看到的那份 diff
+ * 和最后写下去的字节是同一份依据，不会出现「看着一样、写下去不一样」。
+ * 写完之后更新快照的 after，撤销仍然能回到最初的 before。
+ */
+export async function applyHunks(
+  sessionId: string,
+  id: string,
+  keep: number[]
+): Promise<{ ok: boolean; message: string }> {
+  const rec = await readRecord(sessionId, id)
+  if (!rec) return { ok: false, message: '找不到这条改动记录' }
+  if (!rec.revertable) return { ok: false, message: '文件太大没有保存原文，不能按块应用' }
+  if (rec.kind === 'delete') return { ok: false, message: '删除操作没有「块」可选' }
+
+  const lines = diffLines(rec.before ?? '', rec.after ?? '')
+  const hunks = diffHunks(lines)
+  if (!hunks.length) return { ok: false, message: '这条改动里没有可选的块' }
+
+  const selected = new Set(keep.filter((k) => Number.isInteger(k) && k >= 0 && k < hunks.length))
+  const content = buildWithHunks(lines, hunks, selected)
+  const final = rec.after.endsWith('\n') ? `${content}\n` : content
+
+  try {
+    await fs.mkdir(path.dirname(rec.absPath), { recursive: true })
+    await fs.writeFile(rec.absPath, final, 'utf8')
+  } catch (err) {
+    return { ok: false, message: `写入失败：${(err as Error).message}` }
+  }
+
+  const stats = diffStats(diffLines(rec.before ?? '', final))
+  const next: ChangeRecord = {
+    ...rec,
+    after: final,
+    added: stats.added,
+    removed: stats.removed,
+    size: Buffer.byteLength(final, 'utf8')
+  }
+  try {
+    await fs.writeFile(fileOf(sessionId, id), JSON.stringify(next), 'utf8')
+  } catch {
+    // 快照更新失败不影响已经写对的文件，只是这条记录的撤销会退回最初内容
+  }
+  return { ok: true, message: `已保留 ${selected.size}/${hunks.length} 块改动` }
+}
+
+/** 从最新往回撤，最终回到本轮最开始的状态 */export async function revertAll(sessionId: string): Promise<{ ok: boolean; message: string; count: number }> {
   const list = await listChanges(sessionId)
   let count = 0
   const failed: string[] = []

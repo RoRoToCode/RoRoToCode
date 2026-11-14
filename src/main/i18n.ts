@@ -37,7 +37,15 @@ const EN: Record<string, string> = {
   '选择要发给模型的文件': 'Choose files to send to the model',
   '添加': 'Add',
   'Node.js LTS（含 npm）': 'Node.js LTS (includes npm)',
-  'Python 3（可选）': 'Python 3 (optional)'
+  'Python 3（可选）': 'Python 3 (optional)',
+  // 托盘菜单与「收进托盘」气泡
+  '显示窗口': 'Show window',
+  '收起到托盘': 'Hide to tray',
+  '退出 RoRoTo Code': 'Quit RoRoTo Code',
+  'RoRoTo Code · 后台运行中': 'RoRoTo Code · running in background',
+  'RoRoTo Code 还在后台运行': 'RoRoTo Code is still running',
+  '点右下角托盘图标可以重新打开窗口；想彻底退出请右键图标选「退出」。':
+    'Click the tray icon in the bottom-right corner to reopen the window. To really quit, right-click it and choose Quit.'
 }
 
 export function mt(key: string, vars?: Record<string, unknown>): string {

@@ -21,6 +21,11 @@ export interface ApprovalInput {
   alwaysApprove: boolean
   /** 本会话已显式允许过高危操作 */
   alwaysApproveHigh: boolean
+  /**
+   * 用户在审批弹窗里点过「以后都这样」：这个工作区里这个工具长期放行。
+   * 只可能来自非高危操作 —— 高危的「记住」不落盘（见 main/grants.ts 的说明）。
+   */
+  granted?: boolean
   /** 被项目规则明确拒绝：直接 deny，不弹确认框 */
   denied?: boolean
 }
@@ -32,8 +37,9 @@ export function decideApproval(input: ApprovalInput): ApprovalDecision {
   // 只读且不越界：任何模式下都不用问
   if (!input.hasRisk) return 'allow'
 
-  // 只读档：有副作用一律拒绝，连问都不问
-  if (input.mode === 'readonly') return 'deny'
+  // 只读档 / 计划模式：有副作用一律拒绝，连问都不问。
+  // 计划模式的「动手」不靠放行，而是靠用户批准后把会话模式切成 build。
+  if (input.mode === 'readonly' || input.mode === 'plan') return 'deny'
 
   /**
    * 高危操作只认「高危专用放行」，不受普通「之后全允许」和自动模式影响。
@@ -41,6 +47,10 @@ export function decideApproval(input: ApprovalInput): ApprovalDecision {
    */
   if (input.high) return input.alwaysApproveHigh ? 'allow' : 'ask'
 
-  if (input.alwaysApprove || input.mode === 'auto') return 'allow'
+  /**
+   * granted 是「以后都这样」的长期授权。放在 high 之后是有意的：
+   * 它永远不会让高危操作跳过确认 —— 那条线不归用户的一次点击管。
+   */
+  if (input.alwaysApprove || input.granted || input.mode === 'auto') return 'allow'
   return 'ask'
 }

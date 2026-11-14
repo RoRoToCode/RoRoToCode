@@ -33,7 +33,7 @@ import {
   normalizeArgv, parseOptions, VALUE_FLAGS, setMirror, getMirror, DEFAULT_MIRROR,
   quantFromName, shardInfo, totalWeightsBytes, paramCountOf,
   quantRank, quantTier, repoVerdict,
-  GB, TUNING, ASSUMPTIONS, KV_BYTES_PER_ELEM, fmtSize,
+  GB, TUNING, ASSUMPTIONS, KV_BYTES_PER_ELEM, fmtSize, speedCapFor,
   vramCeiling, attentionInterval, kvLayers, fullLayerFraction, isHybridSwa, kvBytes,
   analyzeTemplate, assess, attentionReport, verdictOf, headlineOf,
   t, setLocale, getLocale, detectLocale, labelWidth, assumptionsList, localeOf
@@ -67,7 +67,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
 // 版本号写死在这里，由 test.mjs 对着 package.json 校验 —— 单文件 bin 不去读包元数据，
 // 少一次文件系统访问，也避免 npx 缓存目录里包结构变了就崩。
-const VERSION = '1.0.1'
+const VERSION = '1.0.2'
 
 // ───────────────────────────── GGUF 解析 ─────────────────────────────
 
@@ -119,6 +119,9 @@ function bar(ratio, width = 24) {
 function render(meta, hw, result, opts = {}) {
   const L = []
   const { gpu, weights, overhead, freeVram, limit, rows, best, weightsFit } = result
+  /** 看图开销：主报告的档位不含它，只在预算区单列一行，并给出「带图时建议几 K」 */
+  const vision = opts.extra?.bytes > 0 ? opts.extra : null
+  const visionFit = opts.visionFit ?? null
   const quant = quantFromName(meta.file)
   const ftype = meta.fileType !== undefined ? FILE_TYPE[meta.fileType] : undefined
   const params = paramCountOf(meta.file, meta.paramCount)
@@ -242,11 +245,25 @@ function render(meta, hw, result, opts = {}) {
   L.push(row(t('f.weights'), fmtGB(weights) +
     (shard && shard.total > 1 ? paint(t('f.weightsShard'), 'dim') : '')))
   L.push(row(t('f.overhead'), `${fmtSize(overhead)}${paint(t('f.overheadNote'), 'dim')}`))
+  /**
+   * 看图开销单独一行：它和「运行时开销」不是一回事 —— 不挂投影器就没有这一项，
+   * 但一旦发图片挂上，就是「32K 能跑」和「一发图就 OOM」之间的差。
+   */
+  if (vision) {
+    const vBest = visionFit?.best?.ctx ?? null
+    L.push(row(t('f.vision'), `+${fmtSize(vision.bytes)}` +
+      paint(t('f.visionNote', { f: fmtSize(vision.weights) }), 'dim') +
+      paint(' · ', 'dim') +
+      (vBest
+        ? paint(t('f.visionCtx', { c: fmtCtx(vBest) }), 'yellow')
+        : paint(t('f.visionNoFit'), 'yellow'))))
+  }
   L.push(row(t('f.ceiling'), cyan(fmtGB(limit))))
   const basisNote = {
     wddm: () => (result.reclaimable > 0.3 * GB
       ? t('f.basis.wddmReclaim', { n: fmtGB(result.reclaimable) })
       : t('f.basis.wddm', { p: Math.round((1 - TUNING.wddmTotalFactor) * 100) })),
+    'wddm-unknown': () => t('f.basis.wddmUnknown', { p: Math.round(TUNING.wddmUnknownBudgetFactor * 100) }),
     free: () => t('f.basis.free', { p: Math.round((1 - TUNING.freeFactor) * 100) }),
     unified: () => t('f.basis.unified', { p: Math.round((1 - TUNING.unifiedReserve) * 100) }),
     ram: () => t('f.basis.ram', { p: Math.round(TUNING.ramFactor * 100) })
@@ -276,7 +293,10 @@ function render(meta, hw, result, opts = {}) {
     L.push('')
     L.push(`    ${paint(t('b.noFit'), 'red', 'bold')}`)
     L.push(sub(t('b.noFitLine', {
-      w: fmtGB(weights), o: fmtSize(overhead), sum: cyan(fmtGB(weights + overhead)), limit: cyan(fmtGB(limit))
+      w: fmtGB(weights),
+      o: fmtSize(overhead),
+      sum: cyan(fmtGB(weights + overhead)),
+      limit: cyan(fmtGB(limit))
     })))
     if (gpu && limit < 1 * GB) {
       L.push(sub(t('b.noFitVramFull')))
@@ -351,7 +371,7 @@ function render(meta, hw, result, opts = {}) {
   if (result.speed) {
     const sp = result.speed
     const gb = weights / 1e9
-    const cap = gb < TUNING.smallModelGB ? TUNING.speedCapTiny : TUNING.speedCap
+    const cap = speedCapFor(weights)
     section(t('s.speed'))
     const formula = () => note(t('v.formula', { bw: sp.bandwidth, gb: gb.toFixed(2), eff: sp.efficiency }))
     if (sp.cpu) {
@@ -413,6 +433,7 @@ function render(meta, hw, result, opts = {}) {
 /** 一行说明显存上限用的是哪套规则，报告和 --about 共用 */
 function limitBasisText(basis) {
   if (basis === 'wddm') return t('lb.wddm', { f: TUNING.wddmFreeFactor, t: TUNING.wddmTotalFactor })
+  if (basis === 'wddm-unknown') return t('lb.wddmUnknown', { f: TUNING.wddmUnknownBudgetFactor })
   if (basis === 'free') return t('lb.free', { f: TUNING.freeFactor })
   if (basis === 'unified') return t('lb.unified', { r: TUNING.unifiedReserve })
   if (basis === 'ram') return t('lb.ram', { r: TUNING.ramFactor })
@@ -444,6 +465,7 @@ ${opt('--ascii', 'u.optAscii')}
 ${opt('--kv <type>', 'u.optKv')}
 ${opt('--vram 8', 'u.optVram')}
 ${opt('--gpu 1', 'u.optGpu')}
+${opt('--mmproj <file>', 'u.optMmproj')}
 ${opt('--mirror <url>', 'u.optMirror')}
 ${opt('--lang zh|en', 'u.optLang')}
 ${opt('--about', 'u.optAbout')}
@@ -545,7 +567,7 @@ function renderRepoTable(repo, rows) {
     const ctx = r.best ? fmtCtx(r.best) : g('—', '-')
     const v = repoVerdict(r)
     L.push(`    ${dpad(labelOf(r), QW)} ${dpad(fmtGB(r.weights), 9, 'right')}  ` +
-      `${dpad(ctx, CTX_W, 'right')}  ${dpad(spdText(r.onVram), 11)} ${dpad(r.qualityLabel, QUAL_W)}  ` +
+      `${dpad(ctx, CTX_W, 'right')}  ${dpad(spdText(r.onVram, r.weights), 11)} ${dpad(r.qualityLabel, QUAL_W)}  ` +
       paint(v.label, v.color))
   }
   L.push('')
@@ -612,8 +634,11 @@ const dpad = (s, width, align = 'left') => {
   return align === 'right' ? pad + s : s + pad
 }
 
-/** 速度和上下文列：拿不到带宽就不写数字，不然会渲染成 "undefined tok/s" */
-const spdText = (onVram) => (Number.isFinite(onVram) && onVram > 0 ? `~${onVram.toFixed(0)} tok/s` : '—')
+/** 速度和上下文列：拿不到带宽就不写数字，不然会渲染成 "undefined tok/s"。封顶与 JSON 同源 */
+const spdText = (onVram, weightsBytes) =>
+  Number.isFinite(onVram) && onVram > 0
+    ? `~${Math.min(onVram, speedCapFor(weightsBytes)).toFixed(0)} tok/s`
+    : '—'
 
 const isUrlLike = (s) => /^https?:\/\//i.test(s)
 // owner/repo 只有两段。排除 ./models、../x 这类相对路径写法，
@@ -760,9 +785,35 @@ async function runRepo(repo, { jsonOut = false, kvType = 'f16', hw = makeHardwar
   return rows
 }
 
+/**
+ * 视觉投影器给预算带来的额外占用。
+ *
+ * 投影器权重按文件字节数算，激活按 assumptions 里的固定值算 —— 两者性质不同：
+ * 权重随量化变化，激活只跟分辨率和 batch 有关。返回 0 表示这次按纯文本算。
+ */
+async function visionExtra(mmproj, { jsonOut = false } = {}) {
+  const none = { bytes: 0, weights: 0, overhead: 0 }
+  if (!mmproj) return none
+  if (isUrlLike(mmproj)) return none
+  try {
+    const st = await fs.stat(path.resolve(mmproj))
+    if (!st.isFile() || st.size <= 0) throw new Error('empty')
+    return {
+      bytes: st.size + TUNING.visionOverheadBytes,
+      weights: st.size,
+      overhead: TUNING.visionOverheadBytes
+    }
+  } catch {
+    // 投影器读不到就退回纯文本口径，但必须说一声：静默忽略等于高估可用显存
+    if (!jsonOut) console.error(paint(`  ${t('in.p.mmprojBad', { v: shortName(mmproj) })}`, 'yellow'))
+    return none
+  }
+}
+
 /** 逐个文件出报告；返回每一项（含失败项），便于上层决定退出码 */
-async function runChecks(files, { jsonOut = false, kvType = 'f16', hw = makeHardware() } = {}) {
+async function runChecks(files, { jsonOut = false, kvType = 'f16', hw = makeHardware(), mmproj = null } = {}) {
   const results = []
+  const extra = await visionExtra(mmproj, { jsonOut })
   for (const f of files) {
     const remote = isUrlLike(f)
     const shard = shardInfo(f)
@@ -779,9 +830,18 @@ async function runChecks(files, { jsonOut = false, kvType = 'f16', hw = makeHard
       const meta = await readGguf(remote ? f : path.resolve(f))
       // 分片模型：单片体积只是整体的 1/N，不折算会把 20 GB 的模型当成 4 GB 说「轻松装下」
       const weightsBytes = totalWeightsBytes(meta)
+      /**
+       * 主报告按**纯文本**算：默认启动不挂投影器，推荐档必须能用在这个状态下。
+       * 带投影器的结论单独算一次（纯算术，几毫秒），给界面解释「发图要降多少」。
+       * 以前是把额外开销直接并进主报告 —— 结果是视觉模型一律被判「装不下任何档」，
+       * 用户以为模型不行，其实只是少了「发图才付的这笔钱」这一层区分。
+       */
       const result = assess(meta, hw, { kvType, weightsBytes })
-      results.push({ meta, result })
-      if (!jsonOut) console.log(render(meta, hw, result, { kvType }))
+      const visionFit = extra.bytes > 0
+        ? assess(meta, hw, { kvType, weightsBytes, extraBytes: extra.bytes })
+        : null
+      results.push({ meta, result, extra, visionFit })
+      if (!jsonOut) console.log(render(meta, hw, result, { kvType, extra, visionFit }))
     } catch (err) {
       results.push({ file: f, error: err.message })
       if (!jsonOut) {
@@ -800,6 +860,20 @@ async function runChecks(files, { jsonOut = false, kvType = 'f16', hw = makeHard
   return results
 }
 
+
+/**
+ * JSON 里的速度必须和命令行主报告同一口径：公式值超过封顶时不报公式值。
+ *
+ * 小模型（< 2 GB）上 kernel launch / 采样是固定开销，带宽公式会给出
+ * 600+ tok/s 这种物理上跑不出来的数字。命令行早就封顶了，JSON 却直接
+ * Math.round 公式值 —— 消费 JSON 的界面于是显示一个大得离谱的速度。
+ * 另外 CPU 推理时 speed.onVram 是 null，Math.round(null) === 0，
+ * 看起来像真测出了 0 tok/s，所以非有限值一律给 null。
+ */
+const jsonSpeed = (v, weightsBytes) =>
+  Number.isFinite(v) && v > 0
+    ? Math.round(Math.min(v, speedCapFor(weightsBytes)))
+    : null
 
 function toJson(results) {
   return results.map((r) => {
@@ -828,24 +902,58 @@ function toJson(results) {
         name: result.gpu.name,
         totalBytes: result.gpu.totalBytes,
         usedBytes: result.gpu.usedBytes ?? 0,
+        /** 已用显存读不到（A 卡 / 核显）：预算已按保守系数算过，界面要能解释 */
+        usedUnknown: result.gpu.usedUnknown === true,
         kind: result.gpu.kind ?? 'discrete',
         unified: Boolean(result.gpu.unified),
         backend: result.gpu.backend ?? null
       } : null,
       cpuOnly: Boolean(result.onCpu),
       budget: { limitBytes: result.limit, basis: result.limitBasis },
-      tiers: result.rows.map((x) => ({ ctx: x.ctx, needBytes: x.need, fits: x.fits })),
+      /**
+       * 看图口径：主报告（tiers / recommendedCtx）按纯文本算，这里给发图片时的结论。
+       * null 表示没传投影器，或这个模型本来就没有投影器。
+       */
+      vision: r.extra?.bytes > 0
+        ? {
+          projectorBytes: r.extra.weights,
+          activationBytes: r.extra.overhead,
+          totalBytes: r.extra.bytes,
+          /** 挂上投影器后还能开的最大档；null = 一档都不行（应退回纯文本或分层） */
+          recommendedCtx: r.visionFit?.best?.ctx ?? null,
+          fits: Boolean(r.visionFit?.best)
+        }
+        : null,
+      /**
+       * tight（need > limit × 0.85）必须一起序列化。
+       *
+       * 以前这里只挑了 ctx / needBytes / fits 三个字段，于是启动链拿不到「这一档贴着
+       * 上限」这个事实 —— 8 GB 卡上 7B 模型算出 64K 占用 6.42 GB、预算 6.45 GB
+       * （ratio 0.994），明明一毫米余量，还是照样推荐、照样按它启动，
+       * 装不下再花 10 秒重载降档。beyondNative 同理，界面要能说明「这档是 RoPE 外推」。
+       */
+      tiers: result.rows.map((x) => ({
+        ctx: x.ctx,
+        needBytes: x.need,
+        fits: x.fits,
+        tight: x.tight === true,
+        beyondNative: x.beyondNative === true
+      })),
       recommendedCtx: result.best?.ctx ?? null,
       estimated: result.estimated !== false,
       bandwidth: result.speed?.bandwidth ?? null,
-      // CPU 推理时 speed.onVram 是 null，直接 Math.round 会写成 0 —— 看着像真的测出 0 tok/s
-      genTokPerSec: Number.isFinite(result.speed?.onVram) ? Math.round(result.speed.onVram) : null,
-      genTokPerSecOnCpu: Number.isFinite(result.speed?.onRam) ? Math.round(result.speed.onRam) : null,
+      // 速度口径见 speedBasis：零上下文、batch=1、全权重驻留显存时的解码峰值
+      genTokPerSec: jsonSpeed(result.speed?.onVram, totalBytes),
+      genTokPerSecOnCpu: jsonSpeed(result.speed?.onRam, totalBytes),
+      // 按建议上下文补上 KV cache 读取代价后的折减值，用来解释峰值与实测的差距
+      genTokPerSecAtCtx: jsonSpeed(result.speed?.atCtx, totalBytes),
+      speedCtx: result.speed?.atCtxTokens ?? null,
+      speedBasis: 'zero-context-decode-peak',
       moe: meta.expertCount ? { experts: meta.expertCount, active: meta.expertUsedCount ?? null } : null,
       verdict: verdictOf(meta, result),
       // 这一行故意不跟 --lang 走：JSON 是给脚本消费的，要求同一份输入在任何机器上
       // 产出逐字节相同的结果。跟着系统语言变会让 CI 快照随机失败。
-      disclaimer: '静态推算，仅供参考，需实际加载验证；参数与假设见 --about'
+      disclaimer: '静态推算，仅供参考：速度为零上下文、batch=1、全权重驻留显存时的解码峰值，不含 KV cache 读取、首字延迟与工具执行，实测通常更低；需实际加载验证；参数与假设见 --about'
     }
   })
 }
@@ -962,6 +1070,8 @@ export function inputMode({ isTTY, platform }) {
 async function interactive(opts = {}) {
   const kvType = opts.kvType ?? 'f16'
   const gpuIndex = opts.gpuIndex ?? 0
+  /** 只看文字就够，但带上投影器算出来的才是「发图片时」的真实预算 */
+  const mmproj = opts.mmproj ?? null
 
   const mode = inputMode({ isTTY: process.stdin.isTTY, platform: process.platform })
   const cooked = mode.cooked
@@ -1079,7 +1189,7 @@ async function interactive(opts = {}) {
         continue
       }
       for (const r of repos) await runRepo(r, { kvType, hw })
-      if (files.length) await runChecks(files, { kvType, hw })
+      if (files.length) await runChecks(files, { kvType, hw, mmproj })
     } catch (err) {
       console.log(paint(`\n  ✗ ${err.message}`, 'red'))
     }
@@ -1127,7 +1237,7 @@ async function main() {
   if (argv.includes('--about')) { about(); return }
 
   const jsonOut = argv.includes('--json')
-  const { kvType, manualVram, gpuIndex, repo, mirror, problems } = parseOptions(argv)
+  const { kvType, manualVram, gpuIndex, repo, mirror, mmproj, problems } = parseOptions(argv)
   if (problems.length) {
     for (const p of problems) console.error(paint(`  ✗ ${p}`, 'red'))
     console.error(paint(`  ${t('x.helpHint')}`, 'dim'))
@@ -1168,7 +1278,7 @@ async function main() {
   //    从管道喂链接，三种情况都走这里，粘贴链接永远可用。
   if (!raw.length) {
     if (jsonOut) { usage(); process.exitCode = 1; return }
-    await interactive({ kvType, manualVram, gpuIndex })
+    await interactive({ kvType, manualVram, gpuIndex, mmproj })
     return
   }
 
@@ -1179,7 +1289,7 @@ async function main() {
   }
   if (!files.length) return
 
-  const results = await runChecks(files, { jsonOut, kvType, hw })
+  const results = await runChecks(files, { jsonOut, kvType, hw, mmproj })
   if (jsonOut) console.log(JSON.stringify(toJson(results), null, 2))
   // 有文件读不到时退非 0，JSON 模式才好在 CI 里用
   if (results.some((r) => r?.error)) process.exitCode = 1

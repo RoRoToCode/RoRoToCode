@@ -57,3 +57,18 @@ test('高危放行不影响普通风险的判断路径', () => {
     'ask'
   )
 })
+
+test('「以后都这样」的长期授权：非高危直接放行，不用再问', () => {
+  assert.strictEqual(decideApproval({ ...base, granted: true }), 'allow')
+})
+
+test('长期授权不能越过高危：高危操作该问还得问', () => {
+  assert.strictEqual(decideApproval({ ...base, high: true, granted: true }), 'ask')
+  // 连自动模式一起算也一样：高危只认「高危专用放行」
+  assert.strictEqual(decideApproval({ ...base, high: true, granted: true, mode: 'auto' }), 'ask')
+})
+
+test('长期授权不能绕过只读档与项目规则', () => {
+  assert.strictEqual(decideApproval({ ...base, granted: true, mode: 'readonly' }), 'deny')
+  assert.strictEqual(decideApproval({ ...base, granted: true, denied: true }), 'deny')
+})

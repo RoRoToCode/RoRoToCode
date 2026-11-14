@@ -6,16 +6,21 @@ import { dialog, shell } from 'electron'
 import type {
   LocalGgufFile,
   LocalRuntimeKind,
+  LocalGpuSnapshot,
   LocalRuntimeStatus,
   ProviderConfig,
+  RunningLocalModel,
   SetupProgress
 } from '../shared/types'
+import { parseOllamaLogDevices } from '../shared/ollamagpu'
+import { isLlamaProvider, isLoopbackUrl, runtimeKindOf } from '../shared/providers'
 import { loadConfig, saveConfig } from './config'
 import { headSize } from './dl'
 import { modelfileTemplate, readGgufMeta } from './gguf'
-import { localGgufFiles } from './llama'
+import { localGgufFiles, releaseUnpinnedLlama, stopLlamaExcept } from './llama'
 import { scanOllamaDisk, isGgufFile, ollamaModelsRoot } from './ollamadir'
 import { downloadResumable } from './resume'
+import { gpuNames } from './sysinfo'
 import { mt } from './i18n'
 
 /**
@@ -29,6 +34,8 @@ interface Spec {
   label: string
   providerId: string
   providerName: string
+  /** 写进配置的协议：Ollama 走原生接口，LM Studio 只有 OpenAI 兼容层 */
+  providerKind: ProviderConfig['kind']
   apiKey: string
   port: number
   /** 服务根地址（不带 /v1） */
@@ -65,6 +72,7 @@ const SPECS: Record<LocalRuntimeKind, Spec> = {
     label: 'Ollama',
     providerId: 'ollama',
     providerName: 'Ollama 本地',
+    providerKind: 'ollama',
     apiKey: 'ollama',
     port: 11434,
     origin: 'http://127.0.0.1:11434',
@@ -85,6 +93,8 @@ const SPECS: Record<LocalRuntimeKind, Spec> = {
     label: 'LM Studio',
     providerId: 'lmstudio',
     providerName: 'LM Studio 本地',
+    // LM Studio 没有 `/api/chat`，硬写成 ollama 会让对话全部 404
+    providerKind: 'openai',
     apiKey: 'lm-studio',
     port: 1234,
     origin: 'http://127.0.0.1:1234',
@@ -364,6 +374,249 @@ export async function loadedModels(kind: LocalRuntimeKind): Promise<string[]> {
 }
 
 /**
+ * Ollama 服务日志的位置。
+ *
+ * 之所以要读日志：`/api/ps` 只报「多少字节在显存里」，不说是哪张卡；
+ * 每次加载的显卡型号只出现在日志的 `using device …` 行里。
+ * Linux 的日志走 journalctl（拿不到就返回 null，界面退回「只显示有显存占用」）。
+ */
+function ollamaLogPath(): string | null {
+  if (process.platform === 'win32') {
+    const base = process.env.LOCALAPPDATA
+    return base ? path.join(base, 'Ollama', 'server.log') : null
+  }
+  if (process.platform === 'darwin') return path.join(os.homedir(), '.ollama', 'logs', 'server.log')
+  return null
+}
+
+/** 只读文件尾部：日志可能有几十 MB，全读进来是浪费 */
+async function readTail(file: string, bytes: number): Promise<string> {
+  const fh = await fs.open(file, 'r')
+  try {
+    const st = await fh.stat()
+    const len = Math.min(bytes, st.size)
+    if (!len) return ''
+    const buf = Buffer.alloc(len)
+    await fh.read(buf, 0, len, st.size - len)
+    return buf.toString('utf8')
+  } finally {
+    await fh.close()
+  }
+}
+
+/** 日志解析结果的短期缓存：界面会反复问「现在跑在哪张卡」，没必要每次都读盘 */
+let logDevCache: { at: number; file: string; devices: string[] } | null = null
+
+async function ollamaLogDevices(): Promise<string[]> {
+  const file = ollamaLogPath()
+  if (!file) return []
+  if (logDevCache && logDevCache.file === file && Date.now() - logDevCache.at < 8000) return logDevCache.devices
+  let devices: string[] = []
+  try {
+    devices = parseOllamaLogDevices(await readTail(file, 256 * 1024))
+  } catch {
+    devices = []
+  }
+  logDevCache = { at: Date.now(), file, devices }
+  return devices
+}
+
+/**
+ * 本机 Ollama 此刻的显卡使用情况。
+ *
+ * 和 llama.cpp 的区别：那边的实例是本程序拉起来的，device 自己就知道；
+ * Ollama 是常驻服务，只能问它自己 —— `/api/ps` 给 `size_vram`（显存占用），
+ * 显卡型号从日志里补（见 shared/ollamagpu.ts），日志读不到时按本机显卡兜底并标 guessed。
+ *
+ * 即使一个模型都没加载也会返回 running + devices：界面要靠它像 llama.cpp 一样
+ * 先显示「发消息会用哪张卡」，而不是等模型加载完才突然冒出来一个标签。
+ */
+export async function localGpuSnapshot(): Promise<LocalGpuSnapshot> {
+  // 两个常驻服务一起问：Ollama 顺带报显卡型号，LM Studio 只报「加载了哪些」
+  const [ollama, lmstudio] = await Promise.all([
+    ollamaGpuSnapshot(),
+    loadedModels('lmstudio').catch(() => [] as string[])
+  ])
+  return {
+    ...ollama,
+    loaded: [
+      ...ollama.models.map((m) => ({ kind: 'ollama' as const, model: m.model })),
+      ...lmstudio.map((m) => ({ kind: 'lmstudio' as const, model: m }))
+    ]
+  }
+}
+
+/** Ollama 那半边：`/api/ps` 的显存占用 + 日志里的显卡型号 */
+async function ollamaGpuSnapshot(): Promise<Omit<LocalGpuSnapshot, 'loaded'>> {
+  const empty = { running: false, devices: [], guessed: false, models: [] }
+  const origin = await localOrigin('ollama').catch(() => '')
+  if (!origin) return empty
+  try {
+    const res = await fetch(`${origin}/api/ps`, { signal: AbortSignal.timeout(3000) })
+    if (!res.ok) return empty
+    const j = (await res.json()) as {
+      models?: Array<{ name?: string; model?: string; size?: number; size_vram?: number }>
+    }
+    const list = j.models ?? []
+
+    const fromLog = await ollamaLogDevices()
+    // 日志里已经有设备清单就不用再拉子进程；读不到才退回 nvidia-smi
+    const devices = fromLog.length ? fromLog : gpuNames()
+    const guessed = !fromLog.length && devices.length > 0
+
+    const models: RunningLocalModel[] = list
+      .map((m) => {
+        const sizeBytes = Number(m.size) || 0
+        const vramBytes = Number(m.size_vram) || 0
+        return {
+          kind: 'ollama' as const,
+          model: m.name || m.model || '',
+          sizeBytes,
+          vramBytes,
+          // 纯 CPU 推理不占显存，这时候列显卡只会误导
+          devices: vramBytes > 0 ? devices : [],
+          guessed
+        }
+      })
+      .filter((m) => !!m.model)
+
+    return { running: true, devices, guessed, models }
+  } catch {
+    return empty
+  }
+}
+
+/** 模型名对齐：Ollama 的 `/api/ps` 一定带 tag，配置里可能省了 `:latest` */
+const normModel = (s?: string): string => (s ?? '').trim().toLowerCase().replace(/:latest$/, '')
+
+/**
+ * 这条配置里写的模型**此刻真的加载着**吗？
+ *
+ * 探活（models:probe）只能证明「端点通、模型在列表里」——Ollama / LM Studio 的列表
+ * 列的是**已下载**的模型，没加载的一点显存都不占。界面上「可用未启动（黄）」与
+ * 「正在运行（绿）」的区别就落在这里。llama.cpp 的实例由 llama.ts 管，不走这条。
+ */
+/**
+ * 本地服务「装了但没起来」。
+ *
+ * 这种情形该报黄灯（可用未启动），而不是红叉：一键启动就能用，
+ * 红叉要留给真的坏了（没装、模型不存在、端口被占）。
+ */
+export async function localServiceIdle(provider: ProviderConfig): Promise<boolean> {
+  const kind = runtimeKindOf(provider)
+  if (!kind) return false
+  if (!isLoopbackUrl(provider.baseUrl)) return false
+  const st = await localStatus(kind).catch(() => null)
+  return Boolean(st?.installed && !st.running)
+}
+
+export async function isModelLoaded(provider: ProviderConfig): Promise<boolean> {
+  const kind = runtimeKindOf(provider)
+  if (!kind) return false
+  // 配了远端地址的「Ollama」跟本机这份清单没关系，不能拿本机结果冒充
+  if (!isLoopbackUrl(provider.baseUrl)) return false
+  const want = normModel(provider.model)
+  if (!want) return false
+  const loaded = await loadedModels(kind).catch(() => [] as string[])
+  return loaded.some((m) => normModel(m) === want)
+}
+
+/** 后台卸载完别的运行时后通知界面（主进程注册，用它广播给窗口） */
+let freedHook: ((freed: string[]) => void) | null = null
+
+export function setFreedHook(hook: ((freed: string[]) => void) | null): void {
+  freedHook = hook
+}
+
+function notifyFreed(freed: string[]): void {
+  if (freed.length && freedHook) freedHook(freed)
+}
+
+/** 切换后延迟复查的定时器：同一时刻只保留最新一轮，切来切去不会叠一堆 */
+const releaseTimers = new Set<NodeJS.Timeout>()
+
+/**
+ * 切换后隔几秒再复查一次「其它运行时是不是又占上显存了」。
+ *
+ * 为什么需要：模型加载要几秒，`/api/ps` 在加载完成前根本看不到它 ——
+ * 切走的那一刻去问，答案往往是「没加载」，等它冒出来时用户已经看到两个都亮绿灯了。
+ * 请求还在飞、或者 Ollama 收到新请求把模型又拉回来，也靠这几轮复查兜住。
+ */
+export function scheduleRuntimeRelease(keepId: string | null): void {
+  for (const t of releaseTimers) clearTimeout(t)
+  releaseTimers.clear()
+  for (const delay of [4000, 12000, 30000]) {
+    const timer = setTimeout(() => {
+      releaseTimers.delete(timer)
+      void (async () => {
+        // 期间又切走了就交给新的那一轮，别按旧目标乱卸
+        const cfg = await loadConfig().catch(() => null)
+        if (!cfg || (cfg.activeId ?? null) !== keepId) return
+        const freed = await releaseIdleRuntimes(keepId).catch(() => [] as string[])
+        if (freed.length) notifyFreed(freed)
+      })()
+    }, delay)
+    releaseTimers.add(timer)
+  }
+}
+
+/**
+ * 「启动并使用」等同于切模型：把别的本地运行时让出的显存收回来。
+ *
+ * 为什么不能只靠渲染层调 `local:release`：从「本地模型」页一键启动 llama.cpp
+ * 走的是 `llama:start(activate)`，它只改 activeId，不会经过顶栏那条切换路径 ——
+ * 于是 Ollama 里上一个模型继续占着 6 GB 显存，界面上两个都亮绿灯。
+ */
+export async function secureGpuForActive(): Promise<string[]> {
+  const cfg = await loadConfig().catch(() => null)
+  const keep = cfg?.activeId ?? null
+  const freed = await releaseIdleRuntimes(keep).catch(() => [] as string[])
+  if (freed.length) notifyFreed(freed)
+  scheduleRuntimeRelease(keep)
+  return freed
+}
+
+/**
+ * 切换模型时释放「这次用不到」的本地运行时。
+ *
+ * 两条规则，对应两种机器：
+ * - 绑了显卡的 llama.cpp 实例**不动**：那是用户明确安排的「双卡双模型」，切走也得留着，
+ *   否则第二张卡白空着，等于把刚做好的功能又关掉。
+ * - 没绑卡的老实例照旧清掉：单张卡上再起一个必然抢显存（8 GB 上两个 7B 直接 OOM）。
+ *
+ * keepId 是「接下来要用的供应商」，它自己的实例和它同类的运行时都保留。
+ */
+export async function releaseIdleRuntimes(keepId: string | null): Promise<string[]> {
+  const freed: string[] = []
+  const config = await loadConfig()
+  const keep = keepId ? config.providers.find((p) => p.id === keepId) ?? null : null
+  const keepKind = keep ? runtimeKindOf(keep) : null
+  const keepLocalLlama = keep ? isLlamaProvider(keep) : false
+
+  // 切到远端模型：本地主模型该让出显存，但工人模型要留着给子代理用
+  if (keep && !keepLocalLlama && !keepKind) {
+    const worker = config.providers.find((p) => p.role === 'worker' && p.model)
+    const keepKeys = worker && isLlamaProvider(worker) ? [worker.id] : []
+    const r = await stopLlamaExcept(keepKeys).catch(() => null)
+    if (r?.stopped.length) freed.push(`llama.cpp 已停止 ${r.stopped.join('、')}，显存已释放`)
+  } else {
+    // 本地模型之间切换：只清理没绑卡的实例，绑了不同卡的留着（双卡双模型）
+    const r = await releaseUnpinnedLlama(keep?.id ?? null).catch(() => null)
+    if (r?.stopped.length) freed.push(`llama.cpp 已停止 ${r.stopped.join('、')}，显存已释放`)
+  }
+
+  for (const kind of ['ollama', 'lmstudio'] as const) {
+    if (keepKind === kind) continue
+    const rr = await unloadRuntime(kind).catch(() => null)
+    if (rr?.released.length) {
+      freed.push(`${kind === 'ollama' ? 'Ollama' : 'LM Studio'} 已卸载 ${rr.released.join('、')}`)
+    }
+  }
+
+  return freed
+}
+
+/**
  * 把某个运行时里已加载的模型全部卸掉，释放显存。
  *
  * 显卡只有 8 GB 时，LM Studio 里放一个 7B、Ollama 里再放一个 7B 会直接爆显存，
@@ -542,10 +795,16 @@ export async function startLocal(
   }
 }
 
-/** 写入（或新建）对应供应商配置，并设为当前使用 */
+/**
+ * 写入（或新建）对应供应商配置。
+ *
+ * `activate` 默认 true（一键启动 = 使用并设为当前）；「自动配置」这类
+ * 只写配置的动作要显式传 false，否则会顺手把用户正在用的模型换掉。
+ */
 export async function configureLocal(
   kind: LocalRuntimeKind,
-  model?: string
+  model?: string,
+  opts?: { activate?: boolean }
 ): Promise<{ ok: boolean; message: string; model?: string; providerId?: string; created?: boolean }> {
   const spec = SPECS[kind]
   if (!spec) return { ok: false, message: '不支持的本地服务' }
@@ -561,7 +820,7 @@ export async function configureLocal(
     target = {
       id: spec.providerId,
       name: spec.providerName,
-      kind: 'ollama',
+      kind: spec.providerKind,
       baseUrl: `${live.origin}/v1`,
       apiKey: spec.apiKey,
       model: model ?? '',
@@ -571,22 +830,41 @@ export async function configureLocal(
     providers.push(target)
   } else {
     target.baseUrl = `${live.origin}/v1`
-    target.kind = 'ollama'
+    // 协议跟着运行时走：老条目可能是 kind='ollama' 指向 LM Studio（对话会 404），这里顺手纠正
+    target.kind = spec.providerKind
     if (!target.apiKey) target.apiKey = spec.apiKey
     if (model) target.model = model
   }
 
-  // 没指定模型时挑本机已装的第一个，避免条目永远是「未选择模型」
-  if (!target.model) {
-    const p = await probe(spec)
-    if (p.models[0]) target.model = p.models[0]
+  /**
+   * 模型名的三种情况：
+   * - 点名指定了 → 就用点名的，一个字都不改（哪怕本机还没 pull 下来）
+   * - 条目里存着一个，但服务端根本没有（出厂默认的 `qwen2.5-coder:7b` 最容易踩）
+   *   → 换成第一个真实存在的，否则「已就绪」的提示是假的，一聊就报 model not found
+   * - 本来就没填 → 挑第一个
+   * 服务没起 / 列表为空时什么都不改：这时「没读到列表」不等于「这个模型不存在」。
+   */
+  let switched = ''
+  const listed = live.ok ? live.models : []
+  if (!model && listed.length && (!target.model || !listed.some((m) => m === target.model))) {
+    if (target.model) switched = target.model
+    target.model = listed[0]
   }
 
-  await saveConfig({ ...config, providers, activeId: target.id })
+  const activate = opts?.activate !== false
+  await saveConfig({
+    ...config,
+    providers,
+    // 不激活时保留原选择；activeId 为空才退回自己，避免「没有当前模型」
+    activeId: activate ? target.id : config.activeId ?? target.id
+  })
   const label = target.model || '未选择模型'
+  const note = switched ? `（原来填的 ${switched} 本机没有，已换成它）` : ''
   return {
     ok: true,
-    message: created ? `已新建本地模型：${label}` : model ? `已更新本地模型：${label}` : `本地模型已就绪：${label}`,
+    message: `${
+      created ? '已新建本地模型' : model ? '已更新本地模型' : '本地模型已就绪'
+    }：${label}${note}`,
     model: target.model || undefined,
     providerId: target.id,
     created
@@ -729,6 +1007,13 @@ const SETUP: Record<LocalRuntimeKind, SetupPlan> = {
 /** 当前正在下载的安装包，用于「取消下载」 */
 let setupAbort: AbortController | null = null
 
+/** 最近一次安装进度：面板卸载/重开后据此恢复进度条（下载在主进程，不随界面中断） */
+let lastSetup: SetupProgress | null = null
+
+export function localSetupSnapshot(): SetupProgress | null {
+  return lastSetup
+}
+
 /** 取消安装包下载（用户点了进度条上的取消） */
 export function cancelLocalInstall(): boolean {
   if (!setupAbort) return false
@@ -743,6 +1028,21 @@ export async function installLocal(
 ): Promise<{ ok: boolean; message: string; path?: string; launched?: boolean }> {
   const spec = SPECS[kind]
   const setup = SETUP[kind]
+
+  // 已经在下同一个安装包了：别起第二份，把已有进度告诉用户就行
+  if (setupAbort) {
+    return { ok: false, message: `${spec.label} 安装包正在下载中（进度在面板上），切走页面也不会中断。` }
+  }
+
+  // 进度只做播报：界面抛错不能反过来打断下载
+  const emit = (p: SetupProgress): void => {
+    lastSetup = p
+    try {
+      onProgress?.(p)
+    } catch {
+      // 面板没了就没人收进度，继续下
+    }
+  }
 
   // 理论上每个运行时都有源；真没有就开网页，别假装在下东西
   const urls = setup.resolve ? await setup.resolve() : setup.urls
@@ -798,7 +1098,7 @@ export async function installLocal(
   setupAbort = abort
 
   try {
-    onProgress?.({
+    emit({
       kind,
       receivedBytes: 0,
       totalBytes: size > 0 ? size : 0,
@@ -819,7 +1119,7 @@ export async function installLocal(
         totalMs: 4 * 60 * 60 * 1000,
         minBytes: 1024 * 1024,
         onTick: (t) =>
-          onProgress?.({
+          emit({
             kind,
             receivedBytes: t.received,
             totalBytes: t.total,
@@ -843,7 +1143,7 @@ export async function installLocal(
     // 已下载部分保留，重新点「一键安装」会从断点继续
     const kept = fs.stat(target).then((s) => s.size).catch(() => 0)
     const mb = ((await kept) / 1024 / 1024).toFixed(0)
-    onProgress?.({
+    emit({
       kind,
       receivedBytes: 0,
       totalBytes: 0,
@@ -854,7 +1154,7 @@ export async function installLocal(
   }
 
   if (!used) {
-    onProgress?.({
+    emit({
       kind,
       receivedBytes: 0,
       totalBytes: 0,
@@ -876,7 +1176,7 @@ export async function installLocal(
         mt('可以改用 winget 自动安装（系统自带，会自己下载，但不显示进度），或者打开官网手动下载。')
     })
     if (alt.response === 0) {
-      onProgress?.({
+      emit({
         kind,
         receivedBytes: 0,
         totalBytes: 0,
@@ -885,7 +1185,7 @@ export async function installLocal(
         message: '正在通过 winget 安装，这一步不显示进度，通常要几分钟…'
       })
       const r = await wingetInstall('ElementLabs.LMStudio')
-      onProgress?.({
+      emit({
         kind,
         receivedBytes: 0,
         totalBytes: 0,
@@ -906,7 +1206,7 @@ export async function installLocal(
     }
   }
 
-  onProgress?.({ kind, receivedBytes: 0, totalBytes: 0, state: 'done' })
+  emit({ kind, receivedBytes: 0, totalBytes: 0, state: 'done' })
 
   // 安装包落在了系统临时目录，启动它按向导装
   const openErr = await shell.openPath(target)

@@ -6,6 +6,12 @@ import type { RemoteSkill, Skill } from '../shared/types'
 import { parseSkillMd } from './skillhub'
 
 const FILE = 'skills.json'
+/**
+ * 开关单独存一份：内置技能和本机技能（扫 `~/.workbuddy/skills`）都不能写回源，
+ * 想记住「这个技能打开了自动调用」只能另存一张 id → 布尔 的表。
+ * 顺带的好处是删掉技能再装回来，开关状态还在。
+ */
+const TOGGLES = 'skill-toggles.json'
 
 /**
  * 本机技能目录：WorkBuddy / 其它客户端把已安装技能统一放在 `~/.workbuddy/skills/`，
@@ -19,7 +25,7 @@ function localSkillsDir(): string {
 
 /**
  * 内置技能：都是「直接能发给模型的具体指令」，不是空泛的标签。
- * 点「使用」后原文填进输入框，用户可以再补一句自己的需求。
+ * 点「调用」后原文填进输入框，用户可以再补一句自己的需求。
  */
 const BUILTIN: Array<Omit<Skill, 'createdAt'>> = [
   {
@@ -108,6 +114,32 @@ function filePath(): string {
   return path.join(app.getPath('userData'), FILE)
 }
 
+function togglesPath(): string {
+  return path.join(app.getPath('userData'), TOGGLES)
+}
+
+/** 开关表：只认布尔值，坏一条就丢一条，不能让整张表失效把技能全关掉 */
+async function readToggles(): Promise<Record<string, boolean>> {
+  try {
+    const raw = await fs.readFile(togglesPath(), 'utf8')
+    const parsed = JSON.parse(raw) as unknown
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {}
+    const out: Record<string, boolean> = {}
+    for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+      if (typeof v === 'boolean') out[k] = v
+    }
+    return out
+  } catch {
+    // 文件不存在（从没开过开关）就当作全关
+    return {}
+  }
+}
+
+async function writeToggles(map: Record<string, boolean>): Promise<void> {
+  await fs.mkdir(path.dirname(togglesPath()), { recursive: true })
+  await fs.writeFile(togglesPath(), JSON.stringify(map, null, 2), 'utf8')
+}
+
 async function readCustom(): Promise<Skill[]> {
   try {
     const raw = await fs.readFile(filePath(), 'utf8')
@@ -191,7 +223,73 @@ export async function listSkills(): Promise<Skill[]> {
   const custom = await readCustom()
   const builtin: Skill[] = BUILTIN.map((s, i) => ({ ...s, createdAt: i }))
   const local = await scanLocalSkills()
-  return [...builtin, ...local, ...custom]
+  const toggles = await readToggles()
+  /**
+   * 默认全关：打开开关就意味着这个技能的说明会进系统提示、模型可能自己调用它，
+   * 那是要花上下文的事，不能让用户装完一批技能就悄悄付了这笔账。
+   */
+  const mark = (s: Skill): Skill => ({ ...s, enabled: toggles[s.id] === true })
+  return [...builtin, ...local, ...custom].map(mark)
+}
+
+/** 打开开关的技能：只有这些会进系统提示的「可调用技能」，也只有它们能被 use_skill 取到 */
+export async function enabledSkills(): Promise<Skill[]> {
+  return (await listSkills()).filter((s) => s.enabled)
+}
+
+/** 切换一个技能的自动调用开关 */
+export async function setSkillEnabled(
+  id: string,
+  enabled: boolean
+): Promise<{ ok: boolean; message: string; skills: Skill[] }> {
+  const all = await listSkills()
+  const target = all.find((s) => s.id === id)
+  if (!target) {
+    return { ok: false, message: '技能不存在，可能已被删除', skills: all }
+  }
+  const toggles = await readToggles()
+  // 关掉就把键删掉，表里不堆一堆 false；默认值本来就是关
+  if (enabled) toggles[id] = true
+  else delete toggles[id]
+  await writeToggles(toggles)
+  return {
+    ok: true,
+    message: enabled ? `已开启「${target.name}」的自动调用` : `已关闭「${target.name}」的自动调用`,
+    skills: await listSkills()
+  }
+}
+
+/**
+ * use_skill 的落地：按名字（或 id）取一份技能的完整说明。
+ *
+ * 只认打开了开关的技能 —— 开关就是「允许模型自己拿这份说明」的授权，
+ * 关着的技能即便名字被模型猜到也不给，否则那个开关等于没有。
+ */
+export async function readSkillBody(want: string): Promise<string> {
+  const key = String(want ?? '').trim()
+  const all = await listSkills()
+  const on = all.filter((s) => s.enabled)
+  if (!key) {
+    return on.length
+      ? `要给技能名。已开启自动调用的有：${on.map((s) => s.name).join('、')}`
+      : '现在没有任何开启自动调用的技能。让用户到技能面板打开开关，或者直接把需求说清楚由你自己做。'
+  }
+  const lower = key.toLowerCase()
+  const hit =
+    on.find((s) => s.id === key) ??
+    on.find((s) => s.name === key) ??
+    on.find((s) => s.name.toLowerCase() === lower) ??
+    on.find((s) => s.id.toLowerCase() === lower)
+  if (!hit) {
+    return on.length
+      ? `没有名为「${key}」的已开启技能。已开启的有：${on.map((s) => s.name).join('、')}。别硬套，没有合适的就按常规做法自己做。`
+      : `「${key}」这个技能的自动调用开关是关着的。没有已开启的技能可用，按常规做法自己做，或提醒用户去技能面板打开它。`
+  }
+  return [
+    `【技能：${hit.name}】下面是你需要的完整做法，照它执行；它没写到的细节按实际情况判断：`,
+    hit.prompt,
+    '（以上来自技能库，不是用户消息，不要复述这段。）'
+  ].join('\n\n')
 }
 
 export async function saveSkill(input: {

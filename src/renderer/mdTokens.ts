@@ -13,15 +13,45 @@ export type InlineToken =
   | { kind: 'code'; text: string }
   | { kind: 'strong'; children: InlineToken[] }
   | { kind: 'link'; text: string; href: string }
+  | { kind: 'image'; alt: string; src: string }
 
-/** 每次给一个新正则：递归解析粗体内部时不能共用 lastIndex，否则外层扫描会错乱 */
+/**
+ * 每个分支都要给一个新正则：递归解析粗体内部时不能共用 lastIndex，否则外层扫描会错乱。
+ *
+ * 图片排在链接前面 —— `![说明](path)` 里包含 `[说明](path)`，先认链接就会把图片
+ * 拆成一个「感叹号 + 链接」，屏幕上只剩一个孤零零的 `!`。
+ * 地址允许包在 `<…>` 里（本地路径带空格时只能这么写）。
+ */
 function inlineRe(): RegExp {
-  return /(`[^`\n]+`)|(\*\*([^*\n]+?)\*\*)|(\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\))|(https?:\/\/[^\s<>"']+)/g
+  return /(`[^`\n]+`)|(?:!\[([^\]\n]*)\]\(\s*<?([^)>\n]+?)>?\s*\))|(\*\*([^*\n]+?)\*\*)|(\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\))|(https?:\/\/[^\s<>"']+)/g
 }
 
 export function safeHref(raw: string): string | null {
   const url = raw.trim()
   return /^https?:\/\/[^\s<>"']+$/i.test(url) ? url : null
+}
+
+/**
+ * 图片地址放行规则。
+ *
+ * 模型输出的文本不可信，`<img src>` 能做的事比 `<a href>` 多（自动发请求），
+ * 所以只认三种：http(s) 网址、data:image 内联图、本地路径（相对工作区或用
+ * file:// / `C:\` 开头的绝对路径）。其它协议（javascript:、vbscript: …）直接
+ * 当普通文字，连解析都不解析。
+ *
+ * 本地路径不在渲染层读文件 —— 交给主进程按白名单校验后转成 data URL，
+ * 见 vision.ts 的 imagePreview()。
+ */
+export function safeImageSrc(raw: string): string | null {
+  const url = raw.trim().replace(/^</, '').replace(/>$/, '')
+  if (!url) return null
+  if (/^https?:\/\//i.test(url)) return url
+  if (/^data:image\/(png|jpe?g|gif|webp|bmp);base64,[a-z0-9+/=\s]+$/i.test(url)) return url
+  if (/^file:\/\//i.test(url)) return url
+  // Windows 盘符不能被当成协议（`C:` 会命中下面那条协议判断）
+  if (/^[a-z]:[\\/]/i.test(url)) return url
+  if (/^[a-z][a-z0-9+.-]*:/i.test(url)) return null
+  return url
 }
 
 /**
@@ -63,21 +93,25 @@ export function tokenizeInline(text: string, depth = 0): InlineToken[] {
     pushText(text.slice(last, m.index))
     if (m[1]) {
       out.push({ kind: 'code', text: m[1].slice(1, -1) })
-    } else if (m[2]) {
-      // 粗体里还能套链接 / 行内代码，例如 **[文档](https://…)** 或 **`--port`**
-      out.push({ kind: 'strong', children: tokenizeInline(m[3] ?? '', depth + 1) })
+    } else if (m[2] !== undefined && m[3] !== undefined) {
+      const src = safeImageSrc(m[3])
+      if (src) out.push({ kind: 'image', alt: m[2].trim(), src })
+      else pushText(m[0])
     } else if (m[4]) {
-      const href = safeHref(m[6] ?? '')
-      if (href) out.push({ kind: 'link', text: m[5] ?? '', href })
-      else pushText(m[4])
-    } else if (m[7]) {
-      const { url, tail } = trimUrlTail(m[7])
+      // 粗体里还能套链接 / 行内代码，例如 **[文档](https://…)** 或 **`--port`**
+      out.push({ kind: 'strong', children: tokenizeInline(m[5] ?? '', depth + 1) })
+    } else if (m[6]) {
+      const href = safeHref(m[8] ?? '')
+      if (href) out.push({ kind: 'link', text: m[7] ?? '', href })
+      else pushText(m[6])
+    } else if (m[9]) {
+      const { url, tail } = trimUrlTail(m[9])
       const href = safeHref(url)
       if (href) {
         out.push({ kind: 'link', text: url, href })
         pushText(tail)
       } else {
-        pushText(m[7])
+        pushText(m[9])
       }
     }
     last = m.index + m[0].length

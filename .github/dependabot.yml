@@ -1,0 +1,40 @@
+version: 2
+
+# 为什么要有这个文件：依赖里 electron / vite / react 的版本会随安全公告变化，
+# 手工盯不过来。让 bot 开 PR，CI 会自动跑 typecheck / lint / 单测三道门。
+#
+# 刻意低频：单人维护的项目最怕 PR 噪音，npm 用月度、actions 用季度。
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      # 小版本与补丁合并成一个 PR，避免一次开十几个
+      npm-minor-patch:
+        update-types:
+          - minor
+          - patch
+    ignore:
+      # electron 大版本升级要同步改 electron-builder 配置并重打包验证，不适合自动合
+      - dependency-name: electron
+        update-types:
+          - version-update:semver-major
+
+  - package-ecosystem: npm
+    directory: /tools/vramfit
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 2
+    commit-message:
+      prefix: "chore(deps)"
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: quarterly
+    commit-message:
+      prefix: "chore(ci)"

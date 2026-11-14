@@ -1,0 +1,107 @@
+name: Release
+
+# 为什么要有这个文件：v0.1.2 是手工打包、手工上传 Release、手工写 SHA256，
+# 结果文案里的哈希和真实文件对不上，winget 清单也会因为哈希错误被 CI 打回。
+# 这里把「版本 → 构建 → 打包 → 算哈希 → 写 Release 文案 → 出 winget 清单」串成一条链，
+# 哈希一律从真实产物现算，不再由人手抄。
+#
+# 触发：push 一个 v* tag；或在 Actions 里手动跑 workflow_dispatch（用 package.json 的版本）。
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+    timeout-minutes: 40
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: 版本一致性
+        shell: pwsh
+        run: |
+          $pkg = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          $tag = "${{ github.ref_name }}"
+          if ($tag -like 'v*') {
+            $ver = $tag.TrimStart('v')
+            if ($ver -ne $pkg) { throw "tag $tag 与 package.json $pkg 不一致，先改版本再打 tag" }
+          } else {
+            $ver = $pkg
+          }
+          "VERSION=$ver" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "发布版本 v$ver"
+
+      - name: 安装依赖
+        run: npm ci
+
+      - name: 单测
+        run: npm test
+
+      - name: 类型检查
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: 打便携版（同时产出 .sha256）
+        run: npm run dist
+
+      - name: 打 NSIS 安装器
+        run: npm run dist:installer
+
+      - name: 生成 Release 文案与 winget 清单
+        shell: pwsh
+        run: |
+          node packaging/make-release-notes.mjs --version $env:VERSION
+          node packaging/winget/render.mjs --version $env:VERSION
+
+      - name: 校验 winget 清单
+        shell: pwsh
+        # runner 上不一定装了 App Installer（winget）。校验是加分项，不该因为它缺
+        # 就把已经打包好的发布流程卡死，所以先探测再决定是否强制。
+        run: |
+          $m = "packaging/winget/$env:VERSION"
+          if (-not (Test-Path $m)) { throw "清单目录不存在：$m" }
+          if (Get-Command winget -ErrorAction SilentlyContinue) {
+            winget validate --manifest $m
+            if ($LASTEXITCODE -ne 0) { throw "winget validate 失败（exit $LASTEXITCODE）" }
+          } else {
+            Write-Warning "runner 上没有 winget，跳过 validate；请在本地跑 winget validate --manifest $m"
+          }
+
+      - name: 创建 Release 并上传资产
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # 只用自己生成的文案：--generate-notes 会把英文自动日志混进中文说明里，
+          # 而且不同 gh 版本对「自动日志 + 自定义文案」的组合支持不一致，容易在发布阶段翻车。
+          gh release create "v$env:VERSION" release/*.exe release/*.sha256 `
+            --title "v$env:VERSION" `
+            --notes-file release/RELEASE_NOTES.md
+
+      - name: 归档 winget 清单
+        uses: actions/upload-artifact@v4
+        with:
+          name: winget-manifests-${{ env.VERSION }}
+          path: packaging/winget/${{ env.VERSION }}/
+
+      # 自动向 microsoft/winget-pkgs 开 PR 需要：
+      #   1) 首个版本已经手工提 PR 并合并（winget-releaser 只能更新已有包）
+      #   2) 一个 classic PAT（public_repo）放在 secrets.WINGET_TOKEN，以及 fork 所在账号
+      # 见 packaging/GITHUB-UPDATE.md。默认不启用，避免没有 token 时把发布流程搞红。

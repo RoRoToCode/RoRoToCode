@@ -1,4 +1,5 @@
 import { t as tr } from '../i18n'
+import { isPlainEnter } from '../keyboard'
 import { useCallback, useEffect, useState } from 'react'
 import type { GitStatus } from '../../shared/types'
 
@@ -55,6 +56,9 @@ export function GitPanel({ workspace, active, onNotify }: Props) {
       onNotify(r.message, r.ok ? 'info' : 'error')
       if (r.ok) setMessage('')
       await refresh()
+    } catch (err) {
+      // git 不在 PATH / 目录被占用时 IPC 会直接 reject，不接住就是「点了没反应」
+      onNotify(tr("提交失败：{0}", { "0": (err as Error).message }), 'error')
     } finally {
       setBusy(false)
     }
@@ -111,7 +115,7 @@ export function GitPanel({ workspace, active, onNotify }: Props) {
           placeholder={tr("提交信息，例如：修复导出按钮")}
           onChange={(e) => setMessage(e.target.value)}
           onKeyDown={(e) => {
-            if (e.key === 'Enter' && message.trim()) void commit()
+            if (isPlainEnter(e) && message.trim()) void commit()
           }}
         />
         <button

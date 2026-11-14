@@ -8,7 +8,7 @@
 import {
   GB, FILE_TYPE, quantFromName, paramCountOf, shardInfo, totalWeightsBytes,
   analyzeTemplate, attentionReport, stripControl, baseName, fmtSize,
-  headlineOf, TUNING, assumptionsList
+  headlineOf, TUNING, assumptionsList, speedCapFor
 } from '../core/index.mjs'
 // 界面壳子的词条表（表单、表头、状态提示）。报告正文里的结论仍由 core/i18n.mjs
 // 按 core 的 locale 生成，两边在 app.mjs 里同时设定，不会各说一种语言。
@@ -58,8 +58,11 @@ export function buildView(meta, result, ctx = {}) {
   const quant = quantFromName(meta.file) ?? (meta.fileType !== undefined ? FILE_TYPE[meta.fileType] : undefined) ?? tx('rp.unknown')
   const shard = shardInfo(meta.file)
   const weights = totalWeightsBytes(meta)
+  // 和命令行 / JSON 用同一个封顶：小模型上带宽公式会给出跑不出来的数值
   const speed = result.speed?.onVram
-  const sp = Number.isFinite(speed) && speed > 0 ? Math.round(speed) : null
+  const sp = Number.isFinite(speed) && speed > 0
+    ? Math.round(Math.min(speed, speedCapFor(weights)))
+    : null
   const att = attentionReport(meta)
   const tpl = analyzeTemplate(meta.chatTemplate)
   const bd = breakdown(result)
@@ -81,7 +84,7 @@ export function buildView(meta, result, ctx = {}) {
     bestCtxText: result.best ? fmtCtx(result.best.ctx) : '—',
     speed: sp,
     speedOnCpu: Number.isFinite(result.speed?.onRam) && result.speed.onRam > 0
-      ? Math.round(result.speed.onRam)
+      ? Math.round(Math.min(result.speed.onRam, speedCapFor(weights)))
       : null,
     bandwidth: result.speed?.bandwidth ?? null,
     gpuName: result.gpu ? clean(result.gpu.name) : null,

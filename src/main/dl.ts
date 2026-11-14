@@ -1,4 +1,5 @@
 import { downloadResumable } from './resume'
+import type { DownloadSource } from './resume'
 
 /** 只问体积，不下内容；拿不到就返回 0 */
 export async function headSize(url: string, timeoutMs = 20 * 1000): Promise<number> {
@@ -38,20 +39,44 @@ export async function headSize(url: string, timeoutMs = 20 * 1000): Promise<numb
  * 让上层（多镜像回退）能及时换下一个源，而不是干等一小时。
  * 中断不会丢进度——文件保留，重试时用 Range 从断点继续。
  */
-export async function downloadToFile(
-  url: string,
+export type FileDownloadOptions = {
+  headerMs?: number
+  idleMs?: number
+  totalMs?: number
+  signal?: AbortSignal
+  expectedBytes?: number
+  minBytes?: number
+}
+
+/**
+ * 多源版：同一份安装包的官网直链 + 国内镜像一起传进来。
+ * 引擎会并发测速、按内容一致性分组，同组的源分段同时下载；
+ * 组外的源留给断线换源，任一环节失败都保留已下字节。
+ */
+export async function downloadFromSources(
+  sources: DownloadSource[],
   target: string,
   onBytes: (received: number, total: number) => void,
-  opts?: { headerMs?: number; idleMs?: number; totalMs?: number; signal?: AbortSignal; expectedBytes?: number }
+  opts?: FileDownloadOptions
 ): Promise<void> {
-  await downloadResumable([{ label: '直连', url }], target, {
+  await downloadResumable(sources, target, {
     signal: opts?.signal,
     headerMs: opts?.headerMs,
     idleMs: opts?.idleMs,
     totalMs: opts?.totalMs,
     expectedBytes: opts?.expectedBytes,
+    minBytes: opts?.minBytes,
     onTick: (t) => onBytes(t.received, t.total)
   })
+}
+
+export async function downloadToFile(
+  url: string,
+  target: string,
+  onBytes: (received: number, total: number) => void,
+  opts?: FileDownloadOptions
+): Promise<void> {
+  await downloadFromSources([{ label: '直连', url }], target, onBytes, opts)
 }
 
 /** 把字节数说成人话 */

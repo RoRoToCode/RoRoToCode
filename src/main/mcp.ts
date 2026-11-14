@@ -293,7 +293,7 @@ async function connect(name: string, conf: ServerConf): Promise<Conn> {
       const initRes = (await request(conn, 'initialize', {
         protocolVersion: '2024-11-05',
         capabilities: {},
-        clientInfo: { name: 'RoRoToCode', version: '0.1.2' }
+        clientInfo: { name: 'RoRoToCode', version: app.getVersion() }
       }, 15000)) as { protocolVersion?: string }
       // 记录服务端协议版本（若返回），暂时只用于诊断，不强制
       void initRes
@@ -348,7 +348,7 @@ async function connect(name: string, conf: ServerConf): Promise<Conn> {
       {
         protocolVersion: '2024-11-05',
         capabilities: {},
-        clientInfo: { name: 'RoRoToCode', version: '0.1.2' }
+        clientInfo: { name: 'RoRoToCode', version: app.getVersion() }
       },
       15000
     )

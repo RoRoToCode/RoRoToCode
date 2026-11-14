@@ -9,6 +9,7 @@ const assert = require('node:assert')
 const {
   turnRangeOf,
   toolPairsIntact,
+  trimDanglingTail,
   titleAfterTurnDelete
 } = require('../dist/shared/turns.js')
 
@@ -109,4 +110,22 @@ test('toolPairsIntact 能抓到孤儿工具结果 / 没收到结果的调用', (
     ]),
     false
   )
+})
+
+test('分叉剪尾：切在「喊了工具、结果还没回来」处，把那条调用一起剪掉', () => {
+  const all = history()
+  // 切到 a3 为止：a3 喊了 c2，但 t2 还没回来
+  const cut = trimDanglingTail(all.slice(0, 6))
+  assert.deepStrictEqual(cut.map((m) => m.id), ['u1', 'a1', 't1', 'a2', 'u2'])
+  assert.ok(toolPairsIntact(cut))
+})
+
+test('分叉剪尾：配对完整的历史一个字不动', () => {
+  const all = history()
+  assert.deepStrictEqual(trimDanglingTail(all).map((m) => m.id), all.map((m) => m.id))
+})
+
+test('分叉剪尾：只剩孤立的工具结果时，整段剪空而不是留个孤儿', () => {
+  const cut = trimDanglingTail([msg('t9', 'tool', { toolCallId: 'c9' })])
+  assert.deepStrictEqual(cut, [])
 })

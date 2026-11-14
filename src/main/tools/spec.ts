@@ -84,6 +84,34 @@ export const toolSpecs: ToolSpec[] = [
     }
   },
   {
+    name: 'goto_definition',
+    description:
+      '跳到某个符号（变量、函数、类型、类、导入等）的定义处。改代码前想弄清某个名字到底定义在哪、长什么样时用它，比 grep 准（走类型系统，不是文本匹配）。只支持 TypeScript / JavaScript。',
+    parameters: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: '相对工作区的文件路径' },
+        line: { type: 'number', description: '符号所在行号（1 开始）' },
+        col: { type: 'number', description: '符号所在列号（1 开始），默认 1' }
+      },
+      required: ['path', 'line']
+    }
+  },
+  {
+    name: 'find_references',
+    description:
+      '查找某个符号的所有引用位置。改一个函数签名、字段名或常量前，用它确认会影响哪些文件哪些行，避免漏改。只支持 TypeScript / JavaScript。',
+    parameters: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: '相对工作区的文件路径' },
+        line: { type: 'number', description: '符号所在行号（1 开始）' },
+        col: { type: 'number', description: '符号所在列号（1 开始），默认 1' }
+      },
+      required: ['path', 'line']
+    }
+  },
+  {
     name: 'run_shell',
     description:
       '在工作区执行命令。Windows 默认用 cmd.exe；需要 unix 命令时把 shell 设为 bash（需已安装 Git Bash）。' +
@@ -182,6 +210,47 @@ export const toolSpecs: ToolSpec[] = [
     }
   },
   {
+    name: 'board',
+    description:
+      '往「共享黑板」写一条便签。黑板是同一个工作区里所有档案共用的一页：巡检、审查、主控、以及别人交过来的活都会看到。适合写跨会话还有效、但这摊活干完就该扔的事——谁在改哪块、还剩什么没做、刚踩到的坑、这个分支的临时约定。不适合写永久事实（那用 remember）。写完这一轮就会生效，不用等下一次对话。',
+    parameters: {
+      type: 'object',
+      properties: {
+        section: {
+          type: 'string',
+          enum: ['rule', 'fact', 'todo'],
+          description: 'rule = 这摊活的约定（别动哪块、按什么顺序改）；fact = 查到的事实（某接口在哪个文件）；todo = 还剩什么没做'
+        },
+        note: {
+          type: 'string',
+          description: '一句话，写成别人不用问你也能看懂的样子，例如「登录限流改在 src/auth/limit.ts，测试还没补」'
+        }
+      },
+      required: ['section', 'note']
+    }
+  },
+  {
+    name: 'scratch',
+    description:
+      '给「这一次会话」记临时便签：待会儿要回头做的事、刚查到的关键行号、试过但没用的方案。只有当前会话能看到，别的会话和别的档案都看不到，也不会写进长期记忆。跨会话还有效的事实用 remember，跨会话的这摊活进度用 board。活干完这条便签就没意义了，别往里塞长期结论。',
+    parameters: {
+      type: 'object',
+      properties: {
+        text: {
+          type: 'string',
+          description: '要写的内容，一句话一条。不传就是读当前便签'
+        },
+        mode: {
+          type: 'string',
+          enum: ['append', 'replace'],
+          description: 'append = 追加一条（默认，推荐）；replace = 整篇覆盖'
+        },
+        clear: { type: 'boolean', description: '清空便签（活做完了收拾现场用）' }
+      },
+      required: []
+    }
+  },
+  {
     name: 'task',
     description:
       '把一个子任务派给独立的子 agent 去做。子 agent 有自己的上下文和循环，会自己读文件、改代码、跑命令，最后只把结论回传给你——中间几十次读文件的细节不会占用你的上下文。适合：① 要翻阅大量文件才能回答的问题（「这个仓库的鉴权怎么走的」）；② 互不相关的多个模块各改一处，可以一次派多个 task 并行；③ 需要大量搜索/探查的活。简单的一两步操作不要用，自己直接做更快。',
@@ -196,6 +265,28 @@ export const toolSpecs: ToolSpec[] = [
         }
       },
       required: ['description', 'prompt']
+    }
+  },
+  {
+    name: 'handoff',
+    description:
+      '把一件独立的活交给另一个 Agent 档案（比如巡检发现登录接口没限流，交给「审查」去修）。与 task 的关键区别：task 派出去的子 agent 只是多一双手，结果要你自己汇总；handoff 交出去的是**一个有身份、有自己记忆和工具边界的档案**，它会在你这一轮结束后自己接手，你不用等结果。适合：发现的问题属于别人的职责、要改的东西不该由你动、或者这条活做完要沉淀成那个角色自己的经验。交出去之前把「凭什么」写清楚，它只拿着你给的这些开工。',
+    parameters: {
+      type: 'object',
+      properties: {
+        to: { type: 'string', description: '目标档案的名字或 id，从系统提示的「可以交接」里选' },
+        task: { type: 'string', description: '要它做什么，一句话说清。它看不到当前对话，必须能独立看懂' },
+        context: {
+          type: 'string',
+          description: '你查到的关键情况：文件、行号、复现步骤、为什么这是问题。这是它的全部线索，写得越具体它越不需要重查'
+        },
+        files: {
+          type: 'array',
+          description: '相关文件（相对工作区路径）。它自己会读，不要在这贴全文',
+          items: { type: 'string' }
+        }
+      },
+      required: ['to', 'task']
     }
   },
   {
@@ -254,9 +345,153 @@ export const toolSpecs: ToolSpec[] = [
         dry_run: { type: 'boolean', description: '只校验并返回将要发生的改动清单，不写盘。默认 false' }
       }
     }
+  },
+  {
+    name: 'terminal',
+    description:
+      '常驻交互式终端。run_shell 是「发一条、等它跑完」，遇到要等输入的程序（npm init、vite 的交互提示、ssh、Python REPL）会卡住；' +
+      '这里保留一个长期存活的 shell，可以分多次写、分多次读。open 打开会话（同一工作区复用），write 发送输入（需要回车就带 \\n），' +
+      'read 读增量（传上次返回的 seq；wait_ms 用来等新输出），close 关闭。不是完整 PTY，vim/top 这类全屏程序不支持。',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['open', 'write', 'read', 'close', 'list'], description: '要做的操作' },
+        shell: { type: 'string', enum: ['cmd', 'powershell', 'bash'], description: 'open 时用哪种 shell，默认 cmd' },
+        session_id: { type: 'string', description: '会话 id（open 返回；write/read/close 时必填）' },
+        data: { type: 'string', description: 'write 时要发送的内容，例如 "y\\n"' },
+        seq: { type: 'number', description: 'read 时上次拿到的 seq，只取这之后的增量；不传则返回最后一段' },
+        wait_ms: { type: 'number', description: 'read 时最多等多少毫秒的新输出，默认 0（立刻返回），最多 15000' },
+        tail: { type: 'number', description: 'read 不带 seq 时返回最后多少字符，默认 8000' }
+      },
+      required: ['action']
+    }
+  },
+  {
+    name: 'git',
+    description:
+      '结构化 Git 操作，不用自己拼 git 命令。支持：status / diff / log / branches / checkout / add / commit / push / pull / stash / undo / worktree / pr。' +
+      'undo 是 git reset --soft（只退提交、改动保留）；push/pull/pr 会访问网络；pr 需要本机装好并登录 GitHub CLI（gh）。' +
+      '改完代码想落一个提交，用 commit；要开分支用 checkout 且 create=true。',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: [
+            'status', 'diff', 'log', 'branches', 'checkout', 'add', 'commit',
+            'push', 'pull', 'stash', 'undo', 'worktree', 'pr'
+          ],
+          description: '要执行的 git 动作'
+        },
+        paths: { type: 'array', description: 'diff/add/commit 涉及的文件（相对工作区），不填表示全部', items: { type: 'string' } },
+        message: { type: 'string', description: 'commit 的提交信息；stash push 时可作为说明' },
+        branch: { type: 'string', description: 'checkout / push / pull / worktree add 的分支名' },
+        create: { type: 'boolean', description: 'checkout 时是否新建分支；push 时是否设 upstream（默认 true）' },
+        remote: { type: 'string', description: 'push / pull 的远端名，默认 origin' },
+        steps: { type: 'number', description: 'undo 撤销几个提交，默认 1，最多 5' },
+        dir: { type: 'string', description: 'worktree add/remove 的目录' },
+        worktree_action: { type: 'string', enum: ['list', 'add', 'remove'], description: 'worktree 的子操作，默认 list' },
+        stash_action: { type: 'string', enum: ['push', 'pop', 'list', 'drop'], description: 'stash 的子操作，默认 push' },
+        title: { type: 'string', description: 'pr 的标题' },
+        body: { type: 'string', description: 'pr 的正文' },
+        limit: { type: 'number', description: 'log 返回多少条，默认 15' }
+      },
+      required: ['action']
+    }
+  },
+  {
+    name: 'format',
+    description:
+      '用项目自带的格式化器整理文件：prettier（js/ts/json/css）、gofmt（go）、ruff format 或 black（python）、rustfmt（rust）。' +
+      '只动你指定的文件；项目里没装对应工具就跳过，不会联网安装。lint=true 时顺带跑 eslint / ruff check 报问题（不自动修）。',
+    parameters: {
+      type: 'object',
+      properties: {
+        paths: { type: 'array', description: '要格式化的文件（相对工作区）', items: { type: 'string' } },
+        lint: { type: 'boolean', description: '是否顺便跑 lint，默认 false' },
+        docs: { type: 'boolean', description: '是否也格式化 md/html/yaml，默认 false' }
+      },
+      required: ['paths']
+    }
+  },
+  {
+    name: 'repo_map',
+    description:
+      '查看仓库地图：每个文件都有哪些顶层符号（函数/类/接口/导出）+ 一句话说明。' +
+      '先看地图定位到几个文件，再用 read_file / grep 精读，比盲搜省几十倍上下文。' +
+      'query 可以用自然语言描述你要找的东西（例如「登录是怎么校验的」「模型下载的断点续传在哪」），' +
+      '程序会用本地 embedding 做语义检索并按相关度排序；没有 embedding 服务时自动退回关键词匹配。' +
+      'path 只看某个子目录，refresh=true 强制重扫（默认增量更新）。',
+    parameters: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: '关键词，例如「provider 配置」或「auth login」' },
+        path: { type: 'string', description: '只看这个子目录（相对工作区）' },
+        limit: { type: 'number', description: '最多列多少个文件，默认 120，上限 400' },
+        summary: { type: 'boolean', description: '是否带每个文件的一句话说明，默认 true' },
+        refresh: { type: 'boolean', description: '强制全量重建索引，默认 false（按 mtime 增量）' }
+      }
+    }
+  },
+  {
+    name: 'use_skill',
+    description:
+      '取一个「已开启自动调用」的技能的完整做法，然后照着做。只在系统提示的「可调用技能」里列出了它、且当前任务确实对得上时才用；名字填技能名。' +
+      '技能里通常包含具体步骤、脚本路径和注意事项，比你自己摸一遍更快也更稳，但不要凭技能名猜内容——必须真的取到再执行。',
+    parameters: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: '技能名，从系统提示的「可调用技能」里选' }
+      },
+      required: ['name']
+    }
+  },
+  {
+    name: 'write_plan',
+    description:
+      '在「计划模式」下产出执行计划。写完程序会把计划显示给用户，用户点「批准执行」之后你才有写文件和跑命令的权限。' +
+      '计划要具体到文件与动作（改哪个文件、加什么函数、跑什么命令），不要写「优化代码」这类空话。' +
+      '不在计划模式时调用它也能用，但不会解锁任何权限。',
+    parameters: {
+      type: 'object',
+      properties: {
+        plan: { type: 'string', description: '完整的计划正文（Markdown），分步骤写清楚' },
+        steps: {
+          type: 'array',
+          description: '步骤清单，每条一句话；会显示成可勾选的待办',
+          items: { type: 'string' }
+        }
+      },
+      required: ['plan']
+    }
   }
 ]
 
+/**
+ * 工具网关。
+ *
+ * 25 个工具的 JSON Schema 加起来约 4900 tokens —— 在 16K 窗口的本地模型上，
+ * 光「工具说明书」就吃掉三成窗口，而且工具越多小模型越容易挑错。
+ * 上下文紧张时只直接下发常用的十来个，其余通过这个网关调用：
+ * 不带 tool 参数返回清单，带了就在执行前展开成真工具（风险、审批、钩子都按真名走）。
+ *
+ * 它本身不进 toolSpecs：只有真的藏了工具时才下发，否则白占一百多 token。
+ */
+export const TOOLBOX_SPEC: ToolSpec = {
+  name: 'toolbox',
+  description:
+    '调用本轮没有直接列出的工具（例如 git、terminal、board、handoff、格式化等）。' +
+    '不带 tool 参数时返回可用工具的清单；带 tool 时按该工具的参数调用（args 与直接调用完全一样）。',
+  parameters: {
+    type: 'object',
+    properties: {
+      tool: { type: 'string', description: '要调用的工具名，例如 git' },
+      args: { type: 'object', description: '该工具的参数对象，和直接调用时一样' }
+    }
+  }
+}
+
 export function toolSpecByName(name: string): ToolSpec | undefined {
+  if (name === TOOLBOX_SPEC.name) return TOOLBOX_SPEC
   return toolSpecs.find((t) => t.name === name)
 }

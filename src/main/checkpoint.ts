@@ -31,14 +31,38 @@ async function writeJson(abs: string, data: unknown): Promise<void> {
   await fs.rename(tmp, abs)
 }
 
+/**
+ * 按会话串行化写盘。
+ *
+ * 引擎里 saveCheckpoint 是 `void` 调用的（不能因为落盘拖慢每一步），而收工时的
+ * clearCheckpoint 是 await 的。两者并发时，一次还在路上的 save 会在 rm 之后
+ * 把文件重新 rename 回来 —— 于是「已经跑完」的会话下次启动又冒出「继续」横幅。
+ * 排队执行就没有这个窗口：谁最后调用的，谁最后落地。
+ */
+const tails = new Map<string, Promise<unknown>>()
+
+function serialize<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  const prev = tails.get(key) ?? Promise.resolve()
+  const next = prev.then(fn, fn)
+  const settle = next.catch(() => undefined)
+  tails.set(key, settle)
+  void settle.then(() => {
+    // 队列空了就把键删掉，长跑进程里不会越攒越多
+    if (tails.get(key) === settle) tails.delete(key)
+  })
+  return next
+}
+
 /** 写入（或更新）一个 checkpoint。任何 IO 失败都静默吞掉：checkpoint 是兜底，不该拖垮主流程。 */
 export async function saveCheckpoint(cp: Checkpoint): Promise<void> {
-  try {
-    await fs.mkdir(dir(), { recursive: true })
-    await writeJson(fileOf(cp.sessionId), cp)
-  } catch {
-    // 磁盘写不进也不影响对话继续，下一轮再试
-  }
+  await serialize(cp.sessionId, async () => {
+    try {
+      await fs.mkdir(dir(), { recursive: true })
+      await writeJson(fileOf(cp.sessionId), cp)
+    } catch {
+      // 磁盘写不进也不影响对话继续，下一轮再试
+    }
+  })
 }
 
 export async function loadCheckpoint(sessionId: string): Promise<Checkpoint | null> {
@@ -52,11 +76,14 @@ export async function loadCheckpoint(sessionId: string): Promise<Checkpoint | nu
 
 /** 正常完成 / 用户确认放弃后清除，避免下次启动误判成「中断」 */
 export async function clearCheckpoint(sessionId: string): Promise<void> {
-  try {
-    await fs.rm(fileOf(sessionId), { force: true })
-  } catch {
-    // 已不存在或删不掉都无所谓
-  }
+  // 排在这一会话所有未落地的 save 之后：否则刚删掉就被上一次 save 写回来
+  await serialize(sessionId, async () => {
+    try {
+      await fs.rm(fileOf(sessionId), { force: true })
+    } catch {
+      // 已不存在或删不掉都无所谓
+    }
+  })
 }
 
 /**

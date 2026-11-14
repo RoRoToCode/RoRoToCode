@@ -1,8 +1,8 @@
 import { t as tr } from '../i18n'
-import { useEffect, useState } from 'react'
+import { memo, useEffect, useState } from 'react'
 import type { ChatMessage, SubAgentTask } from '../../shared/types'
 import { RichText } from './Markdown'
-import { Dots } from './RunStatus'
+import { isComposingKey, isPlainEnter } from '../keyboard'
 import { SubAgentCard } from './SubAgentCard'
 
 /** 缩略图按路径缓存，滚动重渲染不会反复走 IPC */
@@ -248,17 +248,25 @@ interface Props {
   onEdit?: (messageId: string, text: string) => void
   /** 删掉这条消息所在的一整轮，给上下文减负 */
   onDelete?: (messageId: string) => void
+  /** 从这条消息处复制一份新会话，原会话保留（两条路各走各的） */
+  onFork?: (messageId: string) => void
   /** 这条工具结果是子 agent 派出去的活，带上它的实时状态 */
   subTask?: SubAgentTask
 }
 
-export function MessageItem({
+/**
+ * 一条消息。刻意 memo：
+ * 流式输出时每帧都会换掉「正在写的那一条」，其余几十条不该跟着重新渲染、
+ * 更不该把正文重新分词一遍。前提是父组件传进来的回调引用稳定（见 App.tsx 的 ref 转发）。
+ */
+function MessageItemInner({
   message,
   running,
   canRegenerate,
   onRegenerate,
   onEdit,
   onDelete,
+  onFork,
   subTask
 }: Props) {
   const [editing, setEditing] = useState(false)
@@ -278,16 +286,20 @@ export function MessageItem({
               autoFocus
               onChange={(e) => setDraft(e.target.value)}
               onKeyDown={(e) => {
+                // 输入法选字时按回车只是确认候选，不该顺手把消息发出去
+                if (isComposingKey(e)) return
                 if (e.key === 'Escape') setEditing(false)
-                if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+                if (isPlainEnter(e)) {
                   e.preventDefault()
-                  if (draft.trim()) onEdit?.(message.id, draft.trim())
-                  setEditing(false)
+                  if (draft.trim() && !running) {
+                    onEdit?.(message.id, draft.trim())
+                    setEditing(false)
+                  }
                 }
               }}
             />
             <div className="msg-edit-actions">
-              <span className="msg-edit-tip">{tr("Ctrl+Enter 发送 · Esc 取消")}</span>
+              <span className="msg-edit-tip">{tr("Enter 发送 · Shift+Enter 换行 · Esc 取消")}</span>
               <button className="btn sm" onClick={() => setEditing(false)}>
                 {tr("取消")}</button>
               <button
@@ -319,7 +331,7 @@ export function MessageItem({
                   : tr("附件正文已读取（约 {chars} 字），此处不展开", { chars: view.chars })}
               </div>
             )}
-            {!running && (onEdit || onDelete) && (
+            {!running && (onEdit || onDelete || onFork) && (
               <div className="msg-acts">
                 {onEdit && !view.chars && (
                   <button
@@ -331,6 +343,14 @@ export function MessageItem({
                     }}
                   >
                     {tr("编辑重发")}</button>
+                )}
+                {onFork && (
+                  <button
+                    className="msg-act"
+                    title={tr("从这句话处复制一份新会话重新走，原来这条对话保留不动")}
+                    onClick={() => onFork(message.id)}
+                  >
+                    {tr("从这里分叉")}</button>
                 )}
                 {onDelete && <TurnDelete messageId={message.id} onDelete={onDelete} />}
               </div>
@@ -354,18 +374,10 @@ export function MessageItem({
   }
 
   if (!message.content) {
-    if (!running) return null
-    // 只有一条工具调用、没写正文时不必显示占位，工具卡片本身会说明在干什么
-    if (message.toolCalls?.length) return null
-    return (
-      <div className="msg assistant">
-        <div className="msg-role">RoRoTo Code</div>
-        <div className="msg-body msg-wait">
-          <Dots />
-          <span>{tr("正在思考，请稍等")}</span>
-        </div>
-      </div>
-    )
+    // 「正在思考」已固定在输入区上方状态栏的左侧（和上下文同一行）。
+    // 这里不再放占位消息，免得同一句提示在消息区和状态栏之间来回跳、
+    // 还把消息列表的高度推得一动一动。
+    return null
   }
 
   return (
@@ -387,3 +399,5 @@ export function MessageItem({
     </div>
   )
 }
+
+export const MessageItem = memo(MessageItemInner)

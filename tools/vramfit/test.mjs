@@ -32,7 +32,8 @@ import {
 
 import {
   TUNING, ASSUMPTIONS, KV_BYTES_PER_ELEM, VALUE_FLAGS, setMirror, getMirror, DEFAULT_MIRROR, OFFICIAL,
-  setLocale, getLocale, detectLocale, t, dictStats, bothLangs, labelWidth, assumptionsList, localeOf
+  setLocale, getLocale, detectLocale, t, dictStats, bothLangs, labelWidth, assumptionsList, localeOf,
+  speedCapFor, assumptionLines
 } from './core/index.mjs'
 import { appleWorkingSet } from './cli/hardware.mjs'
 
@@ -328,18 +329,28 @@ test('交互输入模式：Windows 控制台必须走熟模式，否则 Ctrl+V �
 
 // ───────────────────────── 显存上限：平台差异 ─────────────────────────
 
-test('显存上限：Windows 可驱逐，Linux 只能按当前可用算', () => {
+test('显存上限：只认当前可用，不把「可驱逐」当预算', () => {
   const g = { totalBytes: 8 * GB, usedBytes: 6 * GB }
 
+  // 8G 卡上已占 6G。旧实现走 max(free, total×0.94) 会报 7.52 → 每个模型都推荐 64K，
+  // 真跑起来并发两个请求 decode 掉到 1.5 tok/s。现在只认 free。
   const win = vramCeiling({ ...g, platform: 'win32' })
-  assert.ok(win.limit / GB > 7, `Windows 应接近总显存：${(win.limit / GB).toFixed(2)}`)
-  assert.ok(win.reclaimable / GB > 5, 'Windows 上那部分是可驱逐的，报告要写明')
+  assert.ok(
+    Math.abs(win.limit / GB - 2 * 0.92) < 1e-9,
+    `Windows 上限应是可用显存的 92%：${(win.limit / GB).toFixed(2)}`
+  )
+  assert.equal(win.reclaimable, 0, '不再承诺「关掉别的程序就能腾出这么多」')
 
-  // 8G 卡已占 6G，Linux 只剩 2G。修复前这里也走 max(free, total*0.94)，报 7.52 → 必然 OOM
   const lin = vramCeiling({ ...g, platform: 'linux' })
   assert.ok(Math.abs(lin.limit / GB - 2 * 0.92) < 1e-9, `Linux 上限应是可用显存的 92%：${lin.limit / GB}`)
   assert.equal(lin.reclaimable, 0)
-  assert.ok(lin.limit < win.limit)
+  // 两个平台在「按可用算」上一致；差别只在报告口径
+  assert.ok(Math.abs(lin.limit - win.limit) < 1)
+
+  // 空闲时才该接近总显存 —— 这条保证新实现没有反过来把空闲机器也判死
+  const idle = vramCeiling({ totalBytes: 8 * GB, usedBytes: 0.5 * GB, platform: 'win32' })
+  assert.ok(idle.limit / GB > 6.8, `空闲的 8G 卡应能用 7G 左右：${(idle.limit / GB).toFixed(2)}`)
+  assert.ok(idle.limit <= 8 * GB * 0.94, '但永远不能超过总显存的 94%')
 })
 
 test('显存上限：macOS 统一内存按 GPU 建议工作集，不是物理内存', () => {
@@ -396,6 +407,37 @@ test('等号写法：--kv=q8_0 / --vram=8 不能被静默忽略', () => {
 
   assert.equal(parseOptions(normalizeArgv(['--repo=unsloth/Qwen3-8B-GGUF'])).repo, 'unsloth/Qwen3-8B-GGUF')
   assert.equal(parseOptions(normalizeArgv(['--repo'])).problems.length, 1)
+})
+
+test('--mmproj：投影器开销要能进预算，缺值要报错', () => {
+  const o = parseOptions(normalizeArgv(['--mmproj', 'mmproj-x.gguf', 'x.gguf']))
+  assert.equal(o.mmproj, 'mmproj-x.gguf')
+  assert.deepEqual(o.problems, [])
+  // 等号写法同样要能拆开
+  assert.equal(normalizeArgv(['--mmproj=a.gguf'])[0], '--mmproj')
+  // 只写 flag 不跟值：必须报错，不能静默按纯文本算（那会高估可用显存）
+  assert.equal(parseOptions(['--mmproj']).problems.length, 1)
+})
+
+test('assess：看图的额外开销只影响带图的结论，不污染纯文本的推荐档', () => {
+  const hw = {
+    osPlatform: 'win32',
+    ramBytes: 16 * 1024 ** 3,
+    ramBandwidthGBps: 26,
+    gpus: [{ name: 'RTX 3050', totalBytes: 8 * 1024 ** 3, usedBytes: 1.5 * 1024 ** 3, backend: 'cuda', bandwidthGBps: 224 }]
+  }
+  const plain = assess(meta8b, hw)
+  // 实测 Ornith-9B：879 MiB 投影器 + 373 MiB 激活 ≈ 1252 MiB，这里按 1263 MiB 的假设值给
+  const extra = 879 * 1024 * 1024 + 384 * 1024 * 1024
+  const withVision = assess(meta8b, hw, { extraBytes: extra })
+
+  // 纯文本口径不能被改动（默认启动不挂投影器）
+  assert.equal(plain.best.ctx, assess(meta8b, hw, { extraBytes: 0 }).best.ctx)
+  assert.equal(plain.extra, 0)
+  // 带图口径必须更小：每档的 need 都多出这笔钱
+  assert.equal(withVision.extra, extra)
+  assert.ok(withVision.best === null || withVision.best.ctx < plain.best.ctx,
+    '挂投影器后还推荐同样的上下文，等于又回到「说装得下、一发图就崩」')
 })
 
 test('终端转义清洗：远端文件名不能带控制序列进终端', () => {
@@ -608,6 +650,79 @@ test('JSON：CPU 推理的速度不能写成 0 tok/s', () => {
   assert.equal(row.cpuOnly, true)
 })
 
+// ───────────── 速度口径：零上下文峰值 / 封顶 / 上下文折减 ─────────────
+
+test('速度公式守住 RTX 2080 + 9B Q4 的实测校准点', () => {
+  // core/assess.mjs 注释里那个校准点：448 GB/s × 0.7 ÷ 5.78 GB = 54.3，实测 53.9。
+  // 把它写成断言，免得以后调效率因子时把已验证的校准悄悄改坏。
+  const nineB = { ...meta8b, sizeBytes: 5.78e9 }
+  const hw = {
+    gpus: [{ name: 'RTX 2080', totalBytes: 8 * GB, usedBytes: 0, bandwidthGBps: 448 }],
+    ramBytes: 32 * GB, ramBandwidthGBps: 50, platform: 'test'
+  }
+  const r = assess(nineB, hw, { weightsBytes: 5.78e9 })
+  assert.ok(Math.abs(r.speed.onVram - 54.3) < 0.2, `公式值偏离校准点：${r.speed.onVram}`)
+  assert.ok(Math.abs(r.speed.onVram / 53.9 - 1) < 0.01, '和实测的差距应在 1% 内')
+})
+
+test('CPU 推理的速度效率因子与 TUNING 同源，不再写死 0.7', () => {
+  const hw = { gpus: [], ramBytes: 16 * GB, ramBandwidthGBps: 60, platform: 'test' }
+  const meta = { ...meta8b, sizeBytes: 4 * GB }
+  const r = assess(meta, hw, { weightsBytes: 4 * GB })
+  assert.equal(r.speed.efficiency, TUNING.memoryEfficiency)
+  const expected = (60 * TUNING.memoryEfficiency) / (4 * GB / 1e9)
+  assert.ok(Math.abs(r.speed.onRam - expected) < 1e-9, `CPU 分支应算出 ${expected}，实际 ${r.speed.onRam}`)
+})
+
+test('速度封顶：小模型的 JSON 不能再把公式值原样报出去', () => {
+  assert.equal(speedCapFor(1.5e9), TUNING.speedCapTiny)
+  assert.equal(speedCapFor(5e9), TUNING.speedCap)
+  assert.equal(speedCapFor(0), TUNING.speedCap, '体积拿不到时按常规档兜底')
+
+  // 0.5 GB 小模型配 448 GB/s 的卡，公式给 627 tok/s —— kernel launch / 采样
+  // 是固定开销，物理上跑不到。命令行早就封顶，JSON 以前却直接 Math.round。
+  const tiny = { ...meta8b, file: 'Qwen3-0.6B-Q4_K_M.gguf', sizeBytes: 0.5e9 }
+  const fastGpu = {
+    gpus: [{ name: 'RTX 2080', totalBytes: 8 * GB, usedBytes: 0, bandwidthGBps: 448 }],
+    ramBytes: 16 * GB, ramBandwidthGBps: 60, platform: 'test'
+  }
+  const result = assess(tiny, fastGpu, { weightsBytes: 0.5e9 })
+  assert.ok(result.speed.onVram > 600, `公式值应明显超过封顶，实际 ${result.speed.onVram}`)
+
+  const row = toJson([{ meta: tiny, result }])[0]
+  assert.equal(row.genTokPerSec, TUNING.speedCapTiny, 'JSON 与命令行必须同一个封顶')
+  const text = render(tiny, fastGpu, result)
+  assert.ok(!text.includes('627'), '命令行也不该把未封顶的公式值写出来')
+})
+
+test('按建议上下文折减：峰值不含 KV 读取，折减值必须更低', () => {
+  const r = assess(meta8b, hw8b, {})
+  const peak = r.speed.onVram
+  assert.ok(r.speed.atCtx > 0 && r.speed.atCtx < peak,
+    `折减值 ${r.speed.atCtx} 应落在 0 与峰值 ${peak} 之间`)
+  assert.equal(r.speed.atCtxTokens, r.best.ctx)
+  // 带宽与利用率不变时速度 ∝ 1/(权重 + KV)，直接核对公式
+  const expected = peak * r.weights / (r.weights + r.best.kv)
+  assert.ok(Math.abs(r.speed.atCtx - expected) < 1e-9)
+  // 上下文越长折减越多：手工把建议档的 KV 翻倍，速度必须下降
+  const longer = peak * r.weights / (r.weights + r.best.kv * 2)
+  assert.ok(longer < r.speed.atCtx)
+
+  const row = toJson([{ meta: meta8b, result: r }])[0]
+  assert.equal(row.speedBasis, 'zero-context-decode-peak')
+  assert.equal(row.speedCtx, r.best.ctx)
+  assert.ok(row.genTokPerSecAtCtx > 0 && row.genTokPerSecAtCtx < row.genTokPerSec,
+    `折减 ${row.genTokPerSecAtCtx} 应低于峰值 ${row.genTokPerSec}`)
+  assert.match(row.disclaimer, /零上下文/, 'JSON 契约里要写明口径')
+})
+
+test('假设清单：明说峰值「不计上下文」并给出折减说明', () => {
+  const lines = assumptionLines().join('\n')
+  assert.match(lines, /零上下文解码峰值/)
+  assert.match(lines, /不计 KV cache 读取|KV cache 读取/)
+  assert.match(lines, /命令行与 JSON 都套用同一个封顶/)
+})
+
 // ───────────────────────── 报告版式 ─────────────────────────
 
 test('版式：不折行、不留尾空格、值列对齐、免责只印一次', () => {
@@ -660,7 +775,8 @@ test('参数与假设：assess 用到的比例和图里写的一致', () => {
   const lin = vramCeiling({ ...g8, platform: 'linux' })
   assert.equal(lin.limit, 8 * GB * TUNING.freeFactor)
   const win = vramCeiling({ ...g8, platform: 'win32' })
-  assert.equal(win.limit, Math.max(8 * GB * TUNING.wddmFreeFactor, 8 * GB * TUNING.wddmTotalFactor))
+  // min 而不是 max：total×0.94 只是物理上限，不能当预算用（空闲时 free×0.92 更小，取它）
+  assert.equal(win.limit, Math.min(8 * GB * TUNING.wddmFreeFactor, 8 * GB * TUNING.wddmTotalFactor))
   const uni = vramCeiling({ totalBytes: 32 * GB, unified: true, maxWorkingSetBytes: 24 * GB })
   assert.equal(uni.limit, 24 * GB * TUNING.unifiedReserve)
 })

@@ -4,7 +4,9 @@ import os from 'node:os'
 import path from 'node:path'
 import { dialog } from 'electron'
 import type { BaseToolId, BaseToolStatus, ToolSetupProgress } from '../shared/types'
-import { downloadToFile, headSize, humanSize } from './dl'
+import { downloadFromSources, headSize, humanSize } from './dl'
+import { MIRRORS } from './ghdl'
+import type { DownloadSource } from './resume'
 import { mt } from './i18n'
 
 /**
@@ -26,10 +28,17 @@ interface ToolSpec {
   silent: (file: string) => string
   /** 解析安装包直链 */
   resolve: () => Promise<string>
+  /** 同一份安装包的国内镜像；family 与主源一致才允许并发分段下载 */
+  family: string
+  mirrors: (url: string) => DownloadSource[]
   /** 解析不出来时给用户的下载页 */
   page: string
   optional?: boolean
 }
+
+/** 官网 → 国内镜像：路径一一对应，实测都支持 Range 206 */
+const NODE_MIRROR = 'https://cdn.npmmirror.com/binaries/node/'
+const PYTHON_MIRROR = 'https://mirrors.huaweicloud.com/python/'
 
 const PF = process.env.ProgramFiles ?? 'C:\\Program Files'
 const PF86 = process.env['ProgramFiles(x86)'] ?? 'C:\\Program Files (x86)'
@@ -80,7 +89,11 @@ const SPECS: Record<BaseToolId, ToolSpec> = {
       const hit = list.find((v) => v.lts !== false && v.files.includes('win-x64-msi'))
       if (!hit) throw new Error('没找到 Node.js LTS 的 Windows 安装包')
       return `https://nodejs.org/dist/${hit.version}/node-${hit.version}-x64.msi`
-    }
+    },
+    family: 'node',
+    mirrors: (url) => [
+      { label: 'npmmirror', url: url.replace('https://nodejs.org/dist/', NODE_MIRROR), family: 'node' }
+    ]
   },
   git: {
     id: 'git',
@@ -99,7 +112,15 @@ const SPECS: Record<BaseToolId, ToolSpec> = {
       const asset = rel.assets?.find((a) => /^Git-.*-64-bit\.exe$/i.test(a.name))
       if (!asset) throw new Error('没找到 Git 的 64 位安装包')
       return asset.browser_download_url
-    }
+    },
+    family: 'github',
+    // GitHub release 产物走现成的镜像前缀；引擎会先探活，挂掉的镜像自然被排除
+    mirrors: (url) =>
+      MIRRORS.filter((m) => m.prefix).map((m) => ({
+        label: m.label,
+        url: `${m.prefix}${url}`,
+        family: 'github'
+      }))
   },
   python: {
     id: 'python',
@@ -124,7 +145,11 @@ const SPECS: Record<BaseToolId, ToolSpec> = {
       const m = html.match(/python-(3\.\d+\.\d+)-amd64\.exe/)
       if (!m) throw new Error('没找到 Python 的 Windows 安装包')
       return `https://www.python.org/ftp/python/${m[1]}/python-${m[1]}-amd64.exe`
-    }
+    },
+    family: 'python',
+    mirrors: (url) => [
+      { label: '华为云镜像', url: url.replace('https://www.python.org/ftp/python/', PYTHON_MIRROR), family: 'python' }
+    ]
   }
 }
 
@@ -211,14 +236,21 @@ export async function installTools(
   if (targets.length === 0) return { ok: false, message: '没有需要安装的组件' }
 
   // 1) 解析直链
-  const plans: Array<{ spec: ToolSpec; url: string; size: number }> = []
+  const plans: Array<{ spec: ToolSpec; sources: DownloadSource[]; size: number }> = []
   const failed: Array<{ label: string; reason: string }> = []
   for (const id of targets) {
     const spec = SPECS[id]
     try {
       const url = await spec.resolve()
-      const size = await headSize(url)
-      plans.push({ spec, url, size })
+      const sources: DownloadSource[] = [
+        { label: '官方直链', url, family: spec.family },
+        ...spec.mirrors(url)
+      ]
+      // 体积从任一可用源问，官网慢 / 挂掉时不用干等 20 秒
+      const size = await Promise.any(
+        sources.map((s) => headSize(s.url, 8000).then((n) => (n > 0 ? n : Promise.reject(new Error('未知体积')))))
+      ).catch(() => 0)
+      plans.push({ spec, sources, size })
     } catch (err) {
       failed.push({ label: spec.label, reason: (err as Error).message })
     }
@@ -254,14 +286,18 @@ export async function installTools(
   for (const plan of plans) {
     const file = path.join(dir, plan.spec.file)
     try {
-      await downloadToFile(plan.url, file, (received, total) =>
-        onProgress({
-          id: plan.spec.id,
-          label: plan.spec.label,
-          phase: 'download',
-          receivedBytes: received,
-          totalBytes: total
-        })
+      await downloadFromSources(
+        plan.sources,
+        file,
+        (received, total) =>
+          onProgress({
+            id: plan.spec.id,
+            label: plan.spec.label,
+            phase: 'download',
+            receivedBytes: received,
+            totalBytes: total
+          }),
+        { expectedBytes: plan.size || undefined, minBytes: 1024 * 1024 }
       )
       ready.push({ spec: plan.spec, file })
     } catch (err) {

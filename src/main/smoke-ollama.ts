@@ -33,9 +33,10 @@ async function writeManifest(
   rel: string,
   digest: string,
   size: number,
-  mediaType = 'application/vnd.ollama.image.model'
+  mediaType = 'application/vnd.ollama.image.model',
+  dir = 'manifests'
 ): Promise<void> {
-  const file = path.join(root, 'manifests', rel)
+  const file = path.join(root, dir, rel)
   await fs.mkdir(path.dirname(file), { recursive: true })
   await fs.writeFile(
     file,
@@ -110,7 +111,34 @@ async function main(): Promise<void> {
   scan = await scanOllamaDisk()
   check('没有 model 层的清单不计入', !scan.models.some((m) => m.name === 'adapter-only:1b'))
 
-  // 8. 目录不存在：不是错误，只表示没装过 Ollama
+  // 8. 新布局：Ollama 0.12+ 把清单搬到 manifests-v2，host 也从 registry.ollama.ai 变成 ollama.com
+  await fs.writeFile(path.join(root, 'blobs', 'sha256-dddd4444'), ggufBytes(2048))
+  await writeManifest(root, 'ollama.com/library/qwen3/14b', 'sha256:dddd4444', 2052, undefined, 'manifests-v2')
+  scan = await scanOllamaDisk()
+  const v2 = scan.models.find((m) => m.name === 'qwen3:14b')
+  check('manifests-v2 里的模型也能扫到（老布局同时存在时）', !!v2, scan.models.map((m) => m.name).join(', '))
+  check('manifests-v2 的名字去掉 ollama.com/library 前缀', v2?.name === 'qwen3:14b', String(v2?.name))
+
+  // 同一个模型在两个目录各有一份清单：只能出现一次
+  await writeManifest(root, 'ollama.com/library/qwen3/14b', 'sha256:dddd4444', 2052, undefined, 'manifests')
+  scan = await scanOllamaDisk()
+  check(
+    '新老目录重复的清单只算一个模型',
+    scan.models.filter((m) => m.name === 'qwen3:14b').length === 1,
+    String(scan.models.filter((m) => m.name === 'qwen3:14b').length)
+  )
+
+  // 9. 只有 manifests-v2（全新装的机器就是这个样子）：不能报「没有模型目录」
+  const only = path.join(root, 'v2-only')
+  await fs.mkdir(path.join(only, 'blobs'), { recursive: true })
+  await fs.writeFile(path.join(only, 'blobs', 'sha256-eeee5555'), ggufBytes(512))
+  await writeManifest(only, 'ollama.com/library/llama3.2/3b', 'sha256:eeee5555', 516, undefined, 'manifests-v2')
+  process.env.OLLAMA_MODELS = only
+  scan = await scanOllamaDisk()
+  check('只有 manifests-v2 时 dir 不为 null', scan.dir !== null, String(scan.dir))
+  check('只有 manifests-v2 时也能列出模型', scan.models[0]?.name === 'llama3.2:3b', scan.models.map((m) => m.name).join(', '))
+
+  // 10. 目录不存在：不是错误，只表示没装过 Ollama
   process.env.OLLAMA_MODELS = path.join(root, 'nope')
   scan = await scanOllamaDisk()
   check('目录不存在 → ok 且 dir 为 null', scan.ok && scan.dir === null, String(scan.dir))

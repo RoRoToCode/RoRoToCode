@@ -10,11 +10,17 @@ import os from 'node:os'
  * 共 28G，其中 3 个适合当 coding agent」这个判断就完全给不出来 ——
  * 而它恰恰是本程序最该提供的东西：不抢运行时，抢判断层。
  *
- * Ollama 的存储格式（稳定多年）：
- *   models/manifests/<host>/[<namespace>/]<model>/<tag>   纯 JSON，无扩展名
- *   models/blobs/sha256-<hex>                              实际权重，无扩展名
+ * Ollama 的存储格式：
+ *   models/manifests/<host>/[<namespace>/]<model>/<tag>      纯 JSON，无扩展名（老布局）
+ *   models/manifests-v2/<host>/[<namespace>/]<model>/<tag>   同上（Ollama 0.12 起的新布局）
+ *   models/blobs/sha256-<hex>                                实际权重，无扩展名
  * 清单里的 layers 找一个 mediaType = application/vnd.ollama.image.model 的，
  * 它的 digest 就对应 blobs/sha256-<hex>。
+ *
+ * 为什么两个目录都要扫：新版 Ollama（本机实测 0.13）把清单全搬到 `manifests-v2/`
+ * 并把 host 从 `registry.ollama.ai` 改成 `ollama.com`，老的 `manifests/` 只剩一个空壳。
+ * 只认 `manifests` 会让「装了 Ollama、下了 4.5 GB 模型」的机器得到「目录是空的」，
+ * 于是「已有模型」列表全空、导入下拉里一个都看不到 —— 功能看着就是坏的。
  *
  * 注意 blob 没有 .gguf 后缀，所以按扩展名扫盘的逻辑一律看不见它们 ——
  * 只能靠这里读清单，再校验文件头是不是 GGUF。
@@ -98,6 +104,7 @@ async function listManifests(root: string, depth = 0, out: string[] = []): Promi
  * 清单相对路径 → 模型名。
  * registry.ollama.ai/library/qwen2.5-coder/7b → qwen2.5-coder:7b
  * registry.ollama.ai/someone/mymodel/v2       → someone/mymodel:v2
+ * ollama.com/library/qwen3/14b                → qwen3:14b（新布局）
  */
 function nameFromRel(rel: string): string | null {
   const parts = rel.split(/[\\/]+/).filter(Boolean)
@@ -109,55 +116,66 @@ function nameFromRel(rel: string): string | null {
   return model ? `${model}:${tag}` : null
 }
 
+/** 清单可能躺在这几个目录里（老布局 / 新布局），存在哪个就扫哪个 */
+const MANIFEST_DIRS = ['manifests', 'manifests-v2'] as const
+
 /**
  * 扫一遍本机 Ollama 的模型目录。纯只读，不需要 Ollama 在跑。
  * 目录不存在不是错误 —— 只表示这台机器没装过 Ollama。
  */
 export async function scanOllamaDisk(): Promise<OllamaDiskScan> {
   const root = ollamaModelsRoot()
-  const manifestsDir = path.join(root, 'manifests')
   const blobsDir = path.join(root, 'blobs')
 
-  const exists = await fs
-    .stat(manifestsDir)
-    .then((s) => s.isDirectory())
-    .catch(() => false)
-  if (!exists) {
+  const roots: string[] = []
+  for (const name of MANIFEST_DIRS) {
+    const dir = path.join(root, name)
+    const ok = await fs
+      .stat(dir)
+      .then((s) => s.isDirectory())
+      .catch(() => false)
+    if (ok) roots.push(dir)
+  }
+  if (!roots.length) {
     return { ok: true, dir: null, models: [], message: '没有找到 Ollama 模型目录（可能没装过 Ollama）' }
   }
 
-  const manifests = await listManifests(manifestsDir)
   const models: OllamaDiskModel[] = []
   const seen = new Set<string>()
 
-  for (const file of manifests) {
+  // 老目录在前：它在老版本里是权威来源，新目录只补老目录没有的
+  for (const manifestsDir of roots) {
     if (models.length >= MAX_MODELS) break
-    const rel = path.relative(manifestsDir, file)
-    const name = nameFromRel(rel)
-    if (!name || seen.has(name)) continue
-    try {
-      const st = await fs.stat(file)
-      if (!st.isFile() || st.size > MAX_MANIFEST_BYTES) continue
-      const json = JSON.parse(await fs.readFile(file, 'utf8')) as { layers?: ManifestLayer[] }
-      const layers = Array.isArray(json.layers) ? json.layers : []
-      // 分片模型会有多个 model 层：取最大的那块（llama-server 认不了 Ollama 的 blob
-      // 命名分片，所以这里只保证「能体检、能导入」，不承诺直接分片加载）
-      const modelLayer = layers
-        .filter((l) => l.mediaType === MODEL_MEDIA_TYPE && l.digest)
-        .sort((a, b) => Number(b.size ?? 0) - Number(a.size ?? 0))[0]
-      if (!modelLayer?.digest) continue
-      const blob = path.join(blobsDir, blobNameOf(modelLayer.digest))
-      const bst = await fs.stat(blob).catch(() => null)
-      if (!bst?.isFile()) continue
-      seen.add(name)
-      models.push({
-        name,
-        blob,
-        sizeBytes: bst.size,
-        gguf: await isGgufFile(blob)
-      })
-    } catch {
-      // 单个清单坏了不影响其它模型
+    const manifests = await listManifests(manifestsDir)
+    for (const file of manifests) {
+      if (models.length >= MAX_MODELS) break
+      const rel = path.relative(manifestsDir, file)
+      const name = nameFromRel(rel)
+      if (!name || seen.has(name)) continue
+      try {
+        const st = await fs.stat(file)
+        if (!st.isFile() || st.size > MAX_MANIFEST_BYTES) continue
+        const json = JSON.parse(await fs.readFile(file, 'utf8')) as { layers?: ManifestLayer[] }
+        const layers = Array.isArray(json.layers) ? json.layers : []
+        // 分片模型会有多个 model 层：取最大的那块（llama-server 认不了 Ollama 的 blob
+        // 命名分片，所以这里只保证「能体检、能导入」，不承诺直接分片加载）
+        const modelLayer = layers
+          .filter((l) => l.mediaType === MODEL_MEDIA_TYPE && l.digest)
+          .sort((a, b) => Number(b.size ?? 0) - Number(a.size ?? 0))[0]
+        if (!modelLayer?.digest) continue
+        const blob = path.join(blobsDir, blobNameOf(modelLayer.digest))
+        const bst = await fs.stat(blob).catch(() => null)
+        if (!bst?.isFile()) continue
+        seen.add(name)
+        models.push({
+          name,
+          blob,
+          sizeBytes: bst.size,
+          gguf: await isGgufFile(blob)
+        })
+      } catch {
+        // 单个清单坏了不影响其它模型
+      }
     }
   }
 

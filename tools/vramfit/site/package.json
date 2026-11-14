@@ -1,6 +1,6 @@
 {
   "name": "vramfit-web",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "private": true,
   "description": "vramfit 网页版：纯静态，无后端。解析层复用仓库根的 core/，构建产物在 dist/。",
   "type": "module",

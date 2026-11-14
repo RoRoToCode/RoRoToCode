@@ -8,12 +8,14 @@ import {
   coreRoot,
   detectBackend,
   installLlama,
+  launchKvType,
   llamaInstances,
   llamaServerExe,
   startLlama,
   statusLlama
 } from './llama'
 import { fitForLaunch } from './vramfit'
+import { detectGpuPreference } from './gpuplan'
 import type {
   CorePhase,
   CoreProgress,
@@ -52,6 +54,16 @@ export const CORE_MMPROJ_NAME = 'mmproj-Core.gguf'
 export const CORE_PROVIDER_ID = 'core'
 
 /**
+ * 核心模型专用的本地端口。
+ *
+ * 以前和 llamacpp 一样写死 8080：两条配置指向同一个地址，谁后启动谁占坑，
+ * 另一条的请求就会打到**别人的模型**上（llama-server 不校验 model 名）。
+ * 用户看到的是「明明选的是 9B，回答却像小模型」——最难查的那种错。
+ * 8188 和 llama.cpp / Ollama / LM Studio 的默认端口都不重叠。
+ */
+export const CORE_PORT = 8188
+
+/**
  * 核心模型的下载地址（直链）——**待填**。
  *
  * 留空时这一步会跳过：目录照样建好、llama.cpp 照样装好，只是不下载模型；
@@ -70,6 +82,17 @@ const CORE_MODEL_FILE = ''
 
 /** 正在进行的准备（用于「取消」） */
 let coreAbort: AbortController | null = null
+
+/**
+ * 最近一次准备进度 + 是否还在跑。
+ * 面板切走再回来时靠它把进度条接上：核心准备里最长的一段就是下载，
+ * 它跑在主进程，跟界面在看哪个面板无关。
+ */
+let coreLast: CoreProgress | null = null
+
+export function coreSetupSnapshot(): { running: boolean; progress: CoreProgress | null } {
+  return { running: !!coreAbort, progress: coreLast }
+}
 
 export function cancelCoreSetup(): { ok: boolean; message: string } {
   if (!coreAbort) return { ok: false, message: '当前没有正在进行的准备' }
@@ -122,6 +145,7 @@ export async function setupCore(
 ): Promise<CoreSetupResult> {
   const stepList: CoreStep[] = []
   const emit = (p: CoreProgress) => {
+    coreLast = p
     try {
       onProgress?.(p)
     } catch {
@@ -256,7 +280,20 @@ export async function setupCore(
     emit({ phase: 'llama', message: '正在检查 llama.cpp…' })
     const exe = await llamaServerExe()
     if (exe) {
-      add('llama', 'llama.cpp', 'skip', `已安装：${exe}`)
+      // 老用户机器上可能早就装过 CPU 版：这一步以前只说「已安装」，
+      // 于是明明有显卡也一直跑在 CPU 上。现在把差别说出来并给条路。
+      const cur = await detectBackend()
+      const want = detectGpuPreference()
+      if (cur.backend === 'cpu' && want.preference !== 'cpu') {
+        add(
+          'llama',
+          'llama.cpp',
+          'skip',
+          `已装的是 CPU 版（${want.reason}）：想用显卡，到「② 本地模型 → 一键安装」重装一次即可换成显卡版`
+        )
+      } else {
+        add('llama', 'llama.cpp', 'skip', `已安装：${exe}`)
+      }
     } else {
       const r = await installLlama((p) =>
         emit({
@@ -299,7 +336,13 @@ export async function setupCore(
     }
 
     emit({ phase: 'start', message: `正在体检 ${path.basename(modelFile)}…` })
-    const fit = await fitForLaunch(modelFile).catch(() => null)
+    /**
+     * 核心模型带投影器时也要把它算进预算：发图会挂上，体检漏算就是「一开图就崩」。
+     * 这里重新 stat 一次，不复用上面那个 hasMm —— 它在上一个 if 块里，作用域不到这里。
+     */
+    const coreMm = path.join(dir, CORE_MMPROJ_NAME)
+    const hasCoreMm = await fs.stat(coreMm).then((s) => s.size > 0).catch(() => false)
+    const fit = await fitForLaunch(modelFile, 0, await launchKvType(), hasCoreMm ? coreMm : null).catch(() => null)
     if (fit) checks.fit = fit.summary
 
     emit({ phase: 'start', message: '正在加载核心模型（首次要几十秒）…' })
@@ -346,7 +389,11 @@ export async function setupCore(
     add('check', '自检', 'error', msg)
     return done(false, msg)
   } finally {
-    if (coreAbort === ctrl) coreAbort = null
+    if (coreAbort === ctrl) {
+      coreAbort = null
+      // 跑完就别留旧进度了：面板重新挂载时不会误以为还在准备
+      coreLast = null
+    }
   }
 }
 
@@ -388,7 +435,7 @@ export async function ensureCoreProvider(modelFile: string): Promise<CoreProvide
         id: CORE_PROVIDER_ID,
         name: '核心模型（默认兜底）',
         kind: 'openai',
-        baseUrl: `http://127.0.0.1:8080/v1`,
+        baseUrl: `http://127.0.0.1:${CORE_PORT}/v1`,
         apiKey: 'no-key',
         model,
         contextWindow: 16384,
@@ -471,10 +518,14 @@ async function runEnsureCore(): Promise<CoreReady> {
   // 死掉/僵死的实例在这里被判成 idle 或 error，于是重新拉起 —— 而不是让请求打到死端口。
   let live = ours ? await statusLlama(CORE_PROVIDER_ID) : null
   if (!live || live.state === 'idle' || live.state === 'error') {
-    // 体检只是为了让上下文开得合适；失败也不拦着启动
-    const fit = await fitForLaunch(file).catch(() => null)
+    // 体检只是为了让上下文开得合适；失败也不拦着启动。带投影器时一并算进预算
+    const mmNext = path.join(path.dirname(file), CORE_MMPROJ_NAME)
+    const hasMmNext = await fs.stat(mmNext).then((s) => s.size > 0).catch(() => false)
+    const fit = await fitForLaunch(file, 0, await launchKvType(), hasMmNext ? mmNext : null).catch(() => null)
     const r = await startLlama(file, fit?.recommendedCtx ?? undefined, {
-      providerId: CORE_PROVIDER_ID
+      providerId: CORE_PROVIDER_ID,
+      // 专用端口：和用户自己的 llama.cpp 实例分开，避免两条配置指同一个地址
+      port: CORE_PORT
     })
     if (!r.ok) {
       const tip = /llama-server\.exe/.test(r.message) ? '（兜底要用本机 llama.cpp，先点一次「简易核心」）' : ''

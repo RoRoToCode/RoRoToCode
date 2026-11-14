@@ -1,10 +1,12 @@
 import { t as tr } from '../i18n'
+import { isPlainEnter } from '../keyboard'
 import { useEffect, useMemo, useState } from 'react'
 import type { RemoteSkill, Skill, SkillSource } from '../../shared/types'
+import type { SkillDepReport } from '../../shared/skilldeps'
 
 interface Props {
   onClose: () => void
-  /** 点「使用」：把指令填进输入框 */
+  /** 点「调用」：把指令填进输入框 */
   onUse: (skill: Skill) => void
   notify: (message: string) => void
 }
@@ -35,6 +37,45 @@ export function SkillsPanel({ onClose, onUse, notify }: Props) {
   const [picked, setPicked] = useState<Record<string, boolean>>({})
   const [hubError, setHubError] = useState<string | null>(null)
   const [installing, setInstalling] = useState(false)
+
+  /** 离线技能靠 Python 脚本干活，装之前替用户查一次依赖，别等跑一半才报 ModuleNotFoundError */
+  const [deps, setDeps] = useState<SkillDepReport | null>(null)
+  const [checkingDeps, setCheckingDeps] = useState(false)
+
+  const runDepsCheck = async () => {
+    setCheckingDeps(true)
+    try {
+      setDeps(await window.pico.skills.checkDeps())
+    } catch (err) {
+      setHubError(tr("依赖检查失败：{0}", { "0": (err as Error).message }))
+    } finally {
+      setCheckingDeps(false)
+    }
+  }
+
+  /** 6 个离线技能一次装齐（重复装是覆盖更新）。开关仍默认关，不悄悄占用上下文 */
+  const installOfflinePack = async () => {
+    setInstalling(true)
+    try {
+      const found = await window.pico.skills.scan({ sourceId: 'offline' })
+      if (!found.ok || !found.skills.length) {
+        notify(tr("没读到离线技能包"))
+        return
+      }
+      const r = await window.pico.skills.install(found.skills)
+      setSkills(r.skills)
+      setTab('installed')
+      notify(
+        tr("已装好 {0} 个离线技能。到「已安装」页把要用的打开自动调用开关即可。", {
+          "0": String(found.skills.length)
+        })
+      )
+    } catch (err) {
+      notify(tr("安装离线技能失败：{0}", { "0": (err as Error).message }))
+    } finally {
+      setInstalling(false)
+    }
+  }
 
   useEffect(() => {
     void (async () => {
@@ -71,6 +112,8 @@ export function SkillsPanel({ onClose, onUse, notify }: Props) {
   }, [skills, query])
 
   const mine = filtered.filter((s) => !s.builtin).length
+  /** 打开了自动调用的技能数：面板上要能一眼看出「现在有几个会自动上场」 */
+  const autoCount = skills.filter((s) => s.enabled).length
 
   async function submit() {
     if (!draft || busy) return
@@ -110,6 +153,31 @@ export function SkillsPanel({ onClose, onUse, notify }: Props) {
       setError(tr("删除失败：{0}", { "0": (err as Error).message }))
     } finally {
       setBusy(false)
+    }
+  }
+
+  /**
+   * 开关自动调用。
+   * 先改本地再发请求：这个开关的反馈必须跟手，等一次 IPC 往返再变色会显得卡。
+   * 请求失败就把它翻回去，别让界面停在一个主进程并不知道的状态上。
+   */
+  async function toggle(skill: Skill, next: boolean) {
+    if (busy) return
+    const patch = (on: boolean): void =>
+      setSkills((prev) => prev.map((s) => (s.id === skill.id ? { ...s, enabled: on } : s)))
+    patch(next)
+    setError(null)
+    try {
+      const r = await window.pico.skills.toggle(skill.id, next)
+      setSkills(r.skills)
+      if (!r.ok) {
+        setError(r.message)
+        return
+      }
+      notify(r.message)
+    } catch (err) {
+      patch(!next)
+      setError(tr("切换失败：{0}", { "0": (err as Error).message }))
     }
   }
 
@@ -172,7 +240,7 @@ export function SkillsPanel({ onClose, onUse, notify }: Props) {
           <div className="skills-head-text">
             <h2>{tr("技能")}</h2>
             <span className="skills-sub">
-              {tr("点「使用」填入输入框，再补一句需求即可发送。")}</span>
+              {tr("点「调用」把指令填进输入框；打开开关后，模型在合适的任务里会自己用上它。")}</span>
           </div>
           <button className="icon-btn" onClick={onClose} title={tr("关闭")}>
             {tr("关闭")}</button>
@@ -192,6 +260,12 @@ export function SkillsPanel({ onClose, onUse, notify }: Props) {
             >
               {tr("从 GitHub 获取")}</button>
           </div>
+        )}
+
+        {!draft && tab === 'installed' && (
+          <p className="skills-hint">
+            {tr("刚干完一件漂亮活？在对话里输入 /learn，助手会把这次的操作轨迹蒸馏成一条技能。")}
+          </p>
         )}
 
         {draft ? (
@@ -252,6 +326,7 @@ export function SkillsPanel({ onClose, onUse, notify }: Props) {
               <span className="skills-count">
                 {tr("共")}{skills.length} {tr("个")}{query.trim() ? tr("，匹配 {length} 个", { length: filtered.length }) : ''}
                 {mine > 0 ? tr("（自定义 {mine}）", { mine: mine }) : ''}
+                {autoCount > 0 ? tr("（自动调用 {n}）", { n: autoCount }) : ''}
               </span>
             </div>
 
@@ -277,16 +352,33 @@ export function SkillsPanel({ onClose, onUse, notify }: Props) {
                           {tr("来自")}{s.source}
                         </span>
                       ) : null}
+                      {s.enabled ? <span className="skill-tag auto">{tr("自动")}</span> : null}
                     </div>
                     <div className="skill-desc">{s.desc || s.prompt.slice(0, 48)}</div>
                   </div>
                   <div className="skill-ops">
+                    <span className="skill-toggle">
+                      <button
+                        role="switch"
+                        aria-checked={s.enabled === true}
+                        aria-label={tr("自动调用")}
+                        className={`aset-switch ${s.enabled ? 'on' : ''}`}
+                        title={
+                          s.enabled
+                            ? tr("已开启自动调用：模型在合适的任务里会自己取用这个技能。点击关闭")
+                            : tr("打开后模型能自己调用它（名称和说明会进系统提示）。关闭时只能手动点「调用」")
+                        }
+                        onClick={() => void toggle(s, !s.enabled)}
+                      >
+                        <i />
+                      </button>
+                    </span>
                     <button
                       className="btn primary sm"
                       onClick={() => onUse(s)}
                       title={tr("把这段指令填进输入框")}
                     >
-                      {tr("使用")}</button>
+                      {tr("调用")}</button>
                     {!s.builtin && (
                       <button
                         className="btn sm"
@@ -345,7 +437,7 @@ export function SkillsPanel({ onClose, onUse, notify }: Props) {
                   placeholder={tr("也可以填任意仓库：owner/repo 或 GitHub 链接（会自动找里面的 SKILL.md）")}
                   onChange={(e) => setRepoInput(e.target.value)}
                   onKeyDown={(e) => {
-                    if (e.key === 'Enter' && repoInput.trim()) void runScan({ repo: repoInput })
+                    if (isPlainEnter(e) && repoInput.trim()) void runScan({ repo: repoInput })
                   }}
                 />
                 <button
@@ -358,6 +450,49 @@ export function SkillsPanel({ onClose, onUse, notify }: Props) {
 
               <div className="hub-hint">
                 {tr("技能源是 GitHub 上的仓库，每个")}<code>xxx/SKILL.md</code> {tr("算一个技能。扫描只读文件，装进本地后随时可改可删。")}</div>
+
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginTop: 10 }}>
+                <button className="btn" disabled={checkingDeps} onClick={() => void runDepsCheck()}>
+                  {checkingDeps ? tr("检查中…") : tr("检查本机依赖")}</button>
+                <button className="btn primary" disabled={installing} onClick={() => void installOfflinePack()}>
+                  {installing ? tr("安装中…") : tr("一键装齐离线技能包")}</button>
+                <span className="hub-hint">
+                  {tr("PDF / Word / Excel / PPT 这类离线技能靠 Python 跑，先看缺不缺包。只读检查，不装东西、不联网。")}
+                </span>
+              </div>
+
+              {deps && (
+                <div style={{ marginTop: 8, padding: '8px 10px', border: '1px solid var(--border, #444)', borderRadius: 8 }}>
+                  <div className={deps.ok ? 'hub-hint' : 'hub-error'}>{tr(deps.message)}</div>
+                  {deps.installCmd && (
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, margin: '8px 0' }}>
+                      <code style={{ flex: 1, overflowWrap: 'anywhere' }}>{deps.installCmd}</code>
+                      <button
+                        className="btn"
+                        onClick={() => {
+                          void navigator.clipboard
+                            ?.writeText(deps.installCmd)
+                            .then(() => notify(tr("已复制安装命令")))
+                            .catch(() => notify(tr("复制失败，请手动选中这行命令")))
+                        }}
+                      >
+                        {tr("复制")}</button>
+                    </div>
+                  )}
+                  <div style={{ display: 'grid', gap: 4 }}>
+                    {deps.items.map((it) => (
+                      <div key={it.skill} className="hub-hint" style={{ display: 'flex', gap: 8 }}>
+                        <span style={{ minWidth: 110 }}>{tr(it.skill)}</span>
+                        <span>
+                          {it.ok
+                            ? tr("依赖齐备")
+                            : tr("缺 {0}", { "0": it.missing.join('、') || tr("Python") })}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
 
               {scanning && <div className="skill-empty">{tr("正在从 GitHub 读取技能清单…（技能多的仓库要十几秒）")}</div>}
               {!scanning && !scan && !hubError && (

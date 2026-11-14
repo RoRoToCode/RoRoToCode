@@ -1,6 +1,7 @@
 import { t as tr } from '../i18n'
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import type { ChangeDetail, FileChange } from '../../shared/types'
+import { diffHunks } from '../../shared/hunks'
 import { DiffView } from './DiffView'
 
 interface Props {
@@ -21,6 +22,10 @@ export function ChangesPanel({ sessionId, refreshKey, onNotify, onReverted }: Pr
   const [openId, setOpenId] = useState<string | null>(null)
   const [detail, setDetail] = useState<ChangeDetail | null>(null)
   const [busy, setBusy] = useState(false)
+  /** 选中的块（hunk）：默认全选，取消勾选 = 这处改动不要 */
+  const [keep, setKeep] = useState<Set<number>>(new Set())
+
+  const hunks = useMemo(() => (detail ? diffHunks(detail.lines) : []), [detail])
 
   useEffect(() => {
     let alive = true
@@ -47,9 +52,39 @@ export function ChangesPanel({ sessionId, refreshKey, onNotify, onReverted }: Pr
     }
     setOpenId(id)
     setDetail(null)
+    setKeep(new Set())
     if (!sessionId) return
     const d = await window.pico.changes.detail(sessionId, id)
+    /**
+     * detail 返回 null 表示记录已经不在了（另一个窗口撤销过、或回收站被清空）。
+     * 以前这里直接 setDetail(null)，渲染分支永远停在「正在读取改动…」。
+     */
+    if (!d) {
+      setOpenId(null)
+      onNotify(tr("这条改动记录已经不存在了"), 'warn')
+      return
+    }
     setDetail(d)
+    setKeep(new Set(diffHunks(d.lines).map((h) => h.id)))
+  }
+
+  /** 只保留勾选的块：把没勾的那些改动从文件里摘掉 */
+  async function applySelected(id: string) {
+    if (!sessionId) return
+    setBusy(true)
+    try {
+      const r = await window.pico.changes.applyHunks(sessionId, id, [...keep])
+      onNotify(r.message, r.ok ? 'info' : 'error')
+      if (r.ok) {
+        const d = await window.pico.changes.detail(sessionId, id)
+        setDetail(d)
+        if (d) setKeep(new Set(diffHunks(d.lines).map((h) => h.id)))
+        setList(await window.pico.changes.list(sessionId))
+        onReverted?.()
+      }
+    } finally {
+      setBusy(false)
+    }
   }
 
   async function revertOne(id: string) {
@@ -124,6 +159,46 @@ export function ChangesPanel({ sessionId, refreshKey, onNotify, onReverted }: Pr
                     <div className="panel-empty">{tr("正在读取改动…")}</div>
                   )}
                   <div className="change-actions">
+                    {/* 一次改了好几处时，允许只保留其中几块 */}
+                    {hunks.length > 1 && (
+                      <div className="hunk-picks">
+                        {hunks.map((h) => {
+                          const on = keep.has(h.id)
+                          return (
+                            <button
+                              key={h.id}
+                              className={`hunk-chip ${on ? 'on' : ''}`}
+                              title={tr("第 {n} 处：+{add} −{del}（点一下切换保留/丢弃）", {
+                                n: String(h.id + 1),
+                                add: String(h.added),
+                                del: String(h.removed)
+                              })}
+                              onClick={() => {
+                                setKeep((prev) => {
+                                  const next = new Set(prev)
+                                  if (next.has(h.id)) next.delete(h.id)
+                                  else next.add(h.id)
+                                  return next
+                                })
+                              }}
+                            >
+                              {tr("块")}
+                              {h.id + 1}
+                              <em className="add">+{h.added}</em>
+                              <em className="del">−{h.removed}</em>
+                            </button>
+                          )
+                        })}
+                        <button
+                          className="btn sm"
+                          disabled={busy || keep.size === hunks.length}
+                          title={tr("把没勾选的块从文件里摘掉")}
+                          onClick={() => void applySelected(c.id)}
+                        >
+                          {tr("只保留勾选")}
+                        </button>
+                      </div>
+                    )}
                     <button
                       className="btn sm"
                       disabled={busy || detail?.revertable === false}

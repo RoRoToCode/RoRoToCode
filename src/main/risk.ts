@@ -91,6 +91,9 @@ export function resourceCandidates(tool: string, args: Record<string, unknown>):
     }
     return out
   }
+  if (tool === 'git' || tool === 'format') {
+    return Array.isArray(args.paths) ? (args.paths as unknown[]).map(String) : []
+  }
   return []
 }
 
@@ -277,16 +280,68 @@ export function classifyRisk(
     if (custom === 'allow') return null
     return { kind: 'write', reason: '修改文件', high: false }
   }
-  if (tool === 'read_file' || tool === 'list_dir' || tool === 'grep') {
+  if (tool === 'read_file' || tool === 'list_dir' || tool === 'grep' || tool === 'goto_definition' || tool === 'find_references' || tool === 'repo_map') {
     const p = String(args.path ?? '.')
     if (isOutside(workspace, p)) return { kind: 'outside', reason: '访问工作区之外的内容', high: true }
     return null
   }
-  // 联网工具只发 GET、不改本机文件，算只读；抓取历史里也会留卡片，用户可随时取消
-  if (tool === 'web_search' || tool === 'web_fetch' || tool === 'update_todos' || tool === 'remember') {
+  if (tool === 'terminal') {
+    const action = String(args.action ?? '')
+    // open 是这次交互的唯一同意点：终端里后续输入不会逐条弹窗（否则没法用），
+    // 所以开终端本身必须让人看到一次。read/list/close 无副作用。
+    if (action === 'open') {
+      return { kind: 'shell', reason: '打开交互式终端（终端内输入的命令不再逐条确认）', high: true }
+    }
+    if (action === 'write') return { kind: 'shell', reason: '向终端发送输入', high: false }
     return null
   }
-  return null
+  if (tool === 'git') {
+    const action = String(args.action ?? '')
+    if (action === 'push' || action === 'pull' || action === 'pr') {
+      return { kind: 'network', reason: `git ${action} 需要访问网络`, high: true }
+    }
+    if (action === 'status' || action === 'diff' || action === 'log' || action === 'branches') return null
+    if (action === 'undo') return { kind: 'write', reason: '撤销最近提交（soft，改动保留）', high: false }
+    if (custom === 'allow') return null
+    return { kind: 'write', reason: `git ${action} 修改仓库`, high: false }
+  }
+  if (tool === 'format') {
+    const paths = Array.isArray(args.paths) ? (args.paths as unknown[]).map(String) : []
+    for (const p of paths) {
+      if (isOutside(workspace, p)) {
+        return { kind: 'outside', reason: `格式化工作区之外的文件 ${p}`, high: true }
+      }
+    }
+    if (custom === 'allow') return null
+    return { kind: 'write', reason: '格式化文件', high: false }
+  }
+  // 联网工具只发 GET、不改本机文件，算只读；抓取历史里也会留卡片，用户可随时取消
+  // board / scratch 只写 userData 下的一页便签，不碰工作区文件
+  // task 只是起子 agent，它调的每个工具各自还要过一遍这里
+  // handoff / question / use_skill / write_plan 都只改本程序的会话数据，不碰工作区
+  if (
+    tool === 'web_search' ||
+    tool === 'web_fetch' ||
+    tool === 'update_todos' ||
+    tool === 'remember' ||
+    tool === 'board' ||
+    tool === 'scratch' ||
+    tool === 'task' ||
+    tool === 'handoff' ||
+    tool === 'question' ||
+    tool === 'use_skill' ||
+    tool === 'write_plan'
+  ) {
+    return null
+  }
+  /**
+   * 没登记过的工具一律按高危处理。
+   *
+   * 这里以前是 `return null`（默认放行）：新加一个工具、忘了在上面补风险判定，
+   * 它就会绕过审批直接执行 —— 而这种遗漏是静默的，谁也不会发现。
+   * 默认收紧之后，漏登记的代价只是多弹一次确认框，而不是「悄悄执行了」。
+   */
+  return { kind: 'shell', reason: `未登记风险等级的工具 ${tool}`, high: true }
 }
 
 /**

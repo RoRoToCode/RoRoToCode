@@ -1,7 +1,9 @@
 import { t as tr } from '../i18n'
 import { useEffect, useRef, useState, type ReactNode } from 'react'
-import type { AppConfig, AppInfo, ApprovalMode, McpServerStatus, PermissionRule, PermRuleWithSource, ProviderConfig, ThemeKey, TrashEntry } from '../../shared/types'
+import type { AppConfig, AppInfo, ApprovalGrant, ApprovalMode, CloseAction, McpServerStatus, PermissionRule, PermRuleWithSource, ProviderConfig, ThemeKey, TrashEntry } from '../../shared/types'
 import { isLlamaProvider } from '../../shared/providers'
+import { partialModeOf } from '../../shared/ctxtune'
+import { fmtTokens } from '../../shared/pricing'
 import {
   applyFontScale,
   applyTheme,
@@ -22,6 +24,8 @@ interface Props {
   onSave: (config: AppConfig) => Promise<void>
   onClose: () => void
   notify: (text: string) => void
+  /** 打开 Agent 档案面板（会先关掉软件设置，避免两层弹窗叠在一起） */
+  onOpenAgents: () => void
 }
 
 const ZOOMS = [0.8, 0.9, 1, 1.1, 1.25, 1.5]
@@ -52,7 +56,27 @@ const ctxLabel = (n: number) => (n >= 1024 ? `${Math.round(n / 1024)}K` : String
 const APPROVALS: Array<{ key: ApprovalMode; label: string; desc: string }> = [
   { key: 'ask', get label() { return tr("每次询问") }, get desc() { return tr("写文件、删东西、跑命令前都先弹确认") } },
   { key: 'auto', get label() { return tr("自动执行") }, get desc() { return tr("不再逐条确认，速度快但风险高；删除、越界、外部工具仍会拦住") } },
-  { key: 'readonly', get label() { return tr("只读模式") }, get desc() { return tr("只许查看和搜索：写文件、跑命令、联网一律拒绝") } }
+  { key: 'readonly', get label() { return tr("只读模式") }, get desc() { return tr("只许查看和搜索：写文件、跑命令、联网一律拒绝") } },
+  { key: 'plan', get label() { return tr("计划模式") }, get desc() { return tr("只读代码，先写一份方案；你点「批准并执行」之后才允许改文件") } }
+]
+
+/** 右上角 × 的三种行为：后台常驻 / 最小化 / 真退出 */
+const CLOSE_ACTIONS: Array<{ key: CloseAction; label: string; desc: string }> = [
+  {
+    key: 'tray',
+    get label() { return tr("收进托盘，后台继续跑") },
+    get desc() { return tr("窗口消失但程序还在：正在跑的对话不会断，点右下角托盘图标就能回来") }
+  },
+  {
+    key: 'minimize',
+    get label() { return tr("最小化到任务栏") },
+    get desc() { return tr("和系统其它窗口一样缩到任务栏，点一下图标恢复") }
+  },
+  {
+    key: 'quit',
+    get label() { return tr("直接退出程序") },
+    get desc() { return tr("关掉窗口就退出，正在跑的任务会中断，本地模型也会卸载释放显存") }
+  }
 ]
 
 /**
@@ -70,7 +94,7 @@ function Sec({
   summary?: string
   children: ReactNode
 }) {
-  const [open, toggle] = useCollapse(`aset-${id}`)
+  const [open, toggle] = useCollapse(`aset-${id}`, false)
   return (
     <section className={`aset-sec ${open ? '' : 'folded'}`}>
       <button
@@ -102,8 +126,8 @@ function fmtTime(ts: number): string {
   }
 }
 
-/** 软件设置：外观、工作区、审批、数据目录、关于。跟模型无关的东西都放这里。 */
-export function AppSettings({ config, onSave, onClose, notify }: Props) {
+/** 软件设置：外观、工作区、审批、Agent 档案、数据目录、关于。跟模型无关的东西都放这里。 */
+export function AppSettings({ config, onSave, onClose, notify, onOpenAgents }: Props) {
   const [draft, setDraft] = useState<AppConfig>(() => ({
     ...config,
     contextLimit: config.contextLimit === true,
@@ -111,9 +135,25 @@ export function AppSettings({ config, onSave, onClose, notify }: Props) {
     autoCompact: config.autoCompact !== false,
     autoVerify: config.autoVerify !== false,
     webSearch: config.webSearch !== false,
-    memory: config.memory !== false
+    memory: config.memory !== false,
+    tokenLimitPerRun: config.tokenLimitPerRun ?? 0,
+    tokenLimitPerDay: config.tokenLimitPerDay ?? 0
   }))
   const [info, setInfo] = useState<AppInfo | null>(null)
+  /** 今日已用 token：拿不到就显示 null，不编数字 */
+  const [todayUsed, setTodayUsed] = useState<number | null>(null)
+  /** 常驻 Agent 档案数量：只为设置页的摘要服务，读不到就显示「—」 */
+  const [agentCount, setAgentCount] = useState<number | null>(null)
+  useEffect(() => {
+    void window.pico.quota
+      .today()
+      .then((r) => setTodayUsed(r.used))
+      .catch(() => undefined)
+    void window.pico.agents
+      .list()
+      .then((list) => setAgentCount(list.length))
+      .catch(() => setAgentCount(null))
+  }, [])
   const [mem, setMem] = useState<{ path: string; items: number; chars: number } | null>(null)
   const [instr, setInstr] = useState<{ path: string | null; text: string; truncated: boolean; name: string | null } | null>(null)
   /** 项目级权限规则（roroto.json 的 permissions）：带来源标注的规则 + 来源文件列表 */
@@ -128,6 +168,8 @@ export function AppSettings({ config, onSave, onClose, notify }: Props) {
   })
   const [zoom, setZoom] = useState(1)
   const [theme, setTheme] = useState<ThemeKey>(storedTheme())
+  /** 点右上角 × 时做什么，立刻生效（不用等「保存」） */
+  const [closeAction, setCloseAction] = useState<CloseAction>('tray')
   /** 字号：ui 管所有界面文字，chat 为 null 时对话正文跟着 ui 走 */
   const initialFont = useRef(storedFontScale()).current
   const [fontScale, setFontScale] = useState(initialFont.ui)
@@ -178,6 +220,23 @@ export function AppSettings({ config, onSave, onClose, notify }: Props) {
     }
   }
 
+  /** 清空回收站：一次确认，一条不留 */
+  async function purgeAllTrash() {
+    const n = trash?.length ?? 0
+    if (!n) return
+    if (!window.confirm(tr("永久删除回收站里的全部 {n} 条会话？删除后无法恢复。", { n: String(n) }))) return
+    setTrashBusy(true)
+    try {
+      const removed = await window.pico.sessions.purgeAllTrash()
+      await loadTrash()
+      notify(tr("已永久删除 {n} 条会话", { n: String(removed) }))
+    } catch (err) {
+      notify(tr("删除失败：{0}", { "0": (err as Error).message }))
+    } finally {
+      setTrashBusy(false)
+    }
+  }
+
   useEffect(() => {
     let alive = true
     void (async () => {
@@ -207,6 +266,7 @@ export function AppSettings({ config, onSave, onClose, notify }: Props) {
           })
           .catch(() => undefined)
         setZoom(p.zoom)
+        setCloseAction(p.closeAction ?? 'tray')
         // 主进程里的记录为准（换过机器 / 清了 localStorage 时靠它恢复）
         if (isTheme(p.theme)) {
           setTheme(p.theme)
@@ -264,6 +324,18 @@ export function AppSettings({ config, onSave, onClose, notify }: Props) {
       setZoom(p.zoom)
     } catch (err) {
       notify(tr("缩放失败：{0}", { "0": (err as Error).message }))
+    }
+  }
+
+  /** 关闭按钮行为：点了立刻写盘，主进程的 close 处理马上按新规则走 */
+  async function changeCloseAction(next: CloseAction) {
+    const prev = closeAction
+    setCloseAction(next)
+    try {
+      await window.pico.app.setPrefs({ closeAction: next })
+    } catch (err) {
+      setCloseAction(prev)
+      notify(tr("保存失败：{0}", { "0": (err as Error).message }))
     }
   }
 
@@ -395,6 +467,7 @@ export function AppSettings({ config, onSave, onClose, notify }: Props) {
 
   const themeLabel = THEMES.find((t) => t.key === theme)?.label ?? tr("默认")
   const approvalLabel = APPROVALS.find((a) => a.key === draft.approvalMode)?.label ?? tr("每次询问")
+  const closeLabel = CLOSE_ACTIONS.find((c) => c.key === closeAction)?.label ?? tr("收进托盘，后台继续跑")
   const dirShort = draft.workspace ? draft.workspace.split(/[\\/]/).filter(Boolean).pop() ?? draft.workspace : tr("默认")
 
   return (
@@ -529,6 +602,28 @@ export function AppSettings({ config, onSave, onClose, notify }: Props) {
             </div>
           </Sec>
 
+          <Sec id="window" title={tr("关闭窗口")} summary={closeLabel}>
+            <div className="aset-radios">
+              {CLOSE_ACTIONS.map((a) => (
+                <label key={a.key} className={`aset-radio ${closeAction === a.key ? 'on' : ''}`}>
+                  <input
+                    type="radio"
+                    name="closeAction"
+                    checked={closeAction === a.key}
+                    onChange={() => void changeCloseAction(a.key)}
+                  />
+                  <span className="aset-radio-main">
+                    <b>{a.label}</b>
+                    <span>{a.desc}</span>
+                  </span>
+                </label>
+              ))}
+            </div>
+            <p className="aset-hint">
+              {tr("默认收进托盘：点右上角 × 不会掐断正在跑的对话，托盘图标才是真正的退出入口。")}
+            </p>
+          </Sec>
+
           <Sec id="workspace" title={tr("工作区")} summary={dirShort}>
             <div className="aset-row">
               <span className="aset-label">{tr("默认目录")}</span>
@@ -579,6 +674,8 @@ export function AppSettings({ config, onSave, onClose, notify }: Props) {
             </div>
             <p className="aset-hint">{tr("一次提问最多连续做多少步（读文件、改代码、跑命令），5～100。")}</p>
 
+            <GrantList />
+
             <label className="aset-check">
               <input
                 type="checkbox"
@@ -591,6 +688,48 @@ export function AppSettings({ config, onSave, onClose, notify }: Props) {
                   {tr("计划没做完、或助手只说不动手，就自动再推一轮；做完才交回控制权。")}</span>
               </span>
             </label>
+
+            <label className="aset-check">
+              <input
+                type="checkbox"
+                checked={draft.trustWorkspaceHooks === true}
+                onChange={(e) => setDraft((d) => ({ ...d, trustWorkspaceHooks: e.target.checked }))}
+              />
+              <span className="aset-check-main">
+                <b>{tr("执行工作区里的钩子")}</b>
+                <span>
+                  {tr("项目里的 .roroto/hooks.json 是随仓库走的脚本，打开后会在开新对话、上下文中自动执行。只在你信任这个仓库时开启。")}</span>
+              </span>
+            </label>
+
+            <div className="aset-row">
+              <span className="aset-label">{tr("单次 token 上限")}</span>
+              <input
+                className="aset-num"
+                type="number"
+                min={0}
+                step={1000}
+                value={draft.tokenLimitPerRun ?? 0}
+                onChange={(e) => setDraft((d) => ({ ...d, tokenLimitPerRun: Math.max(0, Number(e.target.value) || 0) }))}
+              />
+              <span className="aset-unit">{tr("token")}</span>
+            </div>
+            <div className="aset-row">
+              <span className="aset-label">{tr("每日 token 上限")}</span>
+              <input
+                className="aset-num"
+                type="number"
+                min={0}
+                step={10000}
+                value={draft.tokenLimitPerDay ?? 0}
+                onChange={(e) => setDraft((d) => ({ ...d, tokenLimitPerDay: Math.max(0, Number(e.target.value) || 0) }))}
+              />
+              <span className="aset-unit">{tr("token")}</span>
+            </div>
+            <p className="aset-hint">
+              {tr("填 0 表示不限。撞上限时会先问你一句，不会直接掐断；定时任务没人可问，撞上就停。")}
+              {todayUsed !== null ? ` ${tr("今日已用 {0} token", { "0": fmtTokens(todayUsed) })}` : ''}
+            </p>
           </Sec>
 
           <Sec
@@ -627,6 +766,32 @@ export function AppSettings({ config, onSave, onClose, notify }: Props) {
             <label className="aset-check">
               <input
                 type="checkbox"
+                checked={draft.diagnoseOnWrite !== false}
+                onChange={(e) => setDraft((d) => ({ ...d, diagnoseOnWrite: e.target.checked }))}
+              />
+              <span className="aset-check-main">
+                <b>{tr("改完立刻查编译")}</b>
+                <span>
+                  {tr("每写完一个文件就检查一次：TS/JS 走 tsserver，Python/Go/Rust/Java 跑项目自带的检查命令，错误当场回给模型。")}</span>
+              </span>
+            </label>
+
+            <label className="aset-check">
+              <input
+                type="checkbox"
+                checked={draft.formatOnWrite !== false}
+                onChange={(e) => setDraft((d) => ({ ...d, formatOnWrite: e.target.checked }))}
+              />
+              <span className="aset-check-main">
+                <b>{tr("写完自动格式化")}</b>
+                <span>
+                  {tr("用项目里已装的 prettier / gofmt / ruff / rustfmt 对齐刚改过的文件；没装就跳过，不会联网安装。")}</span>
+              </span>
+            </label>
+
+            <label className="aset-check">
+              <input
+                type="checkbox"
                 checked={draft.memory !== false}
                 onChange={(e) => setDraft((d) => ({ ...d, memory: e.target.checked }))}
               />
@@ -646,7 +811,7 @@ export function AppSettings({ config, onSave, onClose, notify }: Props) {
             summary={
               draft.contextLimit
                 ? tr("上限 {0} · {1}", { "0": ctxLabel(draft.contextWindow), "1": draft.autoCompact !== false ? tr("自动压缩") : tr("不压缩") })
-                : tr("不限制 · {0}", { "0": draft.autoCompact !== false ? tr("自动压缩") : tr("不压缩") })
+                : tr("自动分配 · {0}", { "0": draft.autoCompact !== false ? tr("自动压缩") : tr("不压缩") })
             }
           >
             <div className="aset-row">
@@ -655,14 +820,14 @@ export function AppSettings({ config, onSave, onClose, notify }: Props) {
                 role="switch"
                 aria-checked={draft.contextLimit === true}
                 className={`aset-switch ${draft.contextLimit ? 'on' : ''}`}
-                title={draft.contextLimit ? tr("点击改为不限制") : tr("点击设置上限")}
+                title={draft.contextLimit ? tr("点击改为自动分配") : tr("点击设置上限")}
                 onClick={() => setDraft((d) => ({ ...d, contextLimit: !d.contextLimit }))}
               >
                 <i />
               </button>
             </div>
             <p className="aset-hint">
-              {tr("默认不限制，直到窗口装不下；开启只为省显存和 token。")}</p>
+              {tr("自动分配＝每个模型用自己声明的窗口（llama.cpp 启动时的 -c 就是它）；开启后统一压到下面的上限。两者都不会超过模型自身的窗口。")}</p>
 
             <div className={`aset-row ${draft.contextLimit ? '' : 'off'}`} style={{ marginTop: 12 }}>
               <span className="aset-label">{tr("上限值")}</span>
@@ -685,6 +850,49 @@ export function AppSettings({ config, onSave, onClose, notify }: Props) {
                 {tr("越大记得越多也越占显存（7B 每 1K tokens 约 60MB）。llama.cpp 按此上限启动。")}
               </p>
             )}
+
+            {/*
+              分层加载：默认「自动」—— 装不下的模型才拆层，装得下的模型完全不受影响。
+              以前是个复选框（开/关全局），界面永远显示「开」，用户看不出自己的模型会不会被拆层。
+            */}
+            <div className="aset-row" style={{ marginTop: 12 }}>
+              <span className="aset-label">{tr("显存不够时按层分担")}</span>
+              <div className="aset-zooms">
+                {([
+                  ['auto', tr("自动")],
+                  ['on', tr("总是")],
+                  ['off', tr("关")]
+                ] as const).map(([m, label]) => (
+                  <button
+                    key={m}
+                    className={`aset-zoom ${
+                      partialModeOf({ mode: draft.llamaPartialOffloadMode, enabled: draft.llamaPartialOffload }) === m
+                        ? 'on'
+                        : ''
+                    }`}
+                    onClick={() =>
+                      setDraft((d) => ({
+                        ...d,
+                        llamaPartialOffloadMode: m,
+                        // 同步旧字段：降级回旧版本时「关」不会被读成「开」
+                        llamaPartialOffload: m !== 'off'
+                      }))
+                    }
+                    title={
+                      m === 'auto'
+                        ? tr("推荐：模型装不下显存时才分层，装得下的模型全放显存")
+                        : m === 'on'
+                          ? tr("即使体检说装得下也允许分层（用于估算偏乐观的模型）")
+                          : tr("禁用分层：装不下直接报错")
+                    }
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <p className="aset-hint">
+              {tr("自动：整模型装不进显存时，才把一部分层留在内存由 CPU 算（能启动但明显变慢，8G 卡跑 14B 约 4 tok/s）；装得下的模型全部放显存，速度不受影响。关掉则装不下直接报错。")}</p>
 
             <label className="aset-check">
               <input
@@ -715,6 +923,28 @@ export function AppSettings({ config, onSave, onClose, notify }: Props) {
             </div>
             <p className="aset-hint">
               {tr("llama.cpp 同时处理几个请求。子代理并行时调 2 以上；不改就按显存自动。")}</p>
+
+            <div className="aset-row" style={{ marginTop: 12 }}>
+              <span className="aset-label">{tr("空闲卸载")}</span>
+              <div className="aset-zooms">
+                {[0, 5, 10, 30, 60].map((m) => (
+                  <button
+                    key={m}
+                    className={`aset-zoom ${(draft.llamaIdleMin ?? 10) === m ? 'on' : ''}`}
+                    onClick={() => setDraft((d) => ({ ...d, llamaIdleMin: m }))}
+                    title={
+                      m
+                        ? tr("闲置 {0} 分钟后释放显存，下次发消息自动重新加载", { "0": String(m) })
+                        : tr("一直常驻，不自动释放显存")
+                    }
+                  >
+                    {m ? tr("{0} 分钟", { "0": String(m) }) : tr("不卸载")}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <p className="aset-hint">
+              {tr("闲置到点就停掉本机 llama.cpp 并释放显存；下次发消息用同样的模型和窗口自动加载（几秒到十几秒）。Ollama / LM Studio 由它们自己管，不受影响。")}</p>
           </Sec>
 
           <Sec
@@ -779,6 +1009,21 @@ export function AppSettings({ config, onSave, onClose, notify }: Props) {
                   </span>
                 </div>
               ))}
+            </div>
+          </Sec>
+
+          {/* 常驻 Agent / 定时任务是可选高级功能：默认不用配置，入口从侧栏收进这里 */}
+          <Sec
+            id="agents"
+            title={tr("Agent 档案")}
+            summary={agentCount === null ? '—' : tr("{n} 个档案", { n: agentCount })}
+          >
+            <p className="aset-hint">
+              {tr("常驻 Agent 档案、独立记忆和定时任务是可选功能，日常对话不需要配置；需要时在这里新建与管理。")}
+            </p>
+            <div className="aset-actions">
+              <button className="btn sm" onClick={onOpenAgents}>
+                {tr("管理 Agent 档案")}</button>
             </div>
           </Sec>
 
@@ -917,6 +1162,14 @@ export function AppSettings({ config, onSave, onClose, notify }: Props) {
                 {tr("没有已删除的会话；这里保留 7 天，超期自动清理。")}</p>
             )}
             {trash && trash.length > 0 && (
+              <div className="trash-bar">
+                <span className="aset-hint">
+                  {tr("保留 7 天后自动清理；永久删除后无法恢复。")}</span>
+                <button className="btn sm danger" disabled={trashBusy} onClick={() => void purgeAllTrash()}>
+                  {tr("全部删除")}</button>
+              </div>
+            )}
+            {trash && trash.length > 0 && (
               <div className="trash-list">
                 {trash.map((t) => (
                   <div className="trash-item" key={t.file}>
@@ -988,6 +1241,62 @@ export function AppSettings({ config, onSave, onClose, notify }: Props) {
           </div>
         </div>
       </div>
+    </div>
+  )
+}
+
+/**
+ * 「以后都这样」的长期授权列表。
+ *
+ * 必须列出来并且能撤：一个看不见的长期授权，等于审批被关掉了却没人知道。
+ * 这里只会有非高危工具 —— 高危操作的「记住」不落盘，每次都会照常来问。
+ */
+function GrantList() {
+  const [items, setItems] = useState<ApprovalGrant[]>([])
+  const refresh = async (): Promise<void> => {
+    setItems(await window.pico.approvals.list().catch(() => []))
+  }
+  useEffect(() => {
+    void refresh()
+  }, [])
+
+  if (items.length === 0) return null
+  return (
+    <div className="aset-grants">
+      <div className="aset-grants-head">
+        <span className="aset-label">{tr("已长期允许 · {n} 个工具", { n: items.length })}</span>
+        <button
+          className="btn sm"
+          onClick={async () => {
+            await window.pico.approvals.clear()
+            await refresh()
+          }}
+        >
+          {tr("全部撤销")}
+        </button>
+      </div>
+      <ul className="aset-grant-list">
+        {items.map((g) => (
+          <li key={`${g.workspace}|${g.tool}`}>
+            <code>{g.tool}</code>
+            <span className="aset-grant-ws" title={g.workspace}>
+              {g.workspace.split(/[\\/]/).filter(Boolean).pop() ?? g.workspace}
+            </span>
+            <button
+              className="btn sm"
+              onClick={async () => {
+                await window.pico.approvals.revoke(g.workspace, g.tool)
+                await refresh()
+              }}
+            >
+              {tr("撤销")}
+            </button>
+          </li>
+        ))}
+      </ul>
+      <p className="aset-hint">
+        {tr("高危操作（删除、越界写盘、外部 MCP）不会出现在这里：它们每次都会问一遍。")}
+      </p>
     </div>
   )
 }

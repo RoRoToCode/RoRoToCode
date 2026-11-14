@@ -88,6 +88,18 @@ const norm = (s: string) => s.toLowerCase().replace(/\(r\)|\(tm\)|nvidia|geforce
 /** 虚拟显示器 / 远程桌面显卡没有推理价值，过滤掉（如向日葵、ToDesk、Parsec） */
 const VIRTUAL_GPU = /idd|indirect display|basic display|virtual|mirror|parsec|sunlogin|todesk|oray|remote/i
 
+/**
+ * 只取显卡名字（按显存从大到小）。
+ *
+ * 给「现在跑在哪张卡上」这类展示做兜底：Ollama 的日志读不到时才用它，
+ * 所以只跑最轻的 nvidia-smi，不碰 PowerShell（那一路要 1~2 秒）。
+ */
+export function gpuNames(): string[] {
+  return queryNvidia()
+    .filter((g) => !VIRTUAL_GPU.test(g.name))
+    .map((g) => g.name)
+}
+
 /** PowerShell 5.1 的单元素数组会序列化成对象而非数组，这里统一成数组 */
 function asArray<T>(v: T | T[] | undefined | null): T[] {
   if (v === undefined || v === null) return []

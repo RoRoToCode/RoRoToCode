@@ -3,7 +3,8 @@ import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import crypto from 'node:crypto'
 import type { ChatMessage, Session, SessionHit, SessionMeta, TokenUsage, TrashEntry } from '../shared/types'
-import { titleAfterTurnDelete, turnRangeOf } from '../shared/turns'
+import { titleAfterTurnDelete, trimDanglingTail, turnRangeOf } from '../shared/turns'
+import { searchHit } from '../shared/sessionhit'
 
 async function exists(p: string): Promise<boolean> {
   try {
@@ -36,11 +37,18 @@ export async function listSessions(): Promise<SessionMeta[]> {
     try {
       const raw = await fs.readFile(path.join(dir(), name), 'utf8')
       const s = JSON.parse(raw) as Session
+      // 没有 id 的文件定位不到、点开也是空白，直接跳过；title 缺失给个占位
+      if (!s || typeof s.id !== 'string' || !s.id) continue
       out.push({
         id: s.id,
-        title: s.title,
+        title: typeof s.title === 'string' && s.title ? s.title : '未命名会话',
         workspace: s.workspace ?? null,
         modelId: s.modelId ?? null,
+        modelOverride: s.modelOverride ?? null,
+        agentId: s.agentId ?? null,
+        modeOverride: s.modeOverride ?? null,
+        plan: s.plan ?? null,
+        ...(s.forkedFrom ? { forkedFrom: s.forkedFrom } : {}),
         createdAt: s.createdAt,
         updatedAt: s.updatedAt
       })
@@ -51,18 +59,68 @@ export async function listSessions(): Promise<SessionMeta[]> {
   return out.sort((a, b) => b.updatedAt - a.updatedAt)
 }
 
-export async function createSession(workspace: string | null = null): Promise<Session> {
+/**
+ * 新建会话。agentId 一旦写入就不再变：记忆命名空间和工具白名单都跟着它走，
+ * 中途换档案等于换人，历史会变得没法解释。
+ */
+export async function createSession(
+  workspace: string | null = null,
+  agentId: string | null = null,
+  modelId: string | null = null
+): Promise<Session> {
   const now = Date.now()
   const session: Session = {
     id: newId(),
     title: '新会话',
     workspace,
+    ...(agentId ? { agentId } : {}),
+    ...(modelId ? { modelId } : {}),
     createdAt: now,
     updatedAt: now,
     messages: []
   }
   await persist(session)
   return session
+}
+
+/**
+ * 从某个会话分叉出一条新会话：把切点之前的历史原样带过去，原会话一个字不动。
+ *
+ * 用它的场景和「编辑重发」不一样：重发是把当前这条路改掉（后面的回答全丢），
+ * 分叉是「这条路先留着，我从这儿试着走另一条」。所以两条会话之后完全独立，
+ * 删哪边都不影响另一边。
+ *
+ * messageId 省略表示复制整段历史。切点落在「助手喊了工具、结果还没回来」的位置时，
+ * 尾部那几条会被剪掉 —— 带着没有结果的 tool_calls 的会话，下次请求必然 400。
+ */
+export async function forkSession(id: string, messageId?: string | null): Promise<Session> {
+  const src = await loadSession(id)
+  let cut = src.messages.length
+  if (messageId) {
+    const i = src.messages.findIndex((m) => m.id === messageId)
+    if (i < 0) throw new Error('这条消息不在会话里，可能刚被删掉')
+    cut = i + 1
+  }
+  const messages = trimDanglingTail(src.messages.slice(0, cut))
+  if (messages.length === 0) throw new Error('这条消息之前没有内容，分不出新会话')
+
+  const now = Date.now()
+  const fork: Session = {
+    id: newId(),
+    title: `${src.title.replace(/\s+/g, ' ').trim() || '新会话'} · 分叉`,
+    workspace: src.workspace ?? null,
+    ...(src.agentId ? { agentId: src.agentId } : {}),
+    ...(src.modelId ? { modelId: src.modelId } : {}),
+    ...(src.modelOverride ? { modelOverride: src.modelOverride } : {}),
+    forkedFrom: src.id,
+    createdAt: now,
+    updatedAt: now,
+    // 消息 id 原样保留：它只在会话内部用于定位（删除某一轮、编辑重发），
+    // 换新 id 反而会让「分叉后立刻删某一轮」这类操作的引用对不上
+    messages
+  }
+  await persist(fork)
+  return fork
 }
 
 export async function setSessionWorkspace(id: string, workspace: string | null): Promise<void> {
@@ -81,8 +139,50 @@ export async function setSessionModel(id: string, modelId: string | null): Promi
   await persist(session)
 }
 
-/** 旧版本会话没有 workspace 字段，统一归入当前工作区，避免全部落进“未指定”分组 */
-export async function adoptOrphanSessions(workspace: string | null): Promise<void> {
+/**
+ * 在同一家供应商里换具体模型名。
+ * 和 setSessionModel 分开：切供应商要顺带重启本地服务，
+ * 只换模型名不用动进程（llama-server 支持按请求切已加载的模型时更省事）。
+ */
+export async function setSessionModelOverride(id: string, model: string | null): Promise<void> {
+  const session = await loadSession(id)
+  const next = (model ?? '').trim()
+  session.modelOverride = next || null
+  session.updatedAt = Date.now()
+  await persist(session)
+}
+
+/** 切换会话模式：plan 只读出方案，build 正常执行，null 跟随全局 */
+export async function setSessionMode(id: string, mode: 'plan' | 'build' | null): Promise<void> {
+  const session = await loadSession(id)
+  session.modeOverride = mode
+  session.updatedAt = Date.now()
+  await persist(session)
+}
+
+/** 记下计划模式下产出的方案（批准前不影响权限） */
+export async function saveSessionPlan(id: string, text: string, steps: string[]): Promise<void> {
+  const session = await loadSession(id)
+  session.plan = { text, steps, at: Date.now(), approved: false }
+  session.updatedAt = Date.now()
+  await persist(session)
+}
+
+/**
+ * 批准计划：把会话切成 build，并记下批准时间。
+ * 返回更新后的会话，调用方据此接着跑一轮「按计划执行」。
+ */
+export async function approveSessionPlan(id: string): Promise<Session> {
+  const session = await loadSession(id)
+  if (!session.plan) throw new Error('这个会话还没有计划')
+  session.plan = { ...session.plan, approved: true, approvedAt: Date.now() }
+  session.modeOverride = 'build'
+  session.updatedAt = Date.now()
+  await persist(session)
+  return session
+}
+
+/** 旧版本会话没有 workspace 字段，统一归入当前工作区，避免全部落进“未指定”分组 */export async function adoptOrphanSessions(workspace: string | null): Promise<void> {
   if (!workspace) return
   await fs.mkdir(dir(), { recursive: true })
   const names = await fs.readdir(dir())
@@ -102,7 +202,16 @@ export async function adoptOrphanSessions(workspace: string | null): Promise<voi
 
 export async function loadSession(id: string): Promise<Session> {
   const raw = await fs.readFile(fileOf(id), 'utf8')
-  return JSON.parse(raw) as Session
+  const session = JSON.parse(raw) as Session
+  /**
+   * 老版本写下的会话文件、或被手工改坏的文件可能没有 messages / title。
+   * 后面到处是 `session.messages.push(...)`、`session.title.slice(...)`，
+   * 一个 undefined 就让整个操作炸掉，而用户看到的只是「这个会话打不开」。
+   * 在读入口补齐一次，比在每个调用点做防御便宜得多。
+   */
+  if (!Array.isArray(session.messages)) session.messages = []
+  if (typeof session.title !== 'string') session.title = '未命名会话'
+  return session
 }
 
 /**
@@ -128,6 +237,95 @@ function trashDir(): string {
 
 /** 回收站保留天数 */
 export const TRASH_KEEP_DAYS = 7
+
+/**
+ * 会话清理的两道闸。
+ *
+ * 没有上限的话，sessions/ 只会一直涨：每个会话一个 JSON，listSessions() 还要把
+ * 每个文件整段读出来解析（只为拿标题和更新时间），几百个会话之后每次开侧栏都要
+ * 读几十兆。清得太狠又会删掉用户还想翻的旧对话 —— 所以两条**同时**满足才动：
+ * 既不在「最近 300 个」里，又超过 180 天没被动过。
+ *
+ * 而且不是真删：走 removeSession 进回收站，7 天内还能恢复。
+ * 正常用户永远碰不到这条线，它只在长期重度使用后才起作用。
+ */
+export const SESSION_KEEP_MAX = 300
+export const SESSION_KEEP_DAYS = 180
+
+export interface SessionFileEntry {
+  id: string
+  mtime: number
+  size: number
+}
+
+export interface SessionPruneStats {
+  scanned: number
+  archived: number
+  kept: number
+  archivedBytes: number
+}
+
+/**
+ * 挑出该归档的会话（纯函数，可单测）。
+ * 排序按 mtime 倒序，前 max 个一律不动 —— 那是最可能被翻回去的一批。
+ */
+export function pickPrunable(
+  files: SessionFileEntry[],
+  opts: { max: number; maxAgeDays: number; now?: number }
+): SessionFileEntry[] {
+  const now = opts.now ?? Date.now()
+  const max = Math.max(20, Math.floor(opts.max))
+  const maxAgeDays = Math.max(7, opts.maxAgeDays)
+  const cutoff = now - maxAgeDays * 864e5
+  // 刚动过的（10 分钟内）绝不碰：可能正在写
+  const active = now - 10 * 60 * 1000
+  const sorted = [...files].sort((a, b) => b.mtime - a.mtime)
+  const out: SessionFileEntry[] = []
+  for (let i = 0; i < sorted.length; i++) {
+    if (i < max) continue
+    const f = sorted[i]
+    if (f.mtime >= cutoff || f.mtime >= active) continue
+    out.push(f)
+  }
+  return out
+}
+
+/**
+ * 执行一次清理。只 stat 不 parse：判断只需要时间戳和体积，
+ * 把每个 JSON 都读出来解析反而会让「为了变快而做的清理」自己变慢。
+ */
+export async function pruneSessions(
+  opts: { max?: number; maxAgeDays?: number } = {}
+): Promise<SessionPruneStats> {
+  const names = await fs.readdir(dir()).catch(() => [] as string[])
+  const files: SessionFileEntry[] = []
+  for (const name of names) {
+    if (!name.endsWith('.json')) continue
+    const full = path.join(dir(), name)
+    const st = await fs.stat(full).catch(() => null)
+    if (!st) continue
+    files.push({ id: name.slice(0, -5), mtime: st.mtimeMs, size: st.size })
+  }
+
+  const targets = pickPrunable(files, {
+    max: opts.max ?? SESSION_KEEP_MAX,
+    maxAgeDays: opts.maxAgeDays ?? SESSION_KEEP_DAYS
+  })
+
+  let archived = 0
+  let archivedBytes = 0
+  for (const t of targets) {
+    try {
+      await removeSession(t.id)
+      archived++
+      archivedBytes += t.size
+    } catch {
+      // 单个失败（被占用、权限）不影响其他
+    }
+  }
+
+  return { scanned: files.length, archived, kept: files.length - archived, archivedBytes }
+}
 
 /** 回收站文件名：<会话id>.<时间戳>.json，两个字段都要校验，防止路径穿越 */
 function parseTrashName(name: string): { id: string; deletedAt: number } | null {
@@ -212,6 +410,30 @@ export async function purgeTrash(maxAgeMs = TRASH_KEEP_DAYS * 864e5): Promise<st
       purged.push(meta.id)
     } catch {
       // 删不掉就先留着，下次启动再试
+    }
+  }
+  return purged
+}
+
+/**
+ * 清空整个回收站：用户在设置里明确点了「全部删除」。
+ *
+ * 故意不复用 purgeTrash(0)：那个函数是「按保留期自动清理」，语义是到点才删；
+ * 这里是用户当场要求永久删除，两条路径分开写，日后改保留期也不会误伤这个入口。
+ * 返回被删掉的会话 id，调用方用来连带清理改动快照。
+ */
+export async function purgeAllTrash(): Promise<string[]> {
+  await fs.mkdir(trashDir(), { recursive: true })
+  const names = await fs.readdir(trashDir())
+  const purged: string[] = []
+  for (const name of names) {
+    const meta = parseTrashName(name)
+    if (!meta) continue
+    try {
+      await fs.rm(path.join(trashDir(), name), { force: true })
+      purged.push(meta.id)
+    } catch {
+      // 被占用就先留着：下次点「全部删除」还会再试，别让一条卡住整批
     }
   }
   return purged
@@ -326,7 +548,11 @@ export async function updateMessage(
 
 /** 在标题和正文里找关键词，返回带片段的命中列表 */
 export async function searchSessions(query: string): Promise<SessionHit[]> {
-  const q = query.trim().toLowerCase()
+  /**
+   * IPC 边界没有类型保证：渲染层传 undefined（清空搜索框、旧版界面）时
+   * `query.trim()` 直接抛 TypeError，用户看到的是搜索框报错而不是空结果。
+   */
+  const q = String(query ?? '').trim()
   if (!q) return []
   await fs.mkdir(dir(), { recursive: true })
   const names = await fs.readdir(dir())
@@ -334,32 +560,10 @@ export async function searchSessions(query: string): Promise<SessionHit[]> {
   for (const name of names) {
     if (!name.endsWith('.json')) continue
     try {
-      const s = JSON.parse(await fs.readFile(path.join(dir(), name), 'utf8')) as Session
-      let count = 0
-      let snippet = ''
-      if (s.title.toLowerCase().includes(q)) {
-        count++
-        snippet = s.title
-      }
-      for (const m of s.messages) {
-        const idx = (m.content ?? '').toLowerCase().indexOf(q)
-        if (idx < 0) continue
-        count++
-        if (!snippet) {
-          const start = Math.max(0, idx - 24)
-          snippet = `${start > 0 ? '…' : ''}${m.content.slice(start, idx + q.length + 34).replace(/\s+/g, ' ')}`
-        }
-      }
-      if (!count) continue
-      out.push({
-        id: s.id,
-        title: s.title,
-        workspace: s.workspace ?? null,
-        createdAt: s.createdAt,
-        updatedAt: s.updatedAt,
-        snippet,
-        hits: count
-      })
+      // 判定逻辑在 shared/sessionhit：那边对缺失字段做类型检查，不会因为
+      // 一个没有 title 的老会话就把整条记录从搜索结果里丢掉
+      const hit = searchHit(JSON.parse(await fs.readFile(path.join(dir(), name), 'utf8')), q)
+      if (hit) out.push(hit)
     } catch {
       // 损坏文件跳过
     }

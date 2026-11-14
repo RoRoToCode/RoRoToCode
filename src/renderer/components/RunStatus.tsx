@@ -21,26 +21,40 @@ function elapsedText(ms: number): string {
 }
 
 /**
- * 执行中的状态条：只要助手还在跑就一直挂在输入框上方并闪烁。
- * 之前回车后界面没有任何反馈，用户不知道是卡住了还是在干活。
+ * 执行中的状态：固定在输入区上方那一行的左侧，和右边的上下文占用同一栏。
+ *
+ * 运行中这一格始终占着：有具体进度（正在执行 run_shell、自动验证…）就显示进度，
+ * 没有就显示「正在思考，请稍等」。以前「正在思考」是消息区里的一条占位消息，
+ * 和这里的状态条交替出现，看着像在对话窗口和上下文栏之间来回跳。
  */
-export function RunStatus({ note, startedAt }: { note?: string; startedAt: number }) {
+export function RunStatus({
+  note,
+  startedAt,
+  queued = false
+}: {
+  note?: string
+  startedAt: number
+  /** 排队等全局并发槽位：还没开始烧算力，所以不显示「已跑多久」 */
+  queued?: boolean
+}) {
   const begin = useRef(startedAt || Date.now())
   const [elapsed, setElapsed] = useState(() => Date.now() - begin.current)
 
   useEffect(() => {
+    if (!note || queued) return
     if (startedAt) begin.current = startedAt
     setElapsed(Date.now() - begin.current)
     const timer = window.setInterval(() => setElapsed(Date.now() - begin.current), 500)
     return () => window.clearInterval(timer)
-  }, [startedAt])
+  }, [startedAt, note, queued])
+
+  const label = note || `RoRoTo Code · ${tr("正在思考，请稍等")}`
 
   return (
-    <div className="run-status" role="status" aria-live="polite">
+    <div className={`run-status ${queued ? 'queued' : ''} ${note ? '' : 'idle'}`} role="status" aria-live="polite">
       <Dots />
-      <span className="run-status-text">{tr("执行中，请稍等")}</span>
-      {note ? <span className="run-status-note">{note}</span> : null}
-      <span className="run-status-time">{elapsedText(elapsed)}</span>
+      <span className="run-status-note">{label}</span>
+      {note && !queued && <span className="run-status-time">{elapsedText(elapsed)}</span>}
     </div>
   )
 }

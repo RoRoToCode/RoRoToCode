@@ -76,7 +76,7 @@ function parseObjects(src: string): Map<number, PdfObject> {
       continue
     }
 
-    let dict = body.slice(0, sIdx).trim()
+    const dict = body.slice(0, sIdx).trim()
     let dataStart = cur.bodyStart + sIdx + 6
     if (src[dataStart] === '\r') dataStart++
     if (src[dataStart] === '\n') dataStart++

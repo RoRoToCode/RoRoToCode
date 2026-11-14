@@ -5,9 +5,23 @@ import { spawn } from 'node:child_process'
 import type { ToolSpec } from './spec'
 import { toolSpecs } from './spec'
 import { rememberFact } from '../memory'
+import { addBoardNote } from '../board'
+import { clearScratch, readScratch, writeScratch } from '../scratch'
+import { SECTION_LABEL, type BoardSection } from '../../shared/board'
 import { formatTodos, normalizeTodos } from '../../shared/todos'
 import { webFetchTool, webSearchTool } from './web'
 import { parseApplyPatch } from './applypatch'
+import { gotoDefinition, findReferences } from '../lsp'
+import { relPath } from '../lsp/types'
+import { formatFiles, lintFiles } from '../format'
+import { gitAction } from '../git'
+import { closeTerminal, listTerminals, openTerminal, readTerminal, writeTerminal } from '../terminal'
+import { runHooks } from '../hooks'
+import { clipSafe, replaceOnce } from '../../shared/text'
+import { buildIndex, loadIndex, renderMap } from '../repoindex'
+import { semanticMap } from '../embed'
+import { saveSessionPlan } from '../store'
+import { readSkillBody } from '../skills'
 
 const IGNORED = new Set([
   'node_modules', '.git', 'dist', 'build', 'out', '.next', '.nuxt', 'target',
@@ -24,20 +38,57 @@ export interface ToolContext {
   signal: AbortSignal
   /** 用户已批准“工作区之外”的操作时置为 true，放行路径越界检查 */
   allowOutside?: boolean
+  /** 当前会话属于哪个 agent 档案：remember 要写进它自己那份记忆 */
+  agentId?: string | null
+  /** 当前会话 ID：会话级便签（scratch）按它落盘 */
+  sessionId?: string | null
+  /**
+   * 本轮没有直接下发的工具（上下文紧张时的工具网关）。
+   * agent.ts 会在执行前把「带 tool 参数的 toolbox 调用」展开成真工具，
+   * 走到这里的只有两种情况：不带参数（要清单）、或者要了一个不存在的名字。
+   */
+  hiddenTools?: Array<{ name: string; description: string }>
+  /**
+   * 把活交给另一个档案。由 agent.ts 注入 —— 它知道当前会话、当前档案和审批策略；
+   * 没有别的档案可交给时不注入，这个工具也就不会出现在工具表里。
+   */
+  handoff?: (req: {
+    to: string
+    task: string
+    context?: string
+    files?: string[]
+  }) => Promise<string>
 }
 
 // 风险判定与命令拦截都在 risk.ts（纯函数，可单测），这里只做转出，保持既有 import 路径不变
 export { classifyRisk, classifyMcpRisk, hardBlockReason, isOutside, applyCustomRules, tokenizeCommand, resourceCandidates, type RiskInfo, type PermissionRule } from '../risk'
-import { classifyRisk, hardBlockReason, isOutside, type RiskInfo } from '../risk'
+import { hardBlockReason } from '../risk'
 import { safeEnv } from './env'
 import { getJob, killJob, listJobs, startBackground, tailLog } from './shellbg'
 
 export function isDangerous(tool: string): boolean {
-  return tool === 'write_file' || tool === 'edit_file' || tool === 'patch' || tool === 'run_shell'
+  return (
+    tool === 'write_file' ||
+    tool === 'edit_file' ||
+    tool === 'patch' ||
+    tool === 'run_shell' ||
+    tool === 'terminal' ||
+    tool === 'git' ||
+    tool === 'format'
+  )
 }
 
 export function summarize(tool: string, args: Record<string, unknown>): string {
   if (tool === 'run_shell') return String(args.command ?? '')
+  if (tool === 'terminal') {
+    const action = String(args.action ?? '')
+    return action === 'write' ? `终端输入 ${String(args.data ?? '').slice(0, 60)}` : `终端 ${action}`
+  }
+  if (tool === 'git') {
+    const action = String(args.action ?? '')
+    return `git ${action}${args.branch ? ` ${String(args.branch)}` : ''}${args.message ? `：${String(args.message).slice(0, 50)}` : ''}`
+  }
+  if (tool === 'format') return `${Array.isArray(args.paths) ? args.paths.length : 0} 个文件`
   if (tool === 'write_file' || tool === 'edit_file') return String(args.path ?? '')
   if (tool === 'patch') {
     const edits = Array.isArray(args.edits) ? args.edits.length : 0
@@ -47,6 +98,9 @@ export function summarize(tool: string, args: Record<string, unknown>): string {
   if (tool === 'web_fetch') return String(args.url ?? '')
   if (tool === 'web_search') return String(args.query ?? '')
   if (tool === 'remember') return String(args.note ?? '').slice(0, 120)
+  if (tool === 'use_skill') return String(args.name ?? '')
+  if (tool === 'board') return `[${String(args.section ?? 'fact')}] ${String(args.note ?? '')}`.slice(0, 120)
+  if (tool === 'handoff') return `${String(args.to ?? '')}：${String(args.task ?? '').slice(0, 80)}`
   if (tool === 'update_todos') return `${normalizeTodos(args.items).length} 项`
   return JSON.stringify(args).slice(0, 160)
 }
@@ -111,9 +165,21 @@ async function walkFiles(root: string, dir = root, acc: string[] = [], depth = 0
   return acc
 }
 
-function trim(text: string, limit = MAX_READ): string {
+/**
+ * 读文件被截断时的指引。
+ *
+ * 以前这里只说「内容过长已截断」，模型不知道该怎样接着读，于是绕道去写
+ * dump.py / gs.py 这类一次性脚本把文件切块打印 —— 一个任务能刷出十几个脚本，
+ * 还经常因为路径转义写错而反复重试。把它该用的两个手段直接写在结果里。
+ */
+const READ_CUT_HINT =
+  '要看后面的内容，用 read_file 的 offset/limit 分段读（offset 是起始行号），或用 grep 定位关键词；' +
+  '不要为了看文件去写临时脚本'
+
+function trim(text: string, limit = MAX_READ, hint = ''): string {
   if (text.length <= limit) return text
-  return `${text.slice(0, limit)}\n\n…（内容过长已截断，共 ${text.length} 字符）`
+  // 别切在 emoji 的代理对中间：孤立高位代理会让这次工具结果变成非法字符
+  return `${clipSafe(text, limit, '')}\n\n…（内容过长已截断，共 ${text.length} 字符${hint ? `。${hint}` : ''}）`
 }
 
 function looksBinary(buf: Buffer): boolean {
@@ -135,9 +201,9 @@ async function readFileTool(root: string, args: Record<string, unknown>, allowOu
     const lines = text.split(/\r?\n/)
     const start = Math.max(offset - 1, 0)
     const end = limit > 0 ? start + limit : lines.length
-    return trim(lines.slice(start, end).join('\n'))
+    return trim(lines.slice(start, end).join('\n'), MAX_READ, READ_CUT_HINT)
   }
-  return trim(text)
+  return trim(text, MAX_READ, READ_CUT_HINT)
 }
 
 async function writeFileTool(root: string, args: Record<string, unknown>, allowOutside = false): Promise<string> {
@@ -159,7 +225,7 @@ async function editFileTool(root: string, args: Record<string, unknown>, allowOu
   if (count > 1 && !args.replace_all) {
     throw new Error(`old_string 出现 ${count} 次，请提供更长的上下文或设置 replace_all`)
   }
-  const updated = args.replace_all ? original.split(oldText).join(newText) : original.replace(oldText, newText)
+  const updated = args.replace_all ? original.split(oldText).join(newText) : replaceOnce(original, oldText, newText)
   await fs.writeFile(target, updated, 'utf8')
   return `已修改 ${path.relative(root, target)}（替换 ${args.replace_all ? count : 1} 处）`
 }
@@ -236,7 +302,7 @@ function computePatch(
       }
       const updated = edit.replace_all
         ? original.split(oldText).join(String(edit.new_string ?? ''))
-        : original.replace(oldText, String(edit.new_string ?? ''))
+        : replaceOnce(original, oldText, String(edit.new_string ?? ''))
       results.set(abs, updated)
     }
   }
@@ -441,7 +507,8 @@ export async function previewWrite(
   if (!oldText) throw new Error('old_string 不能为空')
   const count = before.split(oldText).length - 1
   if (count === 0) throw new Error('未找到 old_string')
-  const after = args.replace_all ? before.split(oldText).join(newText) : before.replace(oldText, newText)
+  // 预览必须和真正落盘用同一套替换逻辑：否则审批里看到的 diff 都是错的
+  const after = args.replace_all ? before.split(oldText).join(newText) : replaceOnce(before, oldText, newText)
   return { absPath: target, path: rel, kind: 'modify', before, after }
 }
 
@@ -495,7 +562,7 @@ async function grepTool(root: string, args: Record<string, unknown>, allowOutsid
     const lines = text.split(/\r?\n/)
     for (let i = 0; i < lines.length; i++) {
       if (re.test(lines[i])) {
-        out.push(`${rel}:${i + 1}: ${lines[i].trim().slice(0, 200)}`)
+        out.push(`${rel}:${i + 1}: ${clipSafe(lines[i].trim(), 200, '')}`)
         if (out.length >= MAX_GREP_MATCHES) break
       }
     }
@@ -506,11 +573,25 @@ async function grepTool(root: string, args: Record<string, unknown>, allowOutsid
 function runShellTool(root: string, args: Record<string, unknown>, signal: AbortSignal): Promise<string> {
   const command = String(args.command ?? '').trim()
   if (!command) throw new Error('command 不能为空')
+  /**
+   * 已经停了就别再起进程。审批弹窗开着的时候用户点了停止，等他再点「允许」，
+   * 信号早就断了 —— AbortSignal 不会补发事件，spawn 之后注册的监听永远不会触发，
+   * 命令会照跑到超时（最长 10 分钟），界面上却写着「已停止」。
+   */
+  if (signal.aborted) throw new Error('已取消：这一轮已经停止，命令没有执行')
   if (!existsSync(root)) {
     throw new Error(`工作区目录不存在或不可访问：${root}。请重新选择工作区后再执行命令。`)
   }
   const shell = String(args.shell ?? 'cmd')
-  const timeout = Math.min(Math.max(Number(args.timeout_ms ?? 120000), 1000), 600000)
+  /**
+   * 超时必须是有限正数。模型常按人类习惯写 `"30s"` / `"5 min"` / `null`，
+   * Number() 之后是 NaN；Math.max/min 全都是 NaN，而 setTimeout(fn, NaN) 等价于 0 ——
+   * 命令刚起就被 taskkill，返回的却是「超时，进程已终止」，模型会以为命令跑太慢。
+   */
+  const rawTimeout = Number(args.timeout_ms)
+  const timeout = Number.isFinite(rawTimeout)
+    ? Math.min(Math.max(rawTimeout, 1000), 600000)
+    : 120000
 
   // 极少数不可逆命令直接拒，不弹确认框：这类操作不该交给助手代跑
   const blocked = hardBlockReason(command)
@@ -522,6 +603,7 @@ function runShellTool(root: string, args: Record<string, unknown>, signal: Abort
 
   // 后台模式：立刻返回任务 id，长任务不会再把工具调用拖到超时
   if (args.background === true) {
+    if (signal.aborted) throw new Error('已取消')
     return startBackground(root, command, shell).then(
       (job) =>
         `已在后台启动（任务 id：${job.id}，pid：${job.pid ?? '—'}）。\n` +
@@ -549,12 +631,16 @@ function runShellTool(root: string, args: Record<string, unknown>, signal: Abort
     let stdout = ''
     let stderr = ''
     let done = false
+    let timer: ReturnType<typeof setTimeout> | null = null
     const finish = (text: string) => {
       if (done) return
       done = true
+      // 收尾时把定时器和 abort 监听一起摘掉：否则一次取消会在后台留下一个空转的定时器
+      if (timer) clearTimeout(timer)
+      signal.removeEventListener('abort', onAbort)
       resolve(trim(text, MAX_OUTPUT))
     }
-    const timer = setTimeout(() => {
+    timer = setTimeout(() => {
       try {
         spawn('taskkill', ['/pid', String(child.pid), '/t', '/f'], { windowsHide: true })
       } catch {
@@ -602,6 +688,20 @@ export async function executeTool(
   const root = ctx.workspace
   const allowOutside = Boolean(ctx.allowOutside)
   switch (name) {
+    case 'toolbox': {
+      const want = String(args.tool ?? '').trim()
+      const list = ctx.hiddenTools ?? []
+      if (!want) {
+        if (!list.length) return '本轮所有工具都已经直接下发，不需要 toolbox。'
+        return [
+          '本轮没有直接下发、但可以通过 toolbox 调用的工具（把 tool 设成名字，args 填它的参数）：',
+          ...list.map((t) => `- ${t.name}：${(t.description || '').replace(/\s+/g, ' ').slice(0, 90)}`),
+          '',
+          '例：{"tool":"git","args":{"action":"status"}}'
+        ].join('\n')
+      }
+      return `本轮没有名为「${want}」的工具。可以调用的有：${list.map((t) => t.name).join('、') || '（无）'}`
+    }
     case 'read_file':
       return readFileTool(root, args, allowOutside)
     case 'write_file':
@@ -616,6 +716,30 @@ export async function executeTool(
       return globTool(root, args)
     case 'grep':
       return grepTool(root, args, allowOutside)
+    case 'goto_definition': {
+      const file = path.resolve(root, String(args.path ?? ''))
+      const line = Number(args.line) || 0
+      const col = Number(args.col) || 1
+      if (!file || !line) throw new Error('goto_definition 需要 path 和 line')
+      const defs = await gotoDefinition(root, file, line, col)
+      if (!defs.length) return '没找到定义（该位置可能不是符号，或超出 TS/JS 项目范围）。'
+      return defs
+        .map((d, i) => `${i + 1}. ${relPath(d.file, root)}:${d.line}:${d.col}${d.snippet ? `\n   ${d.snippet}` : ''}`)
+        .join('\n')
+    }
+    case 'find_references': {
+      const file = path.resolve(root, String(args.path ?? ''))
+      const line = Number(args.line) || 0
+      const col = Number(args.col) || 1
+      if (!file || !line) throw new Error('find_references 需要 path 和 line')
+      const r = await findReferences(root, file, line, col)
+      if (!r.refs.length) return '没找到引用。'
+      const lines = r.refs.map(
+        (ref) => `${relPath(ref.file, root)}:${ref.line}:${ref.col}${ref.snippet ? `  ${ref.snippet}` : ''}`
+      )
+      const head = `共 ${r.refs.length} 处引用，分布在 ${r.fileCount} 个文件${r.truncated ? `（已截断到前 ${r.refs.length} 条）` : ''}：`
+      return [head, ...lines].join('\n')
+    }
     case 'run_shell':
       return runShellTool(root, args, ctx.signal)
     case 'shell_bg': {
@@ -636,19 +760,189 @@ export async function executeTool(
       if (!getJob(id)) throw new Error(`没有这个后台任务：${id}`)
       return tailLog(id, Number(args.tail ?? 80))
     }
+    case 'board': {
+      const section = String(args.section ?? 'fact') as BoardSection
+      const r = await addBoardNote(root, section, String(args.note ?? ''))
+      return r.added
+        ? `已写进共享黑板「${SECTION_LABEL[section] ?? section}」，这一页现在共 ${r.items} 条。同一个工作区的其他档案下一轮就能看到。`
+        : `黑板上已经有这条了（共 ${r.items} 条），没有重复写。`
+    }
+    case 'scratch': {
+      if (!ctx.sessionId) throw new Error('这个环境没有会话级便签')
+      if (args.clear === true) {
+        await clearScratch(ctx.sessionId)
+        return '会话便签已清空。'
+      }
+      const text = typeof args.text === 'string' ? args.text.trim() : ''
+      if (!text) {
+        const current = (await readScratch(ctx.sessionId)).trim()
+        return current ? `当前会话便签（${current.length} 字）：\n${current}` : '会话便签还是空的。'
+      }
+      const mode = args.mode === 'replace' ? 'replace' : 'append'
+      const r = await writeScratch(ctx.sessionId, text, mode)
+      return `${mode === 'replace' ? '已覆盖' : '已追加一条'}，便签现在 ${r.chars} 字。下几步就会看到它（只在这个会话里）。`
+    }
     case 'web_search':
       return webSearchTool(args, ctx.signal)
     case 'web_fetch':
       return webFetchTool(args, ctx.signal)
+    case 'terminal': {
+      const action = String(args.action ?? '')
+      if (action === 'open') {
+        const info = openTerminal(root, args.shell ? String(args.shell) : undefined)
+        return (
+          `终端已打开：session_id=${info.id}（${info.shell}，${info.cwd}）。` +
+          `\n发送输入：terminal({action:"write", session_id:"${info.id}", data:"命令\\n"})` +
+          `\n读输出：terminal({action:"read", session_id:"${info.id}", wait_ms:1000})`
+        )
+      }
+      if (action === 'list') {
+        const list = listTerminals()
+        if (!list.length) return '还没有终端会话。用 terminal({action:"open"}) 打开一个。'
+        return list
+          .map((t) => `${t.id} · ${t.shell} · ${t.status}${t.exitCode !== null ? `(${t.exitCode})` : ''} · ${t.cwd}`)
+          .join('\n')
+      }
+      const id = String(args.session_id ?? '')
+      if (!id) throw new Error('需要 session_id：先用 terminal({action:"open"})')
+      if (action === 'write') {
+        const data = String(args.data ?? '')
+        if (!data) throw new Error('write 需要 data（要回车就带 \\n）')
+        const t = writeTerminal(id, data)
+        return `已发送 ${data.length} 字符（当前 seq=${t.seq}）。用 read 读输出。`
+      }
+      if (action === 'read') {
+        const r = await readTerminal(id, args.seq !== undefined ? Number(args.seq) : undefined, {
+          tail: Number(args.tail ?? 8000),
+          waitMs: Number(args.wait_ms ?? 0)
+        })
+        const head = `[seq=${r.seq} · ${r.status}${r.exitCode !== null ? ` · exit ${r.exitCode}` : ''}]`
+        return `${head}\n${r.text || '（暂时没有新输出）'}`
+      }
+      if (action === 'close') {
+        const t = closeTerminal(id)
+        return t ? `终端 ${id} 已关闭。` : `没有这个终端：${id}`
+      }
+      throw new Error(`未知 terminal action：${action}`)
+    }
+    case 'git': {
+      const paths = Array.isArray(args.paths) ? (args.paths as unknown[]).map(String) : undefined
+      const action = String(args.action ?? '')
+      /**
+       * preCommit：提交前的最后一道闸。
+       * 放在工具层而不是 git.ts：钩子要知道 sessionId / agentId，
+       * 而 git.ts 是纯 git 封装，不该反过来依赖 agent 的运行时。
+       */
+      if (action === 'commit') {
+        const hook = await runHooks('preCommit', {
+          workspace: root,
+          sessionId: ctx.sessionId ?? null,
+          agentId: ctx.agentId ?? null,
+          tool: 'git',
+          args,
+          text: args.message !== undefined ? String(args.message) : undefined
+        })
+        if (hook.blocked) return `提交被 preCommit 钩子拦下：${hook.blocked}`
+      }
+      return await gitAction(root, action, {
+        message: args.message !== undefined ? String(args.message) : undefined,
+        paths,
+        branch: args.branch !== undefined ? String(args.branch) : undefined,
+        remote: args.remote !== undefined ? String(args.remote) : undefined,
+        create: args.create !== undefined ? Boolean(args.create) : undefined,
+        steps: args.steps !== undefined ? Number(args.steps) : undefined,
+        dir: args.dir !== undefined ? String(args.dir) : undefined,
+        title: args.title !== undefined ? String(args.title) : undefined,
+        body: args.body !== undefined ? String(args.body) : undefined,
+        limit: args.limit !== undefined ? Number(args.limit) : undefined,
+        stashAction: args.stash_action as 'push' | 'pop' | 'list' | 'drop' | undefined,
+        worktreeAction: args.worktree_action as 'list' | 'add' | 'remove' | undefined
+      })
+    }
+    case 'format': {
+      const paths = Array.isArray(args.paths) ? (args.paths as unknown[]).map(String) : []
+      if (!paths.length) throw new Error('format 需要 paths')
+      const files = paths.map((p) => path.resolve(root, p)).filter((f) => existsSync(f))
+      if (!files.length) throw new Error('这些文件都不存在')
+      const fmt = await formatFiles(root, files, { includeDocs: args.docs === true })
+      let out = fmt.message || '[格式化] 没有需要改的地方'
+      if (args.lint === true) {
+        const lint = await lintFiles(root, files)
+        out += lint.count
+          ? `\n\n[lint] ${lint.count} 个问题：\n${lint.text}`
+          : '\n\n[lint] 没有报错'
+      }
+      return out
+    }
+    case 'repo_map': {
+      const index = args.refresh === true ? await buildIndex(root, { force: true }) : await loadIndex(root)
+      const query = args.query ? String(args.query).trim() : ''
+      const limit = typeof args.limit === 'number' ? args.limit : undefined
+      /**
+       * 带 query 时先试语义检索：本地 embedding 能听懂「登录怎么校验的」这种问法，
+       * 词面匹配只能靠用户先猜对关键词。服务没开 / 模型不支持就静默回落，不影响功能。
+       */
+      if (query) {
+        const semantic = await semanticMap(
+          root,
+          index,
+          query,
+          limit ?? 20,
+          args.path ? String(args.path) : undefined
+        ).catch(() => null)
+        if (semantic) return semantic
+      }
+      return renderMap(index, {
+        path: args.path ? String(args.path) : undefined,
+        query: query || undefined,
+        limit,
+        summary: args.summary !== false
+      })
+    }
+    case 'write_plan': {
+      const text = String(args.plan ?? '').trim()
+      if (!text) throw new Error('write_plan 需要 plan：把方案写完整')
+      const steps = Array.isArray(args.steps) ? args.steps.map(String).map((s) => s.trim()).filter(Boolean) : []
+      const dir = path.join(root, '.roroto')
+      await fs.mkdir(dir, { recursive: true })
+      const body = steps.length ? `${text}\n\n## 步骤\n${steps.map((s, i) => `${i + 1}. ${s}`).join('\n')}` : text
+      await fs.writeFile(path.join(dir, 'plan.md'), `${body}\n`, 'utf8')
+      if (ctx.sessionId) await saveSessionPlan(ctx.sessionId, text, steps)
+      return [
+        '计划已保存到 .roroto/plan.md，界面上已弹出批准按钮。',
+        '',
+        body,
+        '',
+        '现在停下等用户批准，不要继续调用任何会改动文件的工具。'
+      ].join('\n')
+    }
     case 'update_todos': {
       // 真正的状态存在引擎里（agent.ts 会先拦截），这里只兜底给个回执
       return formatTodos(normalizeTodos(args.items))
     }
     case 'remember': {
-      const r = await rememberFact(root, String(args.note ?? ''))
+      const r = await rememberFact(root, String(args.note ?? ''), ctx.agentId)
       return r.added
         ? `已写入项目长期记忆，当前共 ${r.count} 条。下次对话会自动带上。`
         : `这条记忆已经存在（共 ${r.count} 条），没有重复写入。`
+    }
+    case 'use_skill': {
+      // 只认打开开关的技能：开关本身就是「允许模型自己取这份说明」的授权
+      return await readSkillBody(String(args.name ?? args.skill ?? ''))
+    }
+    case 'handoff': {
+      if (!ctx.handoff) throw new Error('当前没有别的档案可以交接：先在 Agent 面板里建一个')
+      const to = String(args.to ?? '').trim()
+      const task = String(args.task ?? '').trim()
+      if (!to) throw new Error('handoff 需要 to：要交给谁')
+      if (!task) throw new Error('handoff 需要 task：让对方做什么')
+      const files = Array.isArray(args.files) ? args.files.map((f) => String(f)).filter(Boolean) : []
+      return await ctx.handoff({
+        to,
+        task,
+        context: args.context ? String(args.context) : '',
+        files
+      })
     }
     default:
       throw new Error(`未知工具：${name}`)

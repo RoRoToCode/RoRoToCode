@@ -60,3 +60,51 @@ export function toolPairsIntact(messages: ChatMessage[]): boolean {
   for (const id of calls) if (!results.has(id)) return false
   return true
 }
+
+/**
+ * 把尾部「配不上对」的消息剪掉。
+ *
+ * 用在分叉上：用户可能从任意一条消息切开，切点正好落在「助手已经喊了工具、
+ * 结果还没回来」的位置时，新会话就带着一组没有结果的 tool_calls。
+ * OpenAI / Anthropic 收到这种历史会直接 400，整个分叉出来的会话从此打不开。
+ *
+ * 只从尾部往前剪，不碰中间：中间的不配对属于数据损坏，那是另一回事，
+ * 悄悄重排反而会把现场破坏掉。
+ */
+export function trimDanglingTail(messages: ChatMessage[]): ChatMessage[] {
+  const out = [...messages]
+  while (out.length > 0 && !toolPairsIntact(out)) out.pop()
+  return out
+}
+
+/**
+ * 历史装不下时，从最早的「整轮」开始丢。
+ *
+ * 关键约束：只能切在 user 消息前面。一条轮次 = 提问 + 助手回复 + 它触发的全部工具结果，
+ * 切在 user 前面就意味着这些内容整组留下或整组丢掉 —— 不会出现「助手喊了 3 个工具、
+ * 只回来 2 个结果」这种历史（服务端一定 400，而且这个会话之后每次发送都会 400）。
+ *
+ * 以前 compact() 是 `tail.shift()` 一条一条从头丢，完全不看角色，所以第一次 shift
+ * 就可能正好丢到某条 tool 结果。overBudget 由调用方传入（它才知道 token 怎么算）。
+ */
+export function dropOldestTurns(
+  messages: ChatMessage[],
+  overBudget: (next: ChatMessage[]) => boolean
+): ChatMessage[] {
+  if (!overBudget(messages)) return messages
+
+  // 第一条提问留着当「任务背景」，它本身不带 tool_calls，单独留是安全的
+  const head = messages.length > 0 && messages[0].role === 'user' ? [messages[0]] : []
+  const rest = messages.slice(head.length)
+  let cut = 0
+  while (cut < rest.length && overBudget([...head, ...rest.slice(cut)])) {
+    let next = cut + 1
+    while (next < rest.length && rest[next].role !== 'user') next++
+    // 后面已经没有提问了：再切就把最后一轮也切没，直接停
+    if (next >= rest.length) break
+    cut = next
+  }
+  const out = cut === 0 ? messages : [...head, ...rest.slice(cut)]
+  // 兜底：宁可超预算，也不发一份配不上对的历史
+  return toolPairsIntact(out) ? out : messages
+}

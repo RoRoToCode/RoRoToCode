@@ -1,6 +1,14 @@
 import { t as tr } from '../i18n'
+import { isPlainEnter } from '../keyboard'
 import { useEffect, useRef, useState } from 'react'
-import type { LocalGgufFile, LocalRuntimeKind, LocalRuntimeStatus, SetupProgress } from '../../shared/types'
+import { shortGpuName } from '../../shared/ollamagpu'
+import type {
+  LocalGgufFile,
+  LocalGpuSnapshot,
+  LocalRuntimeKind,
+  LocalRuntimeStatus,
+  SetupProgress
+} from '../../shared/types'
 import { Chevron, useCollapse } from './Collapse'
 import { DownloadBar } from './DownloadBar'
 
@@ -21,6 +29,16 @@ interface Props {
 }
 
 const sameModel = (a?: string, b?: string) => !!a && !!b && a.toLowerCase() === b.toLowerCase()
+
+/** 对齐模型名：服务的运行清单里一定带 tag，配置里可能省略 `:latest` */
+const sameModelLoose = (a?: string, b?: string): boolean => {
+  const norm = (s?: string): string => (s ?? '').trim().toLowerCase().replace(/:latest$/, '')
+  const x = norm(a)
+  return !!x && x === norm(b)
+}
+
+/** GB 数：显存说明用，保留一位小数就够 */
+const gb = (n: number): string => `${(n / 1024 ** 3).toFixed(1)} GB`
 
 /** 1.4 GB / 986 MB，用于模型体积提示 */
 const fmtSize = (n: number): string =>
@@ -45,7 +63,7 @@ export function LocalRuntime({
 }: Props) {
   const [st, setSt] = useState<LocalRuntimeStatus | null>(null)
   const [busy, setBusy] = useState<string | null>(null)
-  const [open, toggle] = useCollapse(`rt-${kind}`, true)
+  const [open, toggle] = useCollapse(`rt-${kind}`, false)
   const [msg, setMsg] = useState('')
   const [picked, setPicked] = useState('')
   const [pullName, setPullName] = useState('')
@@ -55,6 +73,8 @@ export function LocalRuntime({
   const [setupPct, setSetupPct] = useState<number | null>(null)
   /** 下载进度（带速度 / 来源） */
   const [setup, setSetup] = useState<SetupProgress | null>(null)
+  /** 这个服务里已加载（占着显存/内存）的模型：用来在模型行上标「现在跑在哪张卡」 */
+  const [loaded, setLoaded] = useState<LocalGpuSnapshot['models']>([])
   const alive = useRef(true)
 
   useEffect(
@@ -69,12 +89,19 @@ export function LocalRuntime({
       const s = await window.pico.local.status(kind)
       if (!alive.current) return s
       setSt(s)
+      // 顺手刷新「已加载的模型 + 显卡」：Ollama 只在真的加载后才占用显存，
+      // 没加载就没有卡可显示，所以这两份数据一起取
+      const snap = await window.pico.local.gpu().catch(() => null)
+      if (alive.current) setLoaded((snap?.models ?? []).filter((r) => r.kind === kind))
       // 顺手刷新「可导入的 GGUF」：模型面板里刚下完的模型，刷一次状态就会出现在下拉里
       const g = await window.pico.local.ggufs().catch(() => null)
       if (g && alive.current) {
         setGgufs(g.files)
+        // 「已经在 Ollama 库里」的 blob 不能再导入 Ollama（只会白复制一份 4G），
+        // 所以这一项不进 Ollama 卡片的默认选中值
+        const usable = kind === 'ollama' ? g.files.filter((f) => f.source !== 'ollama') : g.files
         setGgufPath((prev) =>
-          prev && g.files.some((f) => f.path === prev) ? prev : (g.files[0]?.path ?? '')
+          prev && usable.some((f) => f.path === prev) ? prev : (usable[0]?.path ?? '')
         )
       }
       return s
@@ -92,20 +119,35 @@ export function LocalRuntime({
 
   // 安装包下载进度（只有直链下载的运行时才会推）：画进度条 + 每秒速度
   useEffect(() => {
-    const off = window.pico.local.onSetupProgress((p) => {
+    const apply = (p: SetupProgress): void => {
       if (p.kind !== kind || !alive.current) return
       setSetup(p)
-      if (p.state === 'downloading') {
+      if (p.state === 'downloading' || p.state === 'preparing') {
         const pct = p.totalBytes > 0 ? Math.min(99, Math.round((p.receivedBytes / p.totalBytes) * 100)) : 0
         setSetupPct(pct)
         setMsg(p.message ?? '')
       } else if (p.state === 'done') {
         setSetupPct(100)
+        // 后台下完、面板是后挂载的：没有人替它收进度条，这里自己收
+        window.setTimeout(() => {
+          if (alive.current) setSetup(null)
+        }, 5000)
       } else {
         setSetupPct(null)
         setMsg(p.message ?? '')
       }
-    })
+    }
+    const off = window.pico.local.onSetupProgress(apply)
+    // 切走再切回来：安装包还在主进程里下，把进度和「安装中」状态接上
+    void window.pico.downloads
+      .snapshot()
+      .then((s) => {
+        if (!s.local || s.local.kind !== kind) return
+        if (s.local.state !== 'preparing' && s.local.state !== 'downloading') return
+        apply(s.local)
+        setBusy((b) => b ?? 'install')
+      })
+      .catch(() => undefined)
     return off
   }, [kind])
 
@@ -170,18 +212,22 @@ export function LocalRuntime({
     })
   }, [models, currentModel])
 
-  /** 自动配置：写模型配置 + 顺手报服务状态（原「检测状态」按钮已删，并到这里） */
+  /** 自动配置：写模型配置 + 顺手报服务状态（原「检测状态」按钮已删，并到这里）
+   *  只写配置，不抢当前模型 —— 「设为当前使用」是「一键启动」的语义 */
   async function configOnly() {
     if (busy) return
     setBusy('config')
     setMsg(tr("正在写入模型配置…"))
     try {
-      const r = await window.pico.local.configure(kind, picked || undefined)
+      const r = await window.pico.local.configure(kind, picked || undefined, { activate: false })
       if (r.ok) await onConfigChanged?.()
       const s = await window.pico.local.status(kind).catch(() => null)
       if (!alive.current) return
       if (s) setSt(s)
       setMsg(s ? `${r.message}\n${s.message}` : r.message)
+    } catch (err) {
+      // 没有 catch 的时候，spawn 失败只会变成一条 unhandled rejection，界面上什么都不显示
+      if (alive.current) setMsg(tr("写入配置失败：{0}", { "0": (err as Error).message }))
     } finally {
       if (alive.current) setBusy(null)
     }
@@ -199,11 +245,15 @@ export function LocalRuntime({
         setMsg(s.message)
         return
       }
-      const c = await window.pico.local.configure(kind, picked || undefined)
+      // activate：一键启动 = 「使用这个模型」，要把当前模型切过来，
+      // 否则回到对话界面还是上一个（顶栏与发消息都按 activeId 走）
+      const c = await window.pico.local.configure(kind, picked || undefined, { activate: true })
       if (!alive.current) return
       setMsg(`${s.message}\n${c.message}`)
       if (c.ok) await onConfigChanged?.()
       await refresh()
+    } catch (err) {
+      if (alive.current) setMsg(tr("启动失败：{0}", { "0": (err as Error).message }))
     } finally {
       if (alive.current) setBusy(null)
     }
@@ -219,6 +269,8 @@ export function LocalRuntime({
       if (!alive.current) return
       setMsg(r.message)
       if (r.ok) setPullName('')
+    } catch (err) {
+      if (alive.current) setMsg(tr("拉取失败：{0}", { "0": (err as Error).message }))
     } finally {
       if (alive.current) setBusy(null)
     }
@@ -227,8 +279,40 @@ export function LocalRuntime({
   const running = Boolean(st?.running)
   const installed = st?.installed ?? false
   const pickedGguf = ggufs.find((f) => f.path === ggufPath)
+  /**
+   * 能导入到这一家的文件。
+   * 来源是 Ollama 库的 blob 对 Ollama 自己没意义（`ollama create` 只会再复制一份），
+   * 主进程那边也会拒绝，所以干脆不列出来，别让人点了才看到报错。
+   */
+  const importable = kind === 'ollama' ? ggufs.filter((f) => f.source !== 'ollama') : ggufs
   /** 服务实际端口：LM Studio 的 1234 被占用时会换端口 */
   const livePort = st?.port ?? port
+
+  /**
+   * 这个模型现在跑在哪张卡上。
+   * 只有「已加载」才有答案：Ollama 的模型空闲 5 分钟就卸载，那时它一点都不占显卡，
+   * 硬写一张卡名会让人以为显存被占着。
+   */
+  function gpuTagOf(model: string): { text: string; title: string } | null {
+    const hit = loaded.find((r) => sameModelLoose(r.model, model))
+    if (!hit) return null
+    if (hit.vramBytes <= 0) {
+      return { text: 'CPU', title: tr("这个模型现在跑在内存里，没占显存") }
+    }
+    const pct = hit.sizeBytes > 0 ? Math.min(100, Math.round((hit.vramBytes / hit.sizeBytes) * 100)) : 100
+    const names = hit.devices
+    const head = names[0] ? shortGpuName(names[0]) : 'GPU'
+    const text = names.length > 1 ? `${head} +${names.length - 1}` : head
+    const title = [
+      names.length ? names.join('、') : tr("型号没读到，只确认占用了显存"),
+      hit.sizeBytes > 0
+        ? tr("显存 {0} / {1}", { "0": gb(hit.vramBytes), "1": gb(hit.sizeBytes) })
+        : tr("显存 {0}", { "0": gb(hit.vramBytes) }),
+      pct >= 95 ? tr("全部在显卡上") : tr("只有 {0}% 在显卡上，其余在内存", { "0": String(pct) }),
+      hit.guessed ? tr("显卡名按本机推断") : ''
+    ].filter(Boolean)
+    return { text, title: title.join(' · ') }
+  }
 
   return (
     <div className={`guide-card ${open ? '' : 'collapsed'}`}>
@@ -316,6 +400,7 @@ export function LocalRuntime({
             {models.map((m) => {
               const on = sameModel(m, picked)
               const active = sameModel(m, currentModel)
+              const gpu = gpuTagOf(m)
               return (
                 <button
                   key={m}
@@ -329,6 +414,11 @@ export function LocalRuntime({
                 >
                   <span className="guide-model-dot" />
                   <span className="guide-model-name">{m}</span>
+                  {gpu && (
+                    <span className="guide-model-tag gpu" title={gpu.title}>
+                      {gpu.text}
+                    </span>
+                  )}
                   {active && running && <span className="guide-model-tag run">{tr("当前")}</span>}
                 </button>
               )
@@ -354,11 +444,11 @@ export function LocalRuntime({
         </p>
       )}
 
-      {installed && ggufs.length > 0 && (
+      {installed && importable.length > 0 && (
         <div className="guide-import">
           <div className="guide-pick-head">
             <b>{tr("用本程序已下载的模型")}</b>
-            <span className="guide-pick-hint">{tr("共")}{ggufs.length} {tr("个 .gguf，不用重新下载")}</span>
+            <span className="guide-pick-hint">{tr("共")}{importable.length} {tr("个 .gguf，不用重新下载")}</span>
           </div>
           <div className="guide-pull">
             <select
@@ -367,7 +457,7 @@ export function LocalRuntime({
               onChange={(e) => setGgufPath(e.target.value)}
               title={ggufPath || tr("程序 models/ 目录里的模型文件")}
             >
-              {ggufs.map((f) => (
+              {importable.map((f) => (
                 <option key={f.path} value={f.path}>
                   {f.name}（{fmtSize(f.sizeBytes)}）
                 </option>
@@ -392,7 +482,7 @@ export function LocalRuntime({
             placeholder={tr("拉取模型，如 qwen2.5-coder:7b")}
             onChange={(e) => setPullName(e.target.value)}
             onKeyDown={(e) => {
-              if (e.key === 'Enter') void pull()
+              if (isPlainEnter(e)) void pull()
             }}
           />
           <button className="btn" disabled={!!busy || !pullName.trim()} onClick={() => void pull()}>

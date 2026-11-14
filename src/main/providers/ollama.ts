@@ -1,7 +1,7 @@
-import type { ChatMessage, ProviderConfig, TokenUsage, ToolCall } from '../../shared/types'
-import type { ToolSpec } from '../tools/spec'
+import type { ArgRepair, ChatMessage, ProviderConfig, TokenUsage, ToolCall } from '../../shared/types'
+import { parseArgs, RAW_ARG_KEY } from '../../shared/toolargs'
 import { imageDataUrl } from '../vision'
-import { idleGuard, joinUrl, readError, requestSignal } from './base'
+import { explainStreamFailure, idleGuard, joinUrl, readError, requestSignal } from './base'
 import type { StreamOptions, StreamResult } from './base'
 
 /**
@@ -29,9 +29,13 @@ interface NativeChunk {
     tool_calls?: Array<{ function?: { name?: string; arguments?: unknown } }>
   }
   done?: boolean
+  /** 结束原因：stop / length / load…，length 表示撞到 num_predict 被截断 */
+  done_reason?: string
   // 最后一帧带上的统计（Ollama 原生接口的字段名）
   prompt_eval_count?: number
   eval_count?: number
+  /** 纯解码耗时，单位纳秒（不是毫秒）；prompt_eval_duration 是预填充，不要算进来 */
+  eval_duration?: number
   error?: string
 }
 
@@ -161,6 +165,31 @@ export async function ollamaNumCtx(provider: ProviderConfig): Promise<number> {
   return Math.max(2048, Math.min(n, 262144))
 }
 
+/**
+ * Ollama 的错误很多时候是「推理引擎起不来」，原因藏在 llama-server 的退出信息里。
+ * 原样抛出去用户只能看到一串英文，还以为是本程序坏了。
+ * 这里只补充「怎么办」，原始文本一个字都不删：真要排查还得靠它。
+ */
+function explainOllamaFailure(msg: string): string {
+  const arch = msg.match(/unknown model architecture: '?([\w.-]+)'?/i)
+  if (arch) {
+    return (
+      `${msg}\n—— 这个模型的架构（${arch[1]}）Ollama 自带的推理引擎不认：常见于新版 llama.cpp 导出的 GGUF，` +
+      '或者需要专门构建才能跑的自定义架构。同一个文件改用「本地模型 → llama.cpp」通常能起来；' +
+      '要留在 Ollama 里，就得换成它支持的架构（比如 Qwen / Llama / Gemma 系列的官方 GGUF）。'
+    )
+  }
+  if (/requires more system memory|out of memory|not enough (?:system )?memory|failed to allocate/i.test(msg)) {
+    return (
+      `${msg}\n—— 显存 / 内存不够。到「模型设置」打开「限制上下文」把窗口调小一档，或换更小的量化版本（Q4_K_M → Q3_K_M）。`
+    )
+  }
+  if (/no such model|model .* not found|pull model manifest/i.test(msg)) {
+    return `${msg}\n—— 本机没有这个模型。到「本地模型」里 ollama pull 一个，或从下拉里换一个已经下载好的。`
+  }
+  return msg
+}
+
 export async function streamOllama(opts: StreamOptions): Promise<StreamResult> {
   const { provider, messages, tools, onText } = opts
   const root = nativeRoot(provider)
@@ -206,7 +235,7 @@ export async function streamOllama(opts: StreamOptions): Promise<StreamResult> {
   if (!res.ok) {
     guard.stop()
     done()
-    throw new Error(await readError(res))
+    throw new Error(explainOllamaFailure(await readError(res)))
   }
   if (!res.body) {
     guard.stop()
@@ -218,6 +247,9 @@ export async function streamOllama(opts: StreamOptions): Promise<StreamResult> {
   const toolCalls: ToolCall[] = []
   const stamp = Date.now().toString(36)
   let usage: TokenUsage | undefined
+  let genMs: number | undefined
+  /** 结束原因：length 意味着输出被 num_predict 截断，不能当成「写完了」 */
+  let finishReason: string | undefined
 
   try {
     for await (const line of jsonLines(res.body)) {
@@ -228,9 +260,15 @@ export async function streamOllama(opts: StreamOptions): Promise<StreamResult> {
       } catch {
         continue
       }
-      if (chunk.error) throw new Error(chunk.error)
+      if (chunk.error) throw new Error(explainOllamaFailure(chunk.error))
+      if (chunk.done_reason) finishReason = chunk.done_reason
       if (chunk.done && (chunk.prompt_eval_count || chunk.eval_count)) {
         usage = { prompt: chunk.prompt_eval_count ?? 0, completion: chunk.eval_count ?? 0 }
+      }
+      // eval_duration 只覆盖「吐出这些 token」的时间，不含预填充。
+      // 用它算 tok/s 才能和「本地模型 → 体检」里的理论生成速度对得上。
+      if (chunk.done && typeof chunk.eval_duration === 'number' && chunk.eval_duration > 0) {
+        genMs = chunk.eval_duration / 1e6
       }
       const msg = chunk.message
       if (msg?.content) {
@@ -241,24 +279,32 @@ export async function streamOllama(opts: StreamOptions): Promise<StreamResult> {
         const name = tc.function?.name
         if (!name) continue
         let args: Record<string, unknown> = {}
+        let repair: ArgRepair | undefined
         const raw = tc.function?.arguments
         if (typeof raw === 'string') {
-          try {
-            args = raw.trim() ? (JSON.parse(raw) as Record<string, unknown>) : {}
-          } catch {
-            args = { _raw: raw }
-          }
+          // 和 OpenAI 那条路走同一个容错层，避免两个 provider 行为不一致
+          const parsed = parseArgs(raw)
+          args = parsed.repair === 'failed' ? { [RAW_ARG_KEY]: raw } : parsed.args
+          if (parsed.repair !== 'none') repair = parsed.repair
         } else if (raw && typeof raw === 'object') {
           args = raw as Record<string, unknown>
         }
-        toolCalls.push({ id: `call_${stamp}_${toolCalls.length}`, name, args })
+        toolCalls.push({
+          id: `call_${stamp}_${toolCalls.length}`,
+          name,
+          args,
+          ...(repair ? { argRepair: repair } : {})
+        })
       }
       if (chunk.done) break
     }
+  } catch (err) {
+    // 和 OpenAI 那条路同一套翻译：`TypeError: terminated` 不能直接甩给用户
+    throw new Error(await explainStreamFailure(err, provider, signal))
   } finally {
     guard.stop()
     done()
   }
 
-  return { text, toolCalls, usage }
+  return { text, toolCalls, usage, genMs, finishReason }
 }

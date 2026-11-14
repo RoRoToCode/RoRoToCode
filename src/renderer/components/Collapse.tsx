@@ -5,10 +5,13 @@ import { useEffect, useState } from 'react'
  *
  * 状态放在模块级 Map 里：切到别的标签页再回来、或者关掉设置面板重新打开，
  * 折叠状态都保持原样，不会「刚收起来又弹开」。
+ *
+ * 默认折叠（defaultOpen 默认 false）：Ollama / LM Studio / 设置里的功能分组
+ * 都不该一进来就全摊开，用户要用哪个再点开哪个。
  */
 const memory = new Map<string, boolean>()
 
-export function useCollapse(key: string, defaultOpen = true): [boolean, () => void] {
+export function useCollapse(key: string, defaultOpen = false): [boolean, () => void] {
   const [open, setOpen] = useState(() => memory.get(key) ?? defaultOpen)
   useEffect(() => {
     memory.set(key, open)

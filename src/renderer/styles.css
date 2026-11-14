@@ -2,7 +2,7 @@
   --bg: #0d0d0f;
   --panel: #141417;
   --panel-2: #191920;
-  /* 助手回答的底框：比用户气泡更淡，四套主题各调一份 */
+  /* 助手回答的底色：比用户气泡更淡，各套主题各调一份 */
   --assistant-bg: #141418;
   --assistant-border: #202027;
   --panel-3: #1f1f26;
@@ -27,6 +27,8 @@
   --overlay: rgba(0, 0, 0, 0.55);
   --shadow: 0 18px 44px rgba(0, 0, 0, 0.6);
   --radius: 10px;
+  /* 对话区最大宽度：窗口再宽也不无限拉长，到这儿就停住并居中，两侧自然留白 */
+  --chat-max: 1280px;
   /* 字号缩放因子：设置页写到 <html style> 上，这里只给默认值兜底 */
   --fs: 1;
   --fs-chat: 1;
@@ -262,6 +264,7 @@ select:focus {
 }
 
 .sidebar {
+  position: relative; /* 侧栏内部浮层以此为定位基准 */
   flex: none;
   width: 264px;
   background: var(--panel);
@@ -269,6 +272,181 @@ select:focus {
   display: flex;
   flex-direction: column;
   min-height: 0;
+  overflow: hidden;
+  transition: width 0.16s ease;
+}
+
+/* 收起后只留一条窄边，工作目录 / 会话 / 新建对话整块让出对话宽度。
+   用 display:none 而不是卸载组件：轮询和闪烁动画照常跑，
+   展开回来时搜索词、分组折叠状态都还在。 */
+.sidebar.collapsed {
+  width: 46px;
+}
+
+.sidebar.collapsed > .brand,
+.sidebar.collapsed > .skill-btn,
+.sidebar.collapsed > .session-search,
+.sidebar.collapsed > .session-list,
+.sidebar.collapsed > .sidebar-foot {
+  display: none;
+}
+
+.sidebar:not(.collapsed) > .sidebar-rail {
+  display: none;
+}
+
+/* 展开态：折叠把手贴在侧栏右缘、垂直居中。
+   尺寸与右侧「成果文件」那条把手完全一致（22px 宽、至少 88px 高），
+   比原来挂在 RoRoToCode 旁边那个 22px 的小方块好按得多，
+   也不再和品牌名抢位置。 */
+.sidebar-handle {
+  position: absolute;
+  z-index: 4;
+  top: 50%;
+  right: 0;
+  transform: translateY(-50%);
+  display: none;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  min-height: 88px;
+  padding: 10px 0;
+  border: 1px solid var(--border);
+  border-right: none;
+  border-radius: 9px 0 0 9px;
+  background: var(--panel-2);
+  color: var(--muted);
+  -webkit-app-region: no-drag;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+
+/* 只有展开态用这条把手：收起后整条窄边本身就是「展开」按钮 */
+.sidebar:not(.collapsed) > .sidebar-handle {
+  display: flex;
+}
+
+.sidebar-handle:hover {
+  background: var(--panel-3);
+  border-color: var(--border-strong);
+  color: var(--accent);
+}
+
+/* 底图是向下的 V：旋转 90° 指左（收起），旋转 -90° 指右（展开） */
+.sidebar-chev {
+  display: inline-flex;
+  color: var(--dim);
+}
+
+.sidebar-chev.to-left {
+  transform: rotate(90deg);
+}
+
+.sidebar-chev.to-right {
+  transform: rotate(-90deg);
+}
+
+.sidebar-handle:hover .sidebar-chev,
+.sidebar-rail:hover .sidebar-chev {
+  color: var(--accent);
+}
+
+/* 收起态：整条窄边可点，里面竖排工作区文件夹 */
+.sidebar-rail {
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: 16px 0 14px;
+  background: transparent;
+  color: var(--muted);
+  text-align: center;
+}
+
+.sidebar-rail:hover {
+  background: var(--panel-2);
+}
+
+.rail-top {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 18px;
+}
+
+.rail-folders {
+  flex: 0 1 auto;
+  min-height: 0;
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  overflow: hidden;
+  padding-top: 4px;
+}
+
+/* 每个文件夹沿用展开态分组的色相，收起后也能对上是哪个工作区 */
+.rail-folder {
+  --ws-hue: 210;
+  position: relative;
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 7px;
+  color: hsl(var(--ws-hue) 68% 62%);
+  background: hsl(var(--ws-hue) 62% 55% / 0.12);
+  border: 1px solid hsl(var(--ws-hue) 60% 55% / 0.35);
+}
+
+.rail-folder.is-live {
+  border-color: hsl(152 60% 58% / 0.75);
+  background: hsl(152 60% 58% / 0.14);
+}
+
+/* 机器人叠在文件夹上闪：文件夹压暗成底，图标亮在它上面 */
+.rail-folder.is-live > svg {
+  opacity: 0.3;
+}
+
+.rail-robot {
+  position: absolute;
+  inset: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: hsl(152 60% 58%);
+  animation: agent-pulse 1.4s step-end infinite;
+}
+
+.rail-robot.queued {
+  color: hsl(38 62% 60%);
+  animation: none;
+}
+
+.rail-more {
+  flex: none;
+  font-size: calc(10px * var(--fs, 1));
+  color: var(--dim);
+}
+
+.rail-title-v {
+  margin-top: auto;
+  writing-mode: vertical-rl;
+  text-orientation: upright;
+  letter-spacing: 3px;
+  font-size: calc(11px * var(--fs, 1));
+  color: var(--dim);
+}
+
+.sidebar-rail:hover .rail-title-v {
+  color: var(--text);
 }
 
 .brand {
@@ -375,8 +553,8 @@ select:focus {
   }
 }
 
-/* 本地模型加载提示 */
-.llama-loading {
+/* 切换模型时的加载提示（llama.cpp / Ollama / LM Studio / 远端 API 通用） */
+.model-loading {
   padding: 4px 24px 0;
   font-size: calc(12px * var(--fs, 1));
   color: #ff5c5c;
@@ -415,7 +593,8 @@ select:focus {
 .session-list {
   flex: 1;
   overflow-y: auto;
-  padding: 0 8px 8px;
+  /* 右侧留出折叠把手的宽度：它垂直居中悬浮在侧栏右缘，别压住行尾的删除 × */
+  padding: 0 26px 8px 8px;
   min-height: 0;
 }
 
@@ -455,6 +634,47 @@ select:focus {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* 正在工作的会话：标题前挂一个机器人。
+   绿色闪烁 = 真的在烧算力；琥珀常亮 = 抢不到并发槽位在排队。
+   两者都不能是「静悄悄」的，否则用户切到别的会话后没法知道哪条还在跑 */
+.session-live {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  color: hsl(152 60% 58%);
+  animation: agent-pulse 1.4s step-end infinite;
+}
+
+.session-live.queued {
+  color: hsl(38 62% 60%);
+  animation: none;
+}
+
+/* 机器人闪烁：亮半拍 / 暗半拍，亮的时候带一圈光晕。
+   step-end 下 0% 保持到 50%、50% 保持到 100%，是硬切而不是渐隐，
+   一眼就能看出「还在跑」，不是装饰性的呼吸灯。 */
+@keyframes agent-pulse {
+  0% {
+    opacity: 1;
+    color: hsl(152 72% 68%);
+    filter: drop-shadow(0 0 5px hsl(152 72% 58% / 0.85));
+  }
+  50% {
+    opacity: 0.32;
+    color: hsl(152 45% 50%);
+    filter: none;
+  }
+  100% {
+    opacity: 0.32;
+    color: hsl(152 45% 50%);
+    filter: none;
+  }
+}
+
+.session-item.busy .session-title {
+  color: var(--text);
 }
 
 .session-del {
@@ -501,12 +721,33 @@ select:focus {
 
 /* 工作区图标用本组颜色，扫一眼就能分清是哪一组 */
 .ws-icon {
+  position: relative; /* 分组收起时，闪烁机器人叠在文件夹上 */
   flex: none;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   color: hsl(var(--ws-hue) 68% 62%);
   opacity: 0.9;
+}
+
+/* 分组收起后看不到会话行，机器人改在这枚文件夹图标上闪 */
+.ws-icon.has-live > svg {
+  opacity: 0.25;
+}
+
+.ws-live-badge {
+  position: absolute;
+  inset: -3px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: hsl(152 60% 58%);
+  animation: agent-pulse 1.4s step-end infinite;
+}
+
+.ws-live-badge.queued {
+  color: hsl(38 62% 60%);
+  animation: none;
 }
 
 .ws-chevron {
@@ -678,14 +919,32 @@ select:focus {
   min-height: 0;
 }
 
+/* 标题栏以下才分成左右两栏：左边对话 + 输入框，右边成果面板。
+   上面那 48px 永远留给标题栏（右上角是最小 / 最大 / 关闭），成果面板不越界去占它。 */
+.workbench {
+  flex: 1 1 auto;
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+}
+
+.chat-col {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+
 .header {
   height: 48px;
   border-bottom: 1px solid var(--border);
   display: flex;
   align-items: center;
   gap: 10px;
-  /* 右边贴着窗口边缘放自绘的窗口按钮，所以只留 8px */
-  padding: 0 8px 0 14px;
+  /* 右边给窗口按钮留出避让位（三个按钮 106px + 6px 边距），否则语言 / 齿轮会被压在按钮下面。
+     成果面板展开时也照旧：它现在从标题栏下面开始，不会来抢这块地方 */
+  padding: 0 118px 0 14px;
   flex: none;
   position: relative;
   z-index: 20;
@@ -697,13 +956,18 @@ select:focus {
   -webkit-app-region: no-drag;
 }
 
-/* 右上角三个自绘窗口按钮：最小化 / 最大化 / 关闭 */
+/* 右上角三个自绘窗口按钮：钉在「窗口」的角上，不是顶栏的角上。
+   右侧成果面板一展开顶栏就变窄，按钮若跟着顶栏走会往里错位，所以这里脱离文档流绝对定位。 */
 .win-btns {
-  flex: none;
+  position: absolute;
+  top: 0;
+  right: 6px;
+  height: 48px; /* 与顶栏等高，图标垂直居中对齐顶栏里的其他按钮 */
+  z-index: 25; /* 压在顶栏(20)和成果面板之上，但低于弹窗遮罩(40) */
   display: flex;
   align-items: center;
   gap: 2px;
-  margin-left: 6px;
+  -webkit-app-region: no-drag;
 }
 
 .win-btn {
@@ -716,6 +980,9 @@ select:focus {
   justify-content: center;
   color: var(--muted);
   transition: background 0.12s ease, color 0.12s ease;
+  /* 按钮本身也要显式声明可点击，否则会被 header / 成果面板标题栏的拖拽区盖住，点不到 */
+  -webkit-app-region: no-drag;
+  pointer-events: auto;
 }
 
 .win-btn:hover {
@@ -785,17 +1052,17 @@ select:focus {
   background: var(--panel);
 }
 
-/* 每会话模型绑定下拉 */
-.session-model-select {
-  flex: none;
-  padding: 5px 8px;
-  border: 1px solid var(--border);
-  background: var(--panel-2);
-  color: var(--text);
-  border-radius: 8px;
-  font-size: calc(11.5px * var(--fs, 1));
-  margin-left: 6px;
-  max-width: 130px;
+/* 斜杠命令弹层：复用 @ 引用那套样式，只补一个来源标记 */
+.slash-menu .mention-name {
+  font-family: var(--mono, ui-monospace, Consolas, monospace);
+}
+.slash-src {
+  margin-left: auto;
+  padding: 0 6px;
+  border-radius: 6px;
+  background: var(--panel-3, var(--panel-2));
+  color: var(--muted);
+  font-size: calc(10.5px * var(--fs, 1));
 }
 
 /* 右上角语言切换：一个按钮点一下在中 / EN 之间切换 */
@@ -862,8 +1129,8 @@ select:focus {
 /* ---------- 执行计划卡片（贴在消息区上方） ---------- */
 .plan-card {
   flex: none;
-  max-width: 900px;
-  width: calc(100% - 48px);
+  width: calc(100% - 64px);
+  max-width: calc(var(--chat-max) - 64px);
   margin: 10px auto 0;
   border: 1px solid var(--border);
   border-radius: 10px;
@@ -994,9 +1261,30 @@ select:focus {
 }
 
 .msg-wrap {
-  max-width: 900px;
+  /* 对话随窗口变宽，但到 --chat-max 就停住并居中：窗口再大，左右也留着距离 */
+  width: 100%;
+  max-width: var(--chat-max);
   margin: 0 auto;
-  padding: 0 24px;
+  padding: 0 32px;
+  box-sizing: border-box;
+}
+
+/* 「显示更早的 N 条」：长会话只渲染尾部一批，剩下靠它往上看 */
+.msg-more {
+  display: block;
+  margin: 4px auto 16px;
+  padding: 5px 14px;
+  border: 0.5px solid var(--border);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--muted);
+  font-size: calc(12px * var(--fs, 1));
+  cursor: pointer;
+}
+
+.msg-more:hover {
+  color: var(--dim);
+  border-color: var(--border-strong);
 }
 
 .msg {
@@ -1040,9 +1328,10 @@ select:focus {
   letter-spacing: 0.3px;
 }
 
+/* 用户气泡：去掉描边，只留一层 50% 不透明的底色 */
 .msg.user .bubble {
-  background: var(--panel-2);
-  border: 1px solid var(--border);
+  background: color-mix(in srgb, var(--panel-2) 50%, transparent);
+  border: none;
   border-radius: 10px;
   padding: 9px 13px;
   white-space: pre-wrap;
@@ -1082,7 +1371,9 @@ select:focus {
 
 /* ===== 输入框上方：模型看不了图的提醒 ===== */
 .attach-warn {
-  max-width: 900px;
+  width: 100%;
+  max-width: calc(var(--chat-max) - 64px);
+  box-sizing: border-box;
   margin: 0 auto 8px;
   padding: 6px 10px;
   border: 1px solid rgba(240, 190, 110, 0.45);
@@ -1093,13 +1384,13 @@ select:focus {
   line-height: 1.5;
 }
 
-/* 助手回答也有底框，但比用户气泡更淡（背景更贴近底色、边框更弱），
-   一眼能分出「我说的」和「它答的」，又不会抢走用户气泡的视觉重量。 */
+/* 助手回答：同样去掉描边、只留 50% 不透明的底色。
+   谁在说靠左右位置和角色名区分，不再靠边框。 */
 .msg-body {
   white-space: pre-wrap;
   word-break: break-word;
-  background: var(--assistant-bg);
-  border: 1px solid var(--assistant-border);
+  background: color-mix(in srgb, var(--assistant-bg) 50%, transparent);
+  border: none;
   border-radius: 10px;
   padding: 10px 14px;
 }
@@ -1152,8 +1443,214 @@ select:focus {
   text-decoration-thickness: 2px;
 }
 
-.tool-card {
+/* ===== 标题 / 分隔线 ===== */
+.md-h {
+  margin: 14px 0 6px;
+  font-weight: 700;
+  line-height: 1.35;
+  color: var(--text);
+}
+
+.md-h:first-child {
+  margin-top: 0;
+}
+
+.md-h1 {
+  font-size: calc(17px * var(--fs, 1));
+}
+
+.md-h2 {
+  font-size: calc(15.5px * var(--fs, 1));
+}
+
+.md-h3 {
+  font-size: calc(14px * var(--fs, 1));
+}
+
+.md-h4,
+.md-h5,
+.md-h6 {
+  font-size: calc(13px * var(--fs, 1));
+  color: var(--text-soft);
+}
+
+.md-hr {
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: 12px 0;
+}
+
+/* ===== 表格 ===== */
+/* 列多的时候表格自己横向滚：对话区域不能被一张宽表顶宽 */
+.md-table-wrap {
+  margin: 8px 0;
+  max-width: 100%;
+  overflow-x: auto;
   border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+}
+
+.md-table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: calc(12.5px * var(--fs, 1));
+  line-height: 1.5;
+}
+
+.md-table th,
+.md-table td {
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+  border-right: 1px solid var(--border);
+  /* 单元格按正常规则折行：继承正文的 pre-wrap 会让长句不自动换行 */
+  white-space: normal;
+  word-break: break-word;
+  vertical-align: top;
+}
+
+.md-table th {
+  background: var(--panel-2);
+  font-weight: 600;
+  color: var(--text);
+  text-align: left;
+  white-space: nowrap;
+}
+
+.md-table tr:last-child td {
+  border-bottom: none;
+}
+
+.md-table th:last-child,
+.md-table td:last-child {
+  border-right: none;
+}
+
+.md-table tbody tr:hover td {
+  background: var(--hover);
+}
+
+/* ===== 列表 ===== */
+.md-listbox {
+  margin: 6px 0;
+}
+
+.md-list {
+  margin: 3px 0;
+  padding-left: 22px;
+}
+
+.md-list .md-list {
+  margin: 2px 0;
+}
+
+.md-ul {
+  list-style: disc;
+}
+
+.md-ol {
+  list-style: decimal;
+}
+
+.md-li {
+  margin: 2px 0;
+}
+
+.md-li::marker {
+  color: var(--muted);
+}
+
+.md-check {
+  display: inline-block;
+  width: 1.15em;
+  color: var(--dim);
+}
+
+.md-check.on {
+  color: var(--ok);
+}
+
+/* ===== 引用 ===== */
+.md-quote {
+  margin: 8px 0;
+  padding: 6px 12px;
+  border-left: 3px solid var(--border-strong);
+  background: var(--panel);
+  color: var(--text-soft);
+  border-radius: 0 8px 8px 0;
+  white-space: pre-wrap;
+}
+
+/* ===== 正文里的图片 ===== */
+.md-fig {
+  display: block;
+  margin: 8px 0;
+}
+
+.md-img {
+  display: block;
+  max-width: 100%;
+  max-height: 400px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  object-fit: contain;
+  cursor: zoom-in;
+}
+
+.md-img-cap {
+  display: block;
+  margin-top: 4px;
+  font-size: calc(11.5px * var(--fs, 1));
+  color: var(--dim);
+  white-space: normal;
+}
+
+.md-img-wait {
+  display: inline-block;
+  width: 140px;
+  height: 84px;
+  border-radius: 8px;
+  border: 1px dashed var(--border-strong);
+  background: repeating-linear-gradient(45deg, var(--panel), var(--panel) 6px, var(--panel-2) 6px, var(--panel-2) 12px);
+  vertical-align: middle;
+}
+
+.md-img-bad {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 6px;
+  border: 1px dashed var(--border-strong);
+  color: var(--dim);
+  font-size: calc(12px * var(--fs, 1));
+  word-break: break-all;
+  white-space: normal;
+}
+
+/* 点开看大图：铺满窗口的一层，点哪儿都能关 */
+.md-zoom {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 4vh 4vw;
+  background: var(--overlay);
+  cursor: zoom-out;
+}
+
+.md-zoom-img {
+  max-width: 100%;
+  max-height: 100%;
+  border-radius: 8px;
+  box-shadow: var(--shadow);
+}
+
+/* 工具执行卡片：和回答一样不描边，只用底色分块。
+   一整轮里会有十几张卡片，每张都围一圈框，整片对话就全是格子。 */
+.tool-card {
+  border: none;
   border-radius: 10px;
   margin: 8px 0;
   overflow: hidden;
@@ -1228,16 +1725,13 @@ select:focus {
 }
 
 /* ===== 连着的 run_shell 折成一张卡，点开才看每条命令和输出 ===== */
+/* 折叠起来的这一步（「执行 N 步」）：同样不描边，靠底色和缩进区分层次 */
 .tool-stack {
-  border: 1px solid var(--border);
+  border: none;
   border-radius: 10px;
   margin: 8px 0;
   overflow: hidden;
   background: var(--panel);
-}
-
-.tool-stack.open {
-  border-color: var(--border-strong);
 }
 
 .tool-stack-head {
@@ -1345,32 +1839,15 @@ select:focus {
   background: var(--panel-2);
 }
 
-/* ===== 执行中的状态条：一直在输入框上方闪，告诉用户还在跑 ===== */
+/* ===== 执行中的状态：固定在输入区上方状态行的左侧，不再是一张整宽闪动的卡片 ===== */
 .run-status {
-  max-width: 900px;
-  margin: 0 auto 8px;
-  display: flex;
+  display: inline-flex;
   align-items: center;
   gap: 8px;
-  padding: 6px 10px;
-  border: 1px solid var(--border-strong);
-  border-radius: 8px;
-  background: var(--panel);
-  font-size: calc(12px * var(--fs, 1));
-  color: var(--text-soft);
-  animation: run-breathe 1.7s ease-in-out infinite;
-}
-
-@keyframes run-breathe {
-  0%,
-  100% {
-    opacity: 1;
-    border-color: var(--border-strong);
-  }
-  50% {
-    opacity: 0.55;
-    border-color: var(--accent);
-  }
+  min-width: 0;
+  max-width: 100%;
+  font-size: calc(11px * var(--fs, 1));
+  color: var(--muted);
 }
 
 .run-dots {
@@ -1409,40 +1886,42 @@ select:focus {
   }
 }
 
-.run-status-text {
-  font-weight: 500;
-  color: var(--text);
-  flex: none;
-}
-
 .run-status-note {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  font-weight: 500;
+  color: var(--text-soft);
+}
+
+/* 默认的「正在思考」比具体进度低调一点，别让整行一直抢眼 */
+.run-status.idle .run-status-note {
+  font-weight: 400;
   color: var(--muted);
 }
 
 .run-status-time {
-  margin-left: auto;
   flex: none;
   color: var(--dim);
   font-variant-numeric: tabular-nums;
 }
 
-/* 占位的「正在思考」：和状态条同一套观感 */
-.msg-wait {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  color: var(--muted);
-  animation: run-breathe 1.7s ease-in-out infinite;
+/* 排队中：琥珀字，和「真的在跑」区分开，别让人以为卡住了 */
+.run-status.queued {
+  color: hsl(38 55% 52%);
 }
 
-/* 不想看动效：保留文字，去掉闪烁 */
+.run-status.queued .run-status-note {
+  color: hsl(38 55% 52%);
+}
+
+.run-status.queued .run-dots i {
+  background: hsl(38 60% 55%);
+}
+
+/* 不想看动效：保留文字，去掉跳动 */
 @media (prefers-reduced-motion: reduce) {
-  .run-status,
-  .msg-wait,
   .tool-status.run,
   .run-dots i {
     animation: none;
@@ -1452,20 +1931,23 @@ select:focus {
 .composer {
   flex: none;
   border-top: 1px solid var(--border);
-  padding: 12px 24px 16px;
+  /* 左右和 .msg-wrap 的 32px 对齐，输入框才不会比对话区宽出一截 */
+  padding: 12px 32px 16px;
   background: var(--bg);
 }
 
 .composer-inner {
-  max-width: 900px;
+  width: 100%;
+  max-width: calc(var(--chat-max) - 64px);
+  box-sizing: border-box;
   margin: 0 auto;
   border: 1px solid var(--border);
   border-radius: 12px;
   background: var(--panel);
-  padding: 8px 10px 8px 12px;
+  padding: 6px 8px 8px 12px;
   display: flex;
-  gap: 10px;
-  align-items: flex-end;
+  flex-direction: column;
+  gap: 4px;
 }
 
 .composer-inner:focus-within {
@@ -1473,14 +1955,26 @@ select:focus {
 }
 
 .composer textarea {
-  flex: 1;
+  /* 竖排容器里 flex:1 会把高度压到 0，这里明确由内容撑开、占满整行 */
+  flex: none;
+  width: 100%;
+  min-width: 0;
   border: none;
   background: transparent;
   padding: 8px 0;
   resize: none;
   max-height: 320px;
-  min-height: 104px;
+  min-height: 96px;
   line-height: 1.65;
+}
+
+/* 输入框下面那一行：左边附件与工作区，右边用量、发送、导出，永远不换行 */
+.composer-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex-wrap: nowrap;
 }
 
 .composer textarea:focus {
@@ -1505,7 +1999,7 @@ select:focus {
 /* 发送按钮右侧的「导出对话」图标（原在 header 右上角） */
 .export-btn {
   flex: none;
-  align-self: flex-end;
+  align-self: center;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -1532,24 +2026,14 @@ select:focus {
 }
 
 .hint {
-  max-width: 900px;
   margin: 6px auto 0;
   font-size: calc(11.5px * var(--fs, 1));
   color: var(--dim);
   text-align: right;
 }
 
-.composer-foot {
-  max-width: 900px;
-  margin: 10px auto 0;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  min-height: 26px;
-  font-size: calc(11.5px * var(--fs, 1));
-  color: var(--dim);
-}
-
+/* 这一排（附件 / 工作区 / 用量 / 发送）并进了 .composer-actions，
+   原来独立的 .composer-foot 那一行已经去掉 */
 .foot-pill {
   display: inline-flex;
   align-items: center;
@@ -1588,7 +2072,10 @@ select:focus {
 }
 
 .ws-chip {
-  max-width: 52%;
+  /* 与「添加文件」同行：给个宽度上限，路径再长也只出省略号，不去挤右边的发送键 */
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 300px;
 }
 
 .ws-chip:hover {
@@ -1630,7 +2117,9 @@ select:focus {
 }
 
 .attach-list {
-  max-width: 900px;
+  width: 100%;
+  max-width: calc(var(--chat-max) - 64px);
+  box-sizing: border-box;
   margin: 0 auto 8px;
   display: flex;
   flex-wrap: wrap;
@@ -1741,7 +2230,8 @@ select:focus {
   gap: 7px;
   height: 30px;
   padding: 0 10px;
-  max-width: 320px;
+  /* 加了显卡胶囊后要给文字留够位置，否则模型名被截得只剩一半 */
+  max-width: 380px;
   border: 1px solid var(--border);
   border-radius: 8px;
   background: var(--panel-2);
@@ -1845,6 +2335,39 @@ select:focus {
   white-space: nowrap;
 }
 
+/* 显卡标记：模型列表 / 顶栏触发器共用同一套外观 */
+.model-trigger-gpu,
+.model-item-gpu {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: none;
+  align-self: flex-start;
+  max-width: 150px;
+  padding: 1px 6px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--panel-2);
+  color: var(--dim);
+  font-size: calc(10.5px * var(--fs, 1));
+  line-height: 1.6;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.model-trigger-gpu {
+  max-width: 118px;
+  align-self: center;
+}
+
+.model-item-gpu .gpu-label,
+.model-trigger-gpu .gpu-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .model-item-error {
   color: var(--danger);
   font-size: calc(11px * var(--fs, 1));
@@ -1860,6 +2383,10 @@ select:focus {
 
 .model-item-state.ok {
   color: var(--ok);
+}
+
+.model-item-state.ready {
+  color: var(--warn);
 }
 
 .model-item-state.checking {
@@ -1898,6 +2425,12 @@ select:focus {
   box-shadow: 0 0 6px rgba(62, 207, 142, 0.45);
 }
 
+/* 可用但没启动：黄灯。绿灯只留给「模型已经加载在跑」，否则看不出谁真占着显存 */
+.dot.ready {
+  background: var(--warn);
+  box-shadow: 0 0 6px color-mix(in srgb, var(--warn) 45%, transparent);
+}
+
 .dot.fail {
   width: 10px;
   height: 10px;
@@ -1921,7 +2454,7 @@ select:focus {
 }
 
 .empty {
-  max-width: 560px;
+  max-width: 760px;
   margin: 12vh auto 0;
   text-align: center;
   color: var(--muted);
@@ -2092,6 +2625,11 @@ select:focus {
 .prov-state.ok {
   color: var(--ok);
   border-color: var(--ok);
+}
+
+.prov-state.ready {
+  color: var(--warn);
+  border-color: var(--warn);
 }
 
 .prov-state.fail {
@@ -2344,6 +2882,9 @@ select:focus {
   color: var(--danger);
 }
 
+/* 「可更新」不再单独上色（原来这里是描边 + 圆点强调色）：和「自动配置」保持一致，
+   避免一排按钮出现三种颜色。有新版这件事由按钮文字「可更新 → b####」表达。 */
+
 .btn:disabled {
   opacity: 0.55;
   cursor: default;
@@ -2375,6 +2916,22 @@ select:focus {
   white-space: pre-wrap;
   word-break: break-all;
   margin: 10px 0;
+}
+
+/* 用量超限的确认：不是工具审批，说清「哪条线、用了多少、上限多少」就够 */
+.quota-body {
+  margin: 10px 0 2px;
+}
+.quota-line {
+  font-size: calc(13px * var(--fs, 1));
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+.quota-hint {
+  margin: 6px 0 0;
+  color: var(--muted);
+  font-size: calc(12.5px * var(--fs, 1));
+  line-height: 1.6;
 }
 
 /* 顶部提示条：默认中性色，只有真正的错误才是红色（否则「已添加文件」也像报错） */
@@ -2477,6 +3034,22 @@ select:focus {
 .approval-risk.risk-outside {
   color: #e0a458;
   border-color: #6d542b;
+}
+
+/* 确认框底部按钮行：文字一律一行，不再被挤成两行。
+   小弹窗略加宽，高危那排（拒绝 / 本次允许 / 勾选 / 始终允许）才排得开 */
+.modal.approval-modal.modal-sm {
+  width: 520px;
+}
+
+.approval-actions {
+  flex-wrap: nowrap;
+  white-space: nowrap;
+}
+
+.approval-actions .btn,
+.approval-actions .approval-ack {
+  flex: none;
 }
 
 /* 高危操作横幅：删除 / 越界 / 外部 MCP，不受「之后全允许」影响 */
@@ -2786,6 +3359,44 @@ select:focus {
   line-height: 1.6;
 }
 
+/* 实时显存仪表：运行中服务占了多少显存，一眼看出是否吃紧 */
+.guide-vram {
+  margin: 10px 0 0;
+}
+
+.guide-vram-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: 4px;
+  font-size: calc(11.5px * var(--fs, 1));
+  color: var(--dim);
+}
+
+.guide-vram-num {
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+
+.guide-vram-track {
+  height: 6px;
+  border-radius: 3px;
+  background: var(--border);
+  overflow: hidden;
+}
+
+.guide-vram-fill {
+  height: 100%;
+  border-radius: 3px;
+  background: var(--ok);
+  transition: width 0.4s ease;
+}
+
+/* 占用超 90% 转红：这是「挤爆了」的信号，和 1.55 tok/s 的教训对应 */
+.guide-vram-fill.high {
+  background: var(--danger);
+}
+
 .guide-warn b {
   color: #f0c894;
 }
@@ -2846,6 +3457,42 @@ a.btn {
   color: var(--danger);
 }
 
+/* 自动校准上下文的进度：探测期间会反复起停，几十秒没有产物，得让人看见它在动 */
+.probe-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+  font-size: calc(11.5px * var(--fs, 1));
+  color: var(--dim);
+  line-height: 1.6;
+}
+
+.probe-dot {
+  flex: none;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: probe-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes probe-pulse {
+  0%,
+  100% {
+    opacity: 0.3;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .probe-dot {
+    animation: none;
+  }
+}
+
 /* ---------- 简易核心：六步清单 ---------- */
 .core-steps {
   display: flex;
@@ -2895,9 +3542,13 @@ a.btn {
   color: var(--danger);
 }
 
+/* 一行一个模型：以前是 flex-wrap 流式排列，名字长的模型会把同一行的
+   其他模型挤散，几行拼在一起也分不清哪行是哪个。改成一列，每个模型占满宽度，
+   名字靠左、标签与体积靠右，扫一眼就是一整行。 */
 .guide-models {
   display: flex;
-  flex-wrap: wrap;
+  flex-direction: column;
+  flex-wrap: nowrap;
   gap: 6px;
   margin-top: 8px;
 }
@@ -2929,10 +3580,12 @@ a.btn {
 }
 
 .guide-model {
-  display: inline-flex;
+  display: flex;
   align-items: center;
   gap: 6px;
-  max-width: 100%;
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
   font-size: calc(11.5px * var(--fs, 1));
   color: var(--dim);
   border: 1px solid var(--border);
@@ -2969,7 +3622,10 @@ a.btn {
   box-shadow: 0 0 0 2px rgba(110, 168, 254, 0.18);
 }
 
+/* 名字吃掉剩余宽度：标签 / 体积 / 删除按钮被推到行尾，每行的右边界对得整齐 */
 .guide-model-name {
+  flex: 1 1 auto;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -2992,6 +3648,17 @@ a.btn {
   background: rgba(240, 180, 90, 0.14);
 }
 
+/* 运行中用的显卡：显卡名普遍很长（NVIDIA GeForce RTX 4060 Laptop GPU），
+   标签里截断、完整名放 title，别把一行挤到换行 */
+.guide-model-tag.gpu {
+  max-width: 190px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #a7b6c9;
+  background: rgba(167, 182, 201, 0.14);
+}
+
 /* 看图能力：配上了投影器给中性偏亮的标记；缺投影器只是「用不了这个功能」，不是错误 */
 .guide-model-tag.vision {
   color: #8fb8f0;
@@ -3001,6 +3668,66 @@ a.btn {
 .guide-model-tag.novision {
   color: #d9a05b;
   background: rgba(217, 160, 91, 0.14);
+}
+
+/* 体积与删除：次要信息，不能抢走模型名的注意力 */
+.guide-model-size {
+  flex: none;
+  font-size: calc(11px * var(--fs, 1));
+  color: var(--dim);
+  opacity: 0.75;
+}
+
+.guide-model-del {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--dim);
+  font-family: inherit;
+  font-size: calc(13px * var(--fs, 1));
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0.55;
+}
+
+.guide-model-del:hover {
+  background: rgba(226, 75, 74, 0.18);
+  color: #e24b4a;
+  opacity: 1;
+}
+
+.guide-disk {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin: 6px 0 8px;
+  font-size: calc(11.5px * var(--fs, 1));
+  color: var(--dim);
+}
+
+.specs-filter {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin: 6px 0 2px;
+  font-size: calc(11.5px * var(--fs, 1));
+  color: var(--dim);
+}
+
+.specs-filter label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
 }
 
 .guide-pick-picked {
@@ -3081,6 +3808,19 @@ a.btn {
   font-style: normal;
 }
 
+/* 速度那一格的补充口径：折减值 / MoE 提示另起一行，别挤在数字后面 */
+.fit-sub {
+  display: block;
+  margin-top: 1px;
+  line-height: 1.5;
+}
+
+/* 「带图一档都装不下」这类否定结论：不用红色（那表示不能用），用警示黄 */
+.fit-warn {
+  color: var(--warn);
+  font-weight: 600;
+}
+
 .fit-refresh {
   margin-left: auto;
   font-size: calc(11px * var(--fs, 1));
@@ -3127,7 +3867,26 @@ a.btn {
   overflow-wrap: anywhere;
 }
 
-/* 各档上下文的通过情况：绿=装得下，红=超预算 */
+/* 各档上下文：点一下就按这档重启服务；绿=装得下，红=超预算 */
+.fit-tier-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+  font-size: calc(11px * var(--fs, 1));
+  color: var(--dim);
+}
+
+.fit-tier-head b {
+  font-size: calc(12px * var(--fs, 1));
+  color: var(--text);
+}
+
+.fit-tier-current {
+  color: var(--accent);
+}
+
 .fit-tiers {
   display: flex;
   flex-wrap: wrap;
@@ -3136,11 +3895,32 @@ a.btn {
 }
 
 .fit-tier {
+  font-family: inherit;
   font-size: calc(10.5px * var(--fs, 1));
-  padding: 1px 6px;
+  line-height: 1.6;
+  padding: 2px 8px;
   border-radius: 5px;
   border: 1px solid var(--border);
+  background: transparent;
   color: var(--dim);
+  cursor: pointer;
+  transition: border-color 0.12s, background 0.12s, color 0.12s;
+}
+
+.fit-tier:hover:not(:disabled) {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--text);
+}
+
+.fit-tier:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.fit-tier:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
 }
 
 .fit-tier.ok {
@@ -3154,9 +3934,164 @@ a.btn {
   text-decoration: line-through;
 }
 
+/* 装不下、要分层才跑得动：虚线但不染色 —— 它是「另一条路」，不是错误。
+   染色 + 「分层」小标一排挂下来，看起来像出了故障，也会把「桌面占了几百 MiB
+   导致 32K 掉档」说成模型不行。要不要走这条路交给下面的开关。 */
+.fit-tier.partial {
+  border-style: dashed;
+  color: var(--dim);
+}
+
 .fit-tier.unknown {
   color: var(--dim);
   border-style: dashed;
+}
+
+.fit-tier.auto {
+  color: var(--text-soft);
+}
+
+/* 体检建议档：加粗边框，不改文字颜色 */
+.fit-tier.suggested:not(.on) {
+  border-width: 2px;
+  padding: 1px 7px;
+}
+
+/* 当前实例实际跑的档：放最后，盖掉 ok / bad 的文字色与删除线 */
+.fit-tier.on {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--accent);
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.fit-tier-rec {
+  font-style: normal;
+  font-size: 0.85em;
+  margin-left: 3px;
+  opacity: 0.85;
+}
+
+/* 装得下但只剩几十上百 MiB：说「紧」比直接判「装不下」诚实 */
+.fit-tier-tight {
+  color: var(--warn);
+}
+
+/* 分层加载开关：紧跟档位行，默认开（不点就是不额外折腾，与主进程默认值一致） */
+.fit-layer {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 7px;
+  font-size: calc(11px * var(--fs, 1));
+  color: var(--dim);
+}
+
+.fit-layer-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-family: inherit;
+  font-size: calc(10.5px * var(--fs, 1));
+  line-height: 1.6;
+  padding: 2px 9px 2px 6px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--dim);
+  cursor: pointer;
+  transition: border-color 0.12s, color 0.12s, background 0.12s;
+}
+
+.fit-layer-switch > i {
+  position: relative;
+  display: block;
+  width: 18px;
+  height: 10px;
+  border-radius: 999px;
+  background: var(--border);
+  transition: background 0.15s;
+}
+
+.fit-layer-switch > i::after {
+  content: '';
+  position: absolute;
+  top: 1px;
+  left: 1px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--dim);
+  transition: transform 0.15s, background 0.15s;
+}
+
+.fit-layer-switch:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--text-soft);
+}
+
+.fit-layer-switch:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.fit-layer-switch.on {
+  color: var(--warn);
+  border-color: rgba(229, 181, 103, 0.45);
+}
+
+.fit-layer-switch.on > i {
+  background: rgba(229, 181, 103, 0.35);
+}
+
+.fit-layer-switch.on > i::after {
+  transform: translateX(8px);
+  background: var(--warn);
+}
+
+/*
+ * 三态模式：自动 / 总是 / 关。
+ *
+ * 「自动」不是开也不是关，所以按钮本身保持中性，只有旁边的小字说明
+ * 这个模型当前会不会分层；真正会分层时（.active）开关拨到右边，颜色沿用警告色。
+ * 这样用户扫一眼就知道：现在是自动，且这个模型会被拆层。
+ */
+.fit-layer-switch > em {
+  font-style: normal;
+  opacity: 0.8;
+  padding-left: 2px;
+  border-left: 1px solid var(--border);
+  margin-left: 2px;
+  padding-left: 6px;
+}
+
+.fit-layer-switch.auto {
+  color: var(--text-soft);
+}
+
+.fit-layer-switch.active > i {
+  background: rgba(229, 181, 103, 0.35);
+}
+
+.fit-layer-switch.active > i::after {
+  transform: translateX(8px);
+  background: var(--warn);
+}
+
+.fit-layer-switch.active {
+  color: var(--warn);
+  border-color: rgba(229, 181, 103, 0.45);
+}
+
+.fit-layer-switch.off {
+  opacity: 0.9;
+}
+
+.fit-layer-switch:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
 }
 
 .fit-foot {
@@ -3179,6 +4114,64 @@ a.btn {
 
 .specs-modal {
   width: 640px;
+}
+
+/* 标题后面的分类按钮：一行放不下时整体换行，关闭按钮始终靠右 */
+.specs-modal .guide-head {
+  flex-wrap: wrap;
+  gap: 8px 10px;
+}
+
+.specs-modal .guide-head .icon-btn {
+  margin-left: auto;
+}
+
+.specs-cats {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px;
+  min-width: 0;
+}
+
+.specs-cat {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 8px;
+  font-size: calc(11.5px * var(--fs, 1));
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.specs-cat:hover {
+  color: var(--text);
+  border-color: var(--accent);
+}
+
+.specs-cat-count {
+  min-width: 17px;
+  padding: 0 4px;
+  border-radius: 7px;
+  background: var(--code-bg);
+  color: var(--dim);
+  font-size: calc(10px * var(--fs, 1));
+  line-height: 15px;
+  text-align: center;
+}
+
+.specs-cat.on .specs-cat-count {
+  background: rgba(110, 168, 254, 0.18);
+  color: var(--accent);
+}
+
+.specs-cat-hint {
+  color: var(--warn);
+  font-size: calc(11px * var(--fs, 1));
+}
+
+.specs-cats-empty .link-btn {
+  margin-left: 6px;
 }
 
 .specs-grid {
@@ -3524,6 +4517,30 @@ a.btn {
 
 .dl-fit.no {
   color: var(--dim);
+}
+
+/* 模态标注：音频 / 图像模型能下载，但 llama.cpp 加载不了，要一眼区分 */
+.dl-fit.mod-vision {
+  color: #8fb8f0;
+  border-color: rgba(143, 184, 240, 0.55);
+}
+
+.dl-fit.mod-audio {
+  color: #c792ea;
+  border-color: rgba(199, 146, 234, 0.65);
+  background: rgba(199, 146, 234, 0.08);
+}
+
+.dl-fit.mod-image,
+.dl-fit.mod-other {
+  color: #e5b567;
+  border-color: rgba(229, 181, 103, 0.7);
+  background: rgba(229, 181, 103, 0.08);
+}
+
+.dl-fit.probing {
+  color: var(--dim);
+  border-style: dashed;
 }
 
 .dl-meta {
@@ -3911,6 +4928,16 @@ a.btn {
   border-bottom: 1px solid var(--border);
 }
 
+/* 面板顶部那句 /learn 提示：不抢眼，但第一次打开就该看见 */
+.skills-hint {
+  margin: 0;
+  padding: 10px 18px;
+  font-size: calc(11.5px * var(--fs, 1));
+  line-height: 1.6;
+  color: var(--dim);
+  border-bottom: 1px solid var(--border);
+}
+
 .skills-tab {
   padding: 6px 12px;
   font-size: calc(12.5px * var(--fs, 1));
@@ -4058,6 +5085,25 @@ a.btn {
   border-color: rgba(88, 201, 138, 0.4);
 }
 
+/* 「自动」标签：开着开关的技能才挂，用主题色把它和内置/来源这些身份标签分开 */
+.skill-tag.auto {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+/* 技能行的开关：站在「调用」左边。
+   复用软件设置里的 .aset-switch 外观，只去掉它自带的 margin-left:auto —— 那会把按钮挤开 */
+.skill-toggle {
+  flex: none;
+  display: flex;
+  align-items: center;
+}
+
+.skill-toggle .aset-switch {
+  margin-left: 0;
+}
+
 .hub-spacer {
   flex: 1;
 }
@@ -4086,20 +5132,28 @@ a.btn {
   width: 46px;
 }
 
-/* 顶部标题行只做展示：它紧挨着标题栏的「关闭 ×」，不能再是可点的折叠热区 */
+/* 面板自己的标题行：整块面板从窗口标题栏下面开始，这里只是「成果文件」这一行，
+   右上角的最小 / 最大 / 关闭在它上面那一层，互不干扰 */
 .output-titlebar {
   flex: none;
   display: flex;
   align-items: center;
   gap: 8px;
-  height: 48px; /* 与顶部标题栏等高 */
-  padding: 0 14px;
+  height: 40px;
+  padding: 0 12px;
   color: var(--muted);
   border-bottom: 1px solid var(--border);
+  /* 面板标题行同样可以拖动窗口 */
+  -webkit-app-region: drag;
 }
 
+.output-titlebar > * {
+  -webkit-app-region: no-drag;
+}
+
+/* 收起态：窄条里不摆标题行，把整条高度都留给中间的折叠把手 */
 .output-side.collapsed .output-titlebar {
-  border-bottom-color: transparent; /* 收起态只留一段空白，避开窗口按钮 */
+  display: none;
 }
 
 /* 折叠把手：下移到面板垂直中间，展开 / 收起都点这里 */
@@ -4599,6 +5653,53 @@ a.btn {
   color: var(--dim);
 }
 
+/* 「以后都这样」的授权列表：能看见才能撤，所以给它一块独立的小卡片 */
+.aset-grants {
+  margin-top: 14px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel-2);
+}
+
+.aset-grants-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.aset-grant-list {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.aset-grant-list li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: calc(12px * var(--fs, 1));
+}
+
+.aset-grant-list code {
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--code-bg, rgba(127, 127, 127, 0.12));
+}
+
+.aset-grant-ws {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--dim);
+}
+
 /* 项目权限规则列表 */
 .perm-list {
   display: flex;
@@ -4684,6 +5785,21 @@ a.btn {
   display: flex;
   flex-direction: column;
   gap: 6px;
+}
+
+/* 回收站顶部那句提示 + 「全部删除」：提示占满剩余宽度，按钮靠右不换行 */
+.trash-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.trash-bar .aset-hint {
+  margin: 0;
+  min-width: 0;
+  flex: 1;
 }
 
 .trash-item {
@@ -5088,12 +6204,34 @@ a.btn {
    变更 / diff / Git / 会话搜索 / @ 引用 / 上下文占用
    ============================================================ */
 
-/* ---------- 上下文占用条 ---------- */
+/* ---------- 状态行：左边运行状态，右边上下文占用 ---------- */
+/* 固定一行高度：运行中「正在思考 → Running run_shell → 自动验证…」只换文字，
+   不再把输入框上下推，也不会在消息区和上下文栏之间来回跳 */
+.composer-status {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 20px;
+  max-width: calc(var(--chat-max) - 64px);
+  margin: 0 auto;
+  padding: 0 14px 6px;
+  box-sizing: border-box;
+}
+
+.composer-status-left {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+}
+
+/* 「上下文 / 用量 / 自动分配」这类状态整组贴右，和输入框右侧的用量、发送键一列 */
 .ctx-bar {
   display: flex;
   align-items: center;
+  justify-content: flex-end;
   gap: 8px;
-  padding: 0 14px 6px;
+  flex: none;
   font-size: calc(11px * var(--fs, 1));
   color: var(--muted);
 }
@@ -5104,7 +6242,9 @@ a.btn {
 }
 
 .ctx-track {
-  flex: 1;
+  /* 不能 flex:1：它会吃掉整行剩余宽度，把「上下文」顶回最左边 */
+  flex: 0 1 160px;
+  width: 160px;
   min-width: 60px;
   max-width: 220px;
   height: 4px;
@@ -5204,23 +6344,6 @@ a.btn {
 }
 
 /* ---------- 输入区「继续」 ---------- */
-.resume-btn {
-  flex: none;
-  padding: 0 12px;
-  height: 34px;
-  border-radius: 8px;
-  background: var(--panel-3);
-  border: 1px solid var(--border-strong);
-  color: var(--text-soft);
-  font-size: calc(12.5px * var(--fs, 1));
-  cursor: pointer;
-}
-
-.resume-btn:hover {
-  border-color: var(--accent);
-  color: var(--text);
-}
-
 /* ---------- 消息操作 ---------- */
 .msg-acts {
   display: flex;
@@ -6282,4 +7405,614 @@ a.btn {
 .auto-fallback > .note {
   flex: 1;
   min-width: 0;
+}
+
+/* ---------- Agent 面板：档案 + 定时任务 ---------- */
+.agent-panel {
+  width: 880px;
+  max-width: 100%;
+  height: 86vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--panel);
+  border: 1px solid var(--border-strong);
+  border-radius: 14px;
+  overflow: hidden;
+}
+
+.agent-panel-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+  flex: none;
+}
+
+.agent-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.agent-tabs button {
+  padding: 6px 12px;
+  border-radius: 8px;
+  color: var(--muted);
+  font-size: calc(12.5px * var(--fs, 1));
+}
+
+.agent-tabs button:hover {
+  color: var(--text);
+  background: var(--panel-2);
+}
+
+.agent-tabs button.on {
+  color: var(--text);
+  background: var(--panel-3);
+}
+
+.agent-close {
+  margin-left: auto;
+  width: 26px;
+  height: 26px;
+  border-radius: 7px;
+  color: var(--muted);
+  font-size: 16px;
+  line-height: 1;
+}
+
+.agent-close:hover {
+  color: var(--text);
+  background: var(--panel-2);
+}
+
+.agent-cols {
+  display: flex;
+  min-height: 0;
+  flex: 1;
+}
+
+.agent-list {
+  width: 210px;
+  flex: none;
+  border-right: 1px solid var(--border);
+  padding: 10px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.agent-list-item {
+  width: 100%;
+  text-align: left;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid transparent;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.agent-list-item:hover {
+  background: var(--panel-2);
+}
+
+.agent-list-item.on {
+  background: var(--panel-3);
+  border-color: var(--border-strong);
+}
+
+.agent-list-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: calc(12.5px * var(--fs, 1));
+  color: var(--text);
+}
+
+.agent-badge {
+  padding: 1px 5px;
+  border-radius: 4px;
+  font-size: calc(10px * var(--fs, 1));
+  color: var(--muted);
+  background: var(--panel-3);
+  border: 1px solid var(--border);
+}
+
+.agent-list-sub {
+  font-size: calc(11px * var(--fs, 1));
+  color: var(--dim);
+}
+
+.agent-list-new {
+  margin-top: 6px;
+  padding: 8px 10px;
+  border: 1px dashed var(--border-strong);
+  border-radius: 8px;
+  color: var(--muted);
+  font-size: calc(12px * var(--fs, 1));
+  text-align: left;
+}
+
+.agent-list-new:hover {
+  color: var(--text);
+  background: var(--panel-2);
+}
+
+.agent-form {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+/* 只有中间这段滚，操作栏留在外面，永远不会盖住最后一个字段 */
+.agent-form-scroll {
+  flex: 1;
+  overflow-y: auto;
+  padding: 14px 18px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.agent-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.agent-field > label {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: calc(11.5px * var(--fs, 1));
+  color: var(--muted);
+}
+
+.agent-label-hint {
+  color: var(--dim);
+  font-size: calc(10.5px * var(--fs, 1));
+}
+
+.agent-field input,
+.agent-field select,
+.agent-field textarea {
+  width: 100%;
+  font-size: calc(12.5px * var(--fs, 1));
+}
+
+.agent-role {
+  min-height: 110px;
+  resize: vertical;
+  line-height: 1.55;
+  font-family: inherit;
+}
+
+.agent-tool-mode {
+  display: inline-flex;
+  padding: 2px;
+  gap: 2px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  align-self: flex-start;
+}
+
+.agent-tool-mode button {
+  padding: 5px 11px;
+  border-radius: 6px;
+  color: var(--muted);
+  font-size: calc(11.5px * var(--fs, 1));
+}
+
+.agent-tool-mode button.on {
+  background: var(--panel-3);
+  color: var(--text);
+}
+
+.agent-tools {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.tool-chip {
+  padding: 4px 9px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: calc(11px * var(--fs, 1));
+  font-family: var(--font-mono, ui-monospace, monospace);
+}
+
+.tool-chip:hover {
+  border-color: var(--border-strong);
+  color: var(--text);
+}
+
+.tool-chip.on {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.agent-note {
+  margin: 0;
+  font-size: calc(11px * var(--fs, 1));
+  color: var(--dim);
+  line-height: 1.5;
+}
+
+.agent-ws {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.agent-ws-path {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--code-bg);
+  color: var(--text-soft);
+  font-size: calc(11.5px * var(--fs, 1));
+  direction: rtl;
+  text-align: left;
+}
+
+.agent-check {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  font-size: calc(11.5px * var(--fs, 1));
+  color: var(--muted);
+  line-height: 1.5;
+}
+
+.agent-check input {
+  margin-top: 2px;
+  width: auto;
+}
+
+.agent-error {
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: rgba(239, 106, 106, 0.1);
+  border: 1px solid rgba(239, 106, 106, 0.35);
+  color: var(--danger);
+  font-size: calc(11.5px * var(--fs, 1));
+}
+
+/* 操作栏常驻底部：表单再长也不用滚到底才能保存 */
+.agent-actions {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+  padding: 12px 18px;
+  background: var(--panel);
+  border-top: 1px solid var(--border);
+}
+
+.agent-spacer {
+  flex: 1;
+}
+
+.agent-empty {
+  margin: auto;
+  padding: 24px;
+  text-align: center;
+  color: var(--muted);
+  font-size: calc(12.5px * var(--fs, 1));
+  line-height: 1.7;
+}
+
+.agent-empty-sub {
+  color: var(--dim);
+  font-size: calc(11.5px * var(--fs, 1));
+}
+
+/* 定时任务 */
+.routine-view {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.routine-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.routine-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel-2);
+}
+
+.routine-main {
+  flex: 1;
+  min-width: 0;
+}
+
+.routine-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: calc(12.5px * var(--fs, 1));
+  color: var(--text);
+}
+
+.routine-badge {
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-size: calc(10px * var(--fs, 1));
+  color: var(--muted);
+  border: 1px solid var(--border);
+}
+
+.routine-badge.off {
+  color: var(--dim);
+}
+
+.routine-badge.st-ok {
+  color: var(--ok);
+  border-color: rgba(99, 201, 138, 0.4);
+}
+
+.routine-badge.st-fail {
+  color: var(--danger);
+  border-color: rgba(239, 106, 106, 0.4);
+}
+
+.routine-badge.st-running {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.routine-badge.st-skipped {
+  color: var(--warn);
+  border-color: rgba(229, 181, 103, 0.4);
+}
+
+.routine-sub {
+  margin-top: 4px;
+  font-size: calc(11px * var(--fs, 1));
+  color: var(--dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.routine-acts {
+  display: flex;
+  gap: 6px;
+  flex: none;
+}
+
+.routine-acts .btn {
+  padding: 5px 9px;
+  font-size: calc(11.5px * var(--fs, 1));
+}
+
+.routine-foot {
+  flex: none;
+  padding: 10px 16px;
+  border-top: 1px solid var(--border);
+}
+
+/* 共享黑板：一页便签，读的时候要像看文件，不像看消息 */
+.board-head {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 16px 10px;
+}
+
+.board-text {
+  flex: 1;
+  min-height: 0;
+  margin: 0 16px;
+  padding: 14px 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--code-bg);
+  color: var(--text-soft);
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: calc(12px * var(--fs, 1));
+  line-height: 1.75;
+  white-space: pre-wrap;
+  overflow-y: auto;
+}
+
+/* 交接回执：一行结论，多了就省略，点开会话看全文 */
+.handoff-result {
+  margin: 2px 0 4px;
+  padding-left: 8px;
+  border-left: 2px solid var(--border-strong);
+  color: var(--text-soft);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.routine-form {
+  max-width: 620px;
+}
+
+.routine-time {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: calc(12px * var(--fs, 1));
+  color: var(--muted);
+}
+
+.routine-time input {
+  width: 66px;
+  text-align: center;
+}
+
+/* 待批准的执行方案：和 PlanCard 视觉上区分开，它是要人做决定的 */
+.plan-approval {
+  flex: none;
+  width: calc(100% - 48px);
+  margin: 10px auto 0;
+  border: 1px solid var(--accent);
+  border-radius: 10px;
+  background: var(--panel);
+  overflow: hidden;
+}
+.plan-approval.approved {
+  border-color: var(--border);
+  opacity: 0.85;
+}
+.pa-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px 6px 0;
+}
+.pa-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
+  padding: 0 6px 0 10px;
+  text-align: left;
+  font-size: calc(12px * var(--fs, 1));
+  font-weight: 600;
+  color: var(--text);
+}
+.pa-badge {
+  flex: none;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: calc(10.5px * var(--fs, 1));
+  font-weight: 600;
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+.pa-badge.ok {
+  color: var(--ok, #4ade80);
+  background: rgba(74, 222, 128, 0.14);
+}
+.pa-title .chev {
+  margin-left: auto;
+  color: var(--muted);
+}
+.pa-body {
+  padding: 0 12px 10px;
+}
+.pa-text {
+  margin: 0;
+  padding: 8px 10px;
+  max-height: 320px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel-2);
+  color: var(--text);
+  font-family: var(--mono, ui-monospace, Consolas, monospace);
+  font-size: calc(11.5px * var(--fs, 1));
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.pa-steps {
+  margin: 8px 0 0;
+  padding-left: 20px;
+  color: var(--text);
+  font-size: calc(12px * var(--fs, 1));
+  line-height: 1.7;
+}
+.pa-hint {
+  margin-top: 8px;
+  color: var(--muted);
+  font-size: calc(11.5px * var(--fs, 1));
+}
+
+/* 本轮用量：和累计用量并排，速度只在真算出来时才显示 */
+.turn-pill .foot-label {
+  color: var(--muted);
+}
+.turn-tps {
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+}
+
+/* 命中前缀缓存的输入 token：这个数越大，说明越没白算 */
+.turn-cached {
+  color: var(--ok, #3ea675);
+  font-variant-numeric: tabular-nums;
+}
+
+/* 逐块保留：一次改多处的文件才出现 */
+.hunk-picks {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-right: auto;
+}
+.hunk-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  font-size: calc(11px * var(--fs, 1));
+  color: var(--muted);
+  background: var(--panel-2);
+}
+.hunk-chip.on {
+  color: var(--text);
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+.hunk-chip em {
+  font-style: normal;
+  font-variant-numeric: tabular-nums;
+}
+.hunk-chip em.add {
+  color: var(--ok, #4ade80);
+}
+.hunk-chip em.del {
+  color: var(--danger, #f87171);
+}
+
+/* 分叉会话：挂一层缩进 + 一个 ⑂，看得出它从哪条分支出来的 */
+.session-item.forked {
+  padding-left: 20px;
+}
+.session-fork {
+  flex: none;
+  margin-right: 2px;
+  color: var(--accent);
+  font-size: calc(11px * var(--fs, 1));
+  line-height: 1;
 }

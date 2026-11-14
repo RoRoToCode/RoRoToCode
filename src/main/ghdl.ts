@@ -94,9 +94,11 @@ export async function downloadFromGithub(
   onTick?.({ received: 0, total: 0, speed: 0, source: '正在并发测速，选择最快的源…' })
   const order = await rankSources(url, mirrors)
 
+  // 四个镜像指向同一份 release 产物：打同一个 family，允许它们并发分段下载
   const sources = order.map((m) => ({
     label: m.label,
-    url: m.prefix ? `${m.prefix}${url}` : url
+    url: m.prefix ? `${m.prefix}${url}` : url,
+    family: 'github'
   }))
 
   const r = await downloadResumable(sources, dest, {

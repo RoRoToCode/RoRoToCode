@@ -1,7 +1,9 @@
 import type { ChatMessage, ProviderConfig, TokenUsage, ToolCall } from '../../shared/types'
+import { samplingBody } from '../../shared/chatbody'
+import { parseArgs, RAW_ARG_KEY } from '../../shared/toolargs'
 import type { ToolSpec } from '../tools/spec'
 import { imageDataUrl } from '../vision'
-import { idleGuard, joinUrl, readError, requestSignal, sseLines } from './base'
+import { ensureLocalAwake, explainStreamFailure, idleGuard, joinUrl, readError, requestSignal, sseLines } from './base'
 import type { OpenAIChunk, StreamOptions, StreamResult } from './base'
 
 type ContentPart =
@@ -89,6 +91,25 @@ function maxOutputTokens(provider: ProviderConfig): number {
 
 export async function streamOpenAI(opts: StreamOptions): Promise<StreamResult> {
   const { provider, messages, tools, onText } = opts
+  /**
+   * 本地服务可能已被空闲卸载：先叫醒再发请求。
+   *
+   * 必须放在 requestSignal 之前 —— 冷加载要几秒到几十秒，这段时间不该算进
+   * 「这一轮回答」的 10 分钟超时里，否则「睡久了 + 长任务」会被误判超时。
+   * 非本机 / 非 llama.cpp 的供应商这里直接返回，没有额外开销。
+   */
+  if (!(await ensureLocalAwake(provider))) {
+    /**
+     * 叫不醒就别把请求发出去。让 fetch 去撞「连接被拒」，用户看到的是
+     * `fetch failed` —— 和真实原因（模型文件没了 / 显存不够 / 服务起不来）
+     * 差着十万八千里，还得自己去猜。这里直接把方向指对。
+     */
+    throw new Error(
+      `本地模型没起来：${provider.name} 的服务不在，自动重新加载也失败了。\n` +
+        '到「② 本地模型」看一眼状态和崩溃日志（常见原因：模型文件被删、显存不够、端口被别的程序占用），' +
+        '重新加载后再发一次。'
+    )
+  }
   const base = normalizeBase(provider)
   const { signal, abort, done } = requestSignal(opts.signal, 10 * 60 * 1000)
   // 总超时管「彻底卡死」，看门狗管「一直没有输出」：后者才是排队时的真实体感
@@ -110,6 +131,8 @@ export async function streamOpenAI(opts: StreamOptions): Promise<StreamResult> {
     }))
     body.tool_choice = 'auto'
   }
+  // 采样与输出格式：留空 = 不发送（三条规则见 shared/chatbody.ts）
+  Object.assign(body, samplingBody(provider, tools.length > 0))
 
   let res: Response
   try {
@@ -136,30 +159,58 @@ export async function streamOpenAI(opts: StreamOptions): Promise<StreamResult> {
   }
 
   let text = ''
+  // 思考过程只累计、绝不推给界面，也不算进回答正文
+  let reasoning = ''
   const calls = new Map<number, ToolCall>()
   const rawArgs = new Map<number, string>()
   let usage: TokenUsage | undefined
+  /** 结束原因（stop / length / tool_calls…）：length 意味着输出被硬截断 */
+  let finishReason: string | undefined
+  /** llama.cpp 给的纯解码耗时；远端服务没有这个字段就留空 */
+  let genMs: number | undefined
+  const decodeMs = (n?: number): number | undefined =>
+    typeof n === 'number' && Number.isFinite(n) && n > 0 ? n : undefined
 
   const contentType = res.headers.get('content-type') ?? ''
   if (!contentType.includes('event-stream') || !res.body) {
-    const json = (await res.json()) as OpenAIChunk
+    let json: OpenAIChunk
+    try {
+      json = (await res.json()) as OpenAIChunk
+    } catch (err) {
+      guard.stop()
+      done()
+      // 这里同样可能撞上「响应体读到一半连接断了」，走同一套翻译
+      throw new Error(await explainStreamFailure(err, provider, signal))
+    }
     guard.stop()
     done()
     const choice = json.choices?.[0]
-    const content = choice?.delta?.content ?? ''
+    const msg = choice?.message ?? choice?.delta
+    const content = msg?.content ?? ''
     if (content) {
       text += content
       onText(content)
     }
+    reasoning += msg?.reasoning_content ?? msg?.reasoning ?? ''
     const u = json.usage
     if (u) {
       usage = {
         prompt: u.prompt_tokens ?? 0,
         completion: u.completion_tokens ?? 0,
-        cached: u.prompt_tokens_details?.cached_tokens
+        cached: u.prompt_tokens_details?.cached_tokens,
+        promptN: decodeMs(json.timings?.prompt_n),
+        promptMs: decodeMs(json.timings?.prompt_ms)
       }
     }
-    return { text, toolCalls: [], usage }
+    genMs = decodeMs(json.timings?.predicted_ms)
+    return {
+      text,
+      toolCalls: [],
+      usage,
+      reasoning: reasoning || undefined,
+      genMs,
+      finishReason: choice?.finish_reason ?? undefined
+    }
   }
 
   try {
@@ -177,15 +228,28 @@ export async function streamOpenAI(opts: StreamOptions): Promise<StreamResult> {
         usage = {
           prompt: chunk.usage.prompt_tokens ?? 0,
           completion: chunk.usage.completion_tokens ?? 0,
-          cached: chunk.usage.prompt_tokens_details?.cached_tokens
+          cached: chunk.usage.prompt_tokens_details?.cached_tokens,
+          promptN: decodeMs(chunk.timings?.prompt_n),
+          promptMs: decodeMs(chunk.timings?.prompt_ms)
         }
       }
+      // 计时帧通常跟 usage 在同一帧、且 choices 为空，必须放在 continue 之前读
+      genMs = decodeMs(chunk.timings?.predicted_ms) ?? genMs
+      /**
+       * 结束原因要先收：最后一帧往往只有 finish_reason、没有 delta，
+       * 放在 `if (!delta) continue` 之后会被整帧丢掉，截断也就无从判断。
+       */
+      const reason = chunk.choices?.[0]?.finish_reason
+      if (reason) finishReason = reason
       const delta = chunk.choices?.[0]?.delta
       if (!delta) continue
       if (delta.content) {
         text += delta.content
         onText(delta.content)
       }
+      // 推理模型（MiMo / DeepSeek-R1 蒸馏等）把思考单独放在这个字段。
+      // 忽略它会导致「正文一直空 → 触发空白重试 → 用户以为加载失败」。
+      reasoning += delta.reasoning_content ?? delta.reasoning ?? ''
       for (const tc of delta.tool_calls ?? []) {
         const idx = tc.index ?? 0
         if (tc.id) {
@@ -198,6 +262,9 @@ export async function streamOpenAI(opts: StreamOptions): Promise<StreamResult> {
         }
       }
     }
+  } catch (err) {
+    // undici 的 `TypeError: terminated` 不能直接甩给用户（见 explainStreamFailure）
+    throw new Error(await explainStreamFailure(err, provider, signal))
   } finally {
     guard.stop()
     done()
@@ -205,18 +272,21 @@ export async function streamOpenAI(opts: StreamOptions): Promise<StreamResult> {
 
   const toolCalls: ToolCall[] = []
   for (const [idx, call] of calls) {
-    const raw = rawArgs.get(idx) ?? '{}'
-    let args: Record<string, unknown> = {}
-    try {
-      args = raw.trim() ? (JSON.parse(raw) as Record<string, unknown>) : {}
-    } catch {
-      args = { _raw: raw }
-    }
     if (!call.name) continue
-    toolCalls.push({ id: call.id, name: call.name, args })
+    // 本地小模型的 arguments 经常不是合法 JSON，交给容错层救一次。
+    // 救不回来时把原文挂在 _raw 上：模型在下一轮能看到自己写了什么，
+    // 而不是对着一个空参数瞎猜。
+    const raw = rawArgs.get(idx) ?? '{}'
+    const parsed = parseArgs(raw)
+    toolCalls.push({
+      id: call.id,
+      name: call.name,
+      args: parsed.repair === 'failed' ? { [RAW_ARG_KEY]: raw } : parsed.args,
+      ...(parsed.repair === 'none' ? {} : { argRepair: parsed.repair })
+    })
   }
 
-  return { text, toolCalls, usage }
+  return { text, toolCalls, usage, reasoning: reasoning || undefined, genMs, finishReason }
 }
 
 export async function listOpenAIModels(provider: ProviderConfig): Promise<string[]> {

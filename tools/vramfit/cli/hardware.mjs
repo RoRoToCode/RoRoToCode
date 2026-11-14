@@ -7,7 +7,7 @@
  * 三个平台的取法完全不同，原因写在对应函数上，别为了「统一」把它们合并。
  */
 
-import { promises as fs } from 'node:fs'
+import { promises as fs, openSync, readSync, closeSync, readdirSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
 import os from 'node:os'
 import path from 'node:path'
@@ -66,9 +66,46 @@ function gpuBandwidth(name) {
   return null
 }
 
-/** 系统内存带宽粗估：部分 offload 时速度由这里决定，会慢 5–10 倍 */
+/**
+ * 系统内存带宽粗估：部分 offload 时速度由这里决定，会慢 5–10 倍。
+ *
+ * 以前固定 60 GB/s，误差能到 ±50%：DDR4-3200 双通道实际约 51，DDR5-5600 约 90。
+ * 对「部分层留在内存」的模型，这直接决定 tok/s 估算是 3 还是 6。
+ * 现在按已装内存条的规格自己算：每条 DIMM 视为一个 64-bit 通道，
+ * 带宽 ≈ Σ(速率 MHz × 8 B) —— 2×5600 正好 89.6，2×3200 是 51.2，和实测对得上。
+ */
+let ramBandwidthCache
+
 function ramBandwidth() {
-  return 60 // DDR4-3200 双通道 ≈ 51，DDR5-5600 双通道 ≈ 90，取中间值
+  if (ramBandwidthCache !== undefined) return ramBandwidthCache
+  ramBandwidthCache = detectRamBandwidth() ?? 60 // 读不到就按 DDR4 双通道的中间值
+  return ramBandwidthCache
+}
+
+function detectRamBandwidth() {
+  if (process.platform !== 'win32') return null
+  const ps = `
+$ErrorActionPreference = 'SilentlyContinue'
+Get-CimInstance Win32_PhysicalMemory |
+  Select-Object @{n='cap';e={$_.Capacity}}, @{n='speed';e={$_.ConfiguredClockSpeed}}, @{n='type';e={$_.SMBIOSMemoryType}} |
+  ConvertTo-Json -Compress -Depth 3`
+  try {
+    const r = spawnSync('powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', ps],
+      { encoding: 'utf8', windowsHide: true, timeout: 15000 })
+    const txt = (r.stdout ?? '').trim()
+    if (!txt) return null
+    const parsed = JSON.parse(txt)
+    const dimms = (Array.isArray(parsed) ? parsed : [parsed]).filter((d) => d && Number(d.speed) > 0)
+    if (!dimms.length) return null
+    // 每条 DIMM 一条 64-bit 通道：MHz × 8 B/s → GB/s 要再 / 1000
+    const gbs = dimms.reduce((sum, d) => sum + (Number(d.speed) * 8) / 1000, 0)
+    if (!Number.isFinite(gbs) || gbs < 8) return null
+    // 四通道 / 八通道工作站上「每条 DIMM 一条通道」会低估，但那是少数，宁可保守
+    return Math.round(gbs)
+  } catch {
+    return null
+  }
 }
 
 
@@ -136,6 +173,13 @@ $gpus | ConvertTo-Json -Compress -Depth 4`
         name: String(g.name),
         totalBytes: Number(g.vram) > 0 ? Number(g.vram) : 0,
         usedBytes: 0,
+        /**
+         * 注册表只能读到「容量」，读不到「现在用了多少」。
+         * 旧代码把它当 0，于是预算变成 total×0.92 —— 桌面已经占掉 1~2 GB 的 A 卡 / I 卡
+         * 上，这个数偏乐观 10~25%，推荐出来的上下文启动就 OOM 或者被 WDDM 换页拖死。
+         * 这个标记让 vramCeiling 改用保守系数（见 core/assumptions.mjs）。
+         */
+        usedUnknown: true,
         driver: g.driver ? String(g.driver) : undefined,
         backend: /nvidia/i.test(g.name) ? 'cuda' : /amd|radeon/i.test(g.name) ? 'vulkan' : 'unknown',
         source: 'registry'
@@ -271,12 +315,19 @@ function collectGpus(ramBytes) {
   for (const g of [...nv, ...rocm, ...apple, ...reg]) {
     const key = norm(g.name)
     const hit = merged.find((x) => norm(x.name) === key)
-    if (!hit) merged.push({ ...g })
+    if (!hit) {
+      merged.push({ ...g })
+      continue
+    }
+    // 「占用未知」只在两条来源都读不到时成立：nvidia-smi / rocm-smi 能读到真实占用，
+    // 不能被紧随其后的注册表条目（容量更大但 used=0）抹成未知。
+    const usedUnknown = Boolean(hit.usedUnknown) && Boolean(g.usedUnknown)
     // 同一张卡从多个来源读到：保留容量更大的那条，已占用取两者较大值
-    else if (g.totalBytes > hit.totalBytes) {
-      Object.assign(hit, g, { usedBytes: Math.max(hit.usedBytes ?? 0, g.usedBytes ?? 0) })
+    if (g.totalBytes > hit.totalBytes) {
+      Object.assign(hit, g, { usedBytes: Math.max(hit.usedBytes ?? 0, g.usedBytes ?? 0), usedUnknown })
     } else {
       hit.usedBytes = Math.max(hit.usedBytes ?? 0, g.usedBytes ?? 0)
+      hit.usedUnknown = usedUnknown
     }
   }
 
@@ -286,10 +337,20 @@ function collectGpus(ramBytes) {
   for (const g of gpus) {
     g.kind ??= /intel|uhd|iris|arc\s*graphics/i.test(g.name) ? 'integrated' : 'discrete'
     if (g.kind === 'integrated') {
-      const shared = Math.floor(ramBytes * 0.5)
+      /**
+       * 核显没有独立显存，Windows 允许它借用物理内存的一部分（通常上限是内存的一半，
+       * 但 BIOS 里可以调小）。旧代码直接取内存的 50% 当显存容量，既不扣系统开销，
+       * 也没有「BIOS 只给了 512 MB」这种情形 —— 16 GB 机器上于是报 8 GB「显存」。
+       *
+       * 这里同时做了两件事：
+       * 1. 共享上限不超过「内存 − 4 GB」：留够系统和应用程序，否则权重装进去就换页；
+       * 2. 标 usedUnknown，让预算再乘一个保守系数（而不是按 free×0.92 算）。
+       */
+      const shared = Math.max(GB, Math.min(Math.floor(ramBytes * 0.5), Math.floor(ramBytes - 4 * GB)))
       if (g.totalBytes < shared) {
         g.shared = true
         g.totalBytes = shared
+        g.usedUnknown = true
       }
     }
     g.bandwidthGBps = gpuBandwidth(g.name)

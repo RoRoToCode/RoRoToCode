@@ -21,7 +21,6 @@ let sawRefreshRetry = false
 
 const mockServer = http.createServer((req, res) => {
   const url = req.url ?? ''
-  const method = req.method ?? ''
 
   // OAuth token endpoint：第一次返回 token-v1（很快过期），之后返回 token-v2
   if (url.startsWith('/oauth/token')) {

@@ -1,7 +1,11 @@
 name: CI
 
-# 只跑「编译 + 纯函数单测」，不做打包：便携版出包要签名和本机环境，
-# 放 CI 里又慢又容易假失败，发布还是手动跑 npm run dist。
+# 为什么要有这个文件：
+# 仓库里有 462 项单测和一批 smoke 脚本，但没有任何机制保证它们被跑。
+# 改动全靠手工 npm test，一次忘记就等于没有保护。这里把「类型 + lint + 单测」
+# 固化成每次 push / PR 必过的一道门。
+#
+# 注意：smoke 脚本需要真实 Electron 窗口，跑不了无头 CI，故意不放在这里。
 
 on:
   push:
@@ -9,9 +13,17 @@ on:
   pull_request:
   workflow_dispatch:
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  test:
+  check:
+    # 项目只支持 Windows（代码里有 taskkill / DPAPI / ProgramFiles 等专有调用），
+    # 测试里的路径断言也按 win32 写，所以直接跑 windows 更贴近真实环境。
     runs-on: windows-latest
+    timeout-minutes: 20
+
     steps:
       - uses: actions/checkout@v4
 
@@ -21,13 +33,17 @@ jobs:
           cache: npm
 
       - name: 安装依赖
+        # CI 只做 tsc / eslint / node --test，不需要 Electron 运行时，
+        # 跳过 100MB+ 的二进制下载能省两分钟。
         run: npm ci
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
 
-      - name: 类型检查
+      - name: 类型检查（主进程 + 渲染层）
         run: npm run typecheck
 
-      - name: 编译主进程与渲染层
-        run: npm run build
+      - name: Lint
+        run: npm run lint
 
-      - name: 单元测试
+      - name: 单测
         run: npm test

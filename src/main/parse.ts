@@ -1,14 +1,20 @@
 import type { ToolCall } from '../shared/types'
+import { balancedEnd, parseLoose } from '../shared/toolargs'
 import { toolSpecs } from './tools/spec'
 
 /**
  * 从模型输出里识别工具调用。
  * 原生 tool_calls 由各 provider 解析；这里处理「模型把调用写成文字」的情况，
  * 主 agent 和子 agent 共用同一套规则，避免两处行为不一致。
+ *
+ * 语法容错统一走 shared/toolargs：本地小模型写 `{name: "read_file", args: {...}}`
+ * 这种裸键是家常便饭，原来这条路上会被整条当成正文发出去（没人执行、也没人报错）。
  */
 
 /** 已知工具名：用来把「正文里恰好出现的 JSON」和真正的工具调用区分开 */
 const knownTools = new Set(toolSpecs.map((t) => t.name))
+
+export { balancedEnd }
 
 export interface RawCall {
   name: string
@@ -19,7 +25,7 @@ export interface RawCall {
 function normalizeCall(value: unknown): RawCall | null {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null
   const obj = value as Record<string, unknown>
-  const nameRaw = obj.name ?? obj.tool ?? obj.tool_name ?? obj.function
+  const nameRaw = obj.name ?? obj.tool ?? obj.tool_name ?? obj.function ?? obj.toolName
   if (typeof nameRaw !== 'string') return null
   const name = nameRaw.trim()
   if (!knownTools.has(name)) return null
@@ -29,11 +35,10 @@ function normalizeCall(value: unknown): RawCall | null {
     const raw = argsRaw.trim()
     if (!raw) argsRaw = {}
     else {
-      try {
-        argsRaw = JSON.parse(raw)
-      } catch {
-        argsRaw = { input: argsRaw }
-      }
+      // 字符串形式的参数：先解一次；解不出来也别包成 { input: "..." }，
+      // 那会让工具报「缺 path」，而真正的问题在这里就能说清楚
+      const parsed = parseLoose(raw)
+      argsRaw = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : { _raw: raw }
     }
   }
   if (!argsRaw || typeof argsRaw !== 'object' || Array.isArray(argsRaw)) argsRaw = {}
@@ -46,29 +51,6 @@ export function asCalls(value: unknown): RawCall[] {
   return one ? [one] : []
 }
 
-/** 从 start 处的 { 或 [ 找到配对的收尾位置，字符串和转义都跳过 */
-export function balancedEnd(text: string, start: number): number {
-  let depth = 0
-  let inStr = false
-  let esc = false
-  for (let i = start; i < text.length; i++) {
-    const ch = text[i]
-    if (inStr) {
-      if (esc) esc = false
-      else if (ch === '\\') esc = true
-      else if (ch === '"') inStr = false
-      continue
-    }
-    if (ch === '"') inStr = true
-    else if (ch === '{' || ch === '[') depth++
-    else if (ch === '}' || ch === ']') {
-      depth--
-      if (depth === 0) return i
-    }
-  }
-  return -1
-}
-
 /**
  * 把模型输出的文本里夹带的工具调用剥出来。
  * 兼容四种写法：裸 JSON、``` 代码块（不限语言标记）、<tool_call> 标签、以及 JSON 数组。
@@ -79,12 +61,10 @@ export function parseTextToolCalls(text: string): { cleanText: string; calls: To
   const removed: Array<[number, number]> = []
 
   const accept = (start: number, end: number, body: string): boolean => {
-    let value: unknown
-    try {
-      value = JSON.parse(body.trim())
-    } catch {
-      return false
-    }
+    // 用容错解析：裸键、单引号、尾逗号在本地模型上太常见，
+    // 严格 JSON.parse 会把整个调用吞掉当正文显示出来
+    const value = parseLoose(body)
+    if (value === undefined) return false
     const found = asCalls(value)
     if (!found.length) return false
     for (const c of found) {

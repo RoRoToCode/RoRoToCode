@@ -22,7 +22,12 @@ export interface MemoryInfo {
   chars: number
 }
 
-function slug(workspace: string): string {
+/**
+ * 工作区落盘用的短名：目录名 + 绝对路径哈希。
+ * 导出是为了让共享黑板（main/board.ts）用同一套命名 —— 同一个项目，
+ * 记忆和黑板应该肩并肩放在一起，用户排查时不用记两套规则。
+ */
+export function workspaceSlug(workspace: string): string {
   const abs = path.resolve(workspace)
   const hash = createHash('sha1').update(abs.toLowerCase()).digest('hex').slice(0, 8)
   const raw = path.basename(abs) || 'workspace'
@@ -34,13 +39,26 @@ function slug(workspace: string): string {
   return `${base}-${hash}`
 }
 
-export function memoryPath(workspace: string): string {
-  return path.join(app.getPath('userData'), 'memory', `${slug(workspace)}.md`)
+/**
+ * 记忆命名空间的落点。
+ *
+ * 没有 agentId 就是原来的「每个工作区一份」，老文件路径完全不变；
+ * 指定 agentId 时另开一份（`<工作区>.<档案>.md`），让巡检记住的坑不会污染审查的判断 ——
+ * 角色的经验混在一起，比没有记忆更糟。
+ */
+function nsSuffix(agentId?: string | null): string {
+  if (!agentId) return ''
+  const safe = String(agentId).replace(/[^\w.-]+/g, '_').slice(0, 40)
+  return safe ? `.${safe}` : ''
 }
 
-export async function readMemory(workspace: string): Promise<string> {
+export function memoryPath(workspace: string, agentId?: string | null): string {
+  return path.join(app.getPath('userData'), 'memory', `${workspaceSlug(workspace)}${nsSuffix(agentId)}.md`)
+}
+
+export async function readMemory(workspace: string, agentId?: string | null): Promise<string> {
   try {
-    return await fs.readFile(memoryPath(workspace), 'utf8')
+    return await fs.readFile(memoryPath(workspace, agentId), 'utf8')
   } catch {
     return ''
   }
@@ -56,8 +74,8 @@ function bullets(text: string): string[] {
 }
 
 /** 给系统提示用的片段：最新优先，超长从头截 */
-export async function memoryForPrompt(workspace: string): Promise<string> {
-  const items = bullets(await readMemory(workspace))
+export async function memoryForPrompt(workspace: string, agentId?: string | null): Promise<string> {
+  const items = bullets(await readMemory(workspace, agentId))
   if (!items.length) return ''
   const picked: string[] = []
   let used = 0
@@ -69,13 +87,35 @@ export async function memoryForPrompt(workspace: string): Promise<string> {
   return picked.map((i) => `- ${i}`).join('\n')
 }
 
-export async function memoryInfo(workspace: string): Promise<MemoryInfo> {
-  const text = await readMemory(workspace)
+export async function memoryInfo(workspace: string, agentId?: string | null): Promise<MemoryInfo> {
+  const text = await readMemory(workspace, agentId)
   return {
-    path: memoryPath(workspace),
+    path: memoryPath(workspace, agentId),
     items: bullets(text).length,
     chars: text.length
   }
+}
+
+/**
+ * 同一份记忆文件的写入必须排队。
+ *
+ * 为什么会撞：引擎的并发锁是按会话的，不是按 agent 的 —— 同一个 agent 开两个会话
+ * 同时跑时，两边几乎同时调 remember，各自「读全文 → 改 → 写回」，
+ * 后写的那次会把先写的那条整条盖掉，且不会报错。
+ * 文件只有几 KB，排队成本可以忽略；key 是记忆文件路径，数量随工作区×档案增长，很小。
+ */
+const writing = new Map<string, Promise<unknown>>()
+
+function serialize<T>(key: string, task: () => Promise<T>): Promise<T> {
+  const prev = writing.get(key) ?? Promise.resolve()
+  // 前一次失败也要接着做：记忆写不进去不该卡住后面的记录
+  const next = prev.then(task, task)
+  // 存一个永不 reject 的版本，否则排在后面的会继承这次失败
+  writing.set(
+    key,
+    next.catch(() => undefined)
+  )
+  return next
 }
 
 /**
@@ -83,12 +123,20 @@ export async function memoryInfo(workspace: string): Promise<MemoryInfo> {
  */
 export async function rememberFact(
   workspace: string,
-  note: string
+  note: string,
+  agentId?: string | null
 ): Promise<{ added: boolean; count: number }> {
   const text = note.replace(/\s+/g, ' ').trim().slice(0, 400)
   if (!text) throw new Error('note 不能为空')
+  return serialize(memoryPath(workspace, agentId), () => appendFact(workspace, text, agentId))
+}
 
-  const items = bullets(await readMemory(workspace))
+async function appendFact(
+  workspace: string,
+  text: string,
+  agentId?: string | null
+): Promise<{ added: boolean; count: number }> {
+  const items = bullets(await readMemory(workspace, agentId))
   const normalized = (s: string) => s.replace(/^[\d-]+\s*/, '').toLowerCase()
   if (items.some((i) => normalized(i).includes(normalized(text)))) {
     return { added: false, count: items.length }
@@ -105,7 +153,7 @@ export async function rememberFact(
     ''
   ].join('\n')
 
-  const file = memoryPath(workspace)
+  const file = memoryPath(workspace, agentId)
   await fs.mkdir(path.dirname(file), { recursive: true })
   await fs.writeFile(file, body, 'utf8')
 
@@ -127,6 +175,6 @@ export async function rememberFact(
   return { added: true, count: next.length }
 }
 
-export async function clearMemory(workspace: string): Promise<void> {
-  await fs.rm(memoryPath(workspace), { force: true })
+export async function clearMemory(workspace: string, agentId?: string | null): Promise<void> {
+  await fs.rm(memoryPath(workspace, agentId), { force: true })
 }

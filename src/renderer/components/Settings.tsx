@@ -1,16 +1,14 @@
 import { t as tr } from '../i18n'
 import { useEffect, useRef, useState, type ReactNode } from 'react'
-import type { AppConfig, FreeModel, FreeSource, ProviderConfig, ProviderKind, WorkerPlan } from '../../shared/types'
-import { isLlamaProvider, llamaPortOf, runtimeKindOf } from '../../shared/providers'
+import type { AppConfig, ProviderConfig, ProviderKind, SlotsProbeResult, WorkerPlan } from '../../shared/types'
+import { isLlamaProvider, isLoopbackUrl, runtimeKindOf } from '../../shared/providers'
 import { StatusDot, type ProbeInfo, type ProbeState } from './ModelPicker'
 import { LocalModels, type LocalModelsHandle } from './LocalModels'
 import { ModelSpecs } from './ModelSpecs'
 import { BaseTools } from './BaseTools'
-import { SimpleCore } from './SimpleCore'
 import { ExternalAccess } from './ExternalAccess'
 import { Chevron, useCollapse } from './Collapse'
 import { ModelCombo } from './ModelCombo'
-import { FreeModels } from './FreeModels'
 
 /** 四个标签页：原来「模型引导」里的三块并入设置，原供应商列表变成第 4 页 */
 const TABS = [
@@ -128,7 +126,7 @@ interface RtState {
  * 例外是「模型名」：在「② 本地模型」页点选并启动后会直接写盘，
  * 这时磁盘才是最新状态，除非用户在本面板里刚手动改过这一项（`touched`）。
  */
-function mergeDraft(prev: AppConfig, disk: AppConfig, touched: Set<string>): AppConfig {
+function mergeDraft(prev: AppConfig, disk: AppConfig, touched: Set<string>, keepActive = false): AppConfig {
   const known = new Set(prev.providers.map((p) => p.id))
   const providers = prev.providers.map((p) => {
     const d = disk.providers.find((x) => x.id === p.id)
@@ -137,7 +135,8 @@ function mergeDraft(prev: AppConfig, disk: AppConfig, touched: Set<string>): App
     return { ...p, model, baseUrl: p.baseUrl || d.baseUrl }
   })
   for (const d of disk.providers) if (!known.has(d.id)) providers.push({ ...d })
-  return { ...prev, providers, activeId: disk.activeId ?? prev.activeId }
+  // 用户在本面板里点过「使用」：那是没保存的显式选择，不能被后台写盘的 activeId 顶掉
+  return { ...prev, providers, activeId: keepActive ? prev.activeId : disk.activeId ?? prev.activeId }
 }
 
 export function Settings({
@@ -175,6 +174,13 @@ export function Settings({
   /** 工人模型的并行判定结果（按「主模型 id」缓存，点「检查」才求值） */
   const [wplan, setWplan] = useState<Record<string, WorkerPlan | null>>({})
   const [wplanBusy, setWplanBusy] = useState(false)
+  /**
+   * 多槽实测：这是唯一一个会真的往模型服务发长请求的检查，
+   * 慢（几秒到一分多钟）且会占满上下文，所以按 provider 分开记录，
+   * 一次只允许测一个。
+   */
+  const [slotBusy, setSlotBusy] = useState<string | null>(null)
+  const [slotResult, setSlotResult] = useState<Record<string, SlotsProbeResult>>({})
   /** 可绑定的设备（值就是 -dev 认的名字：CUDA0 / CUDA1 / Vulkan1 …） */
   const [devices, setDevices] = useState<Array<{ id: string; name: string; vramMiB?: number }>>([])
 
@@ -183,6 +189,12 @@ export function Settings({
   draftRef.current = draft
   // 本面板里用户手动改过模型名的供应商：合并磁盘配置时不覆盖它
   const touchedModels = useRef<Set<string>>(new Set())
+  /**
+   * 本面板里点过「使用」但还没保存：这是用户的显式选择。
+   * 本地模型卡片写盘后会触发 syncFromDisk，它拿磁盘的 activeId 合并草稿 ——
+   * 不挡住的话，刚点好的「当前使用」会被悄悄换回上一个模型。
+   */
+  const touchedActive = useRef(false)
 
   // 「② 本地模型」页的「自动配置 / 一键启动」会直接写盘，这里把结果合并进草稿，
   // 让新建的本地模型立刻出现在列表里（并滚动过去）
@@ -191,7 +203,7 @@ export function Settings({
     const disk = await window.pico.config.get()
     const known = new Set(draftRef.current.providers.map((p) => p.id))
     const added = disk.providers.filter((p) => !known.has(p.id)).map((p) => p.id)
-    setDraft((prev) => mergeDraft(prev, disk, touchedModels.current))
+    setDraft((prev) => mergeDraft(prev, disk, touchedModels.current, touchedActive.current))
     // 本地服务可能换了模型 / 换了服务，重新读一次状态，两边标记才一致
     void refreshAllRuntimes()
     if (added.length) {
@@ -237,61 +249,6 @@ export function Settings({
   /** 「模型 API」页的「我有 API，添加」：新增供应商，切到模型列表并滚动到它 */
   function addProviderFromApi() {
     const id = addProvider()
-    setTab('list')
-    window.setTimeout(() => {
-      document.getElementById(`prov-${id}`)?.scrollIntoView({ block: 'center', behavior: 'smooth' })
-    }, 80)
-  }
-
-  /**
-   * 从「免费模型」清单里加一家：模型名和 Base URL 都填好，只留 API Key 让用户自己粘。
-   * 默认勾上「备用」——免费模型大多限速，当主力不稳，当兜底正好。
-   */
-  function addFreeProvider(source: FreeSource, model?: FreeModel) {
-    const taken = new Set(draftRef.current.providers.map((p) => p.id))
-    let id = `free_${source.id}`
-    let n = 2
-    while (taken.has(id)) id = `free_${source.id}_${n++}`
-
-    // 同一个接口地址已经有条目填过 Key，就直接沿用。
-    // 「免费模型」每加一个模型就新建一条供应商，用户只会在第一次粘 Key；
-    // 后来加的几条空白着，切过去就是 401 —— 那种「我明明配好了却用不了」最难查。
-    const norm = (u: string) => (u || '').trim().replace(/\/+$/, '').toLowerCase()
-    const inherited =
-      draftRef.current.providers.find(
-        (p) => norm(p.baseUrl) === norm(source.baseUrl) && (p.apiKey ?? '').trim()
-      )?.apiKey ?? ''
-
-    const short = model ? (model.name.length > 26 ? `${model.name.slice(0, 26)}…` : model.name) : ''
-    const name = model ? `${source.name} · ${short}` : source.name
-    setDraft((prev) => ({
-      ...prev,
-      providers: [
-        ...prev.providers,
-        {
-          id,
-          name,
-          kind: source.kind,
-          baseUrl: source.baseUrl,
-          apiKey: inherited,
-          model: model?.id ?? '',
-          contextWindow: model?.context && model.context > 2048 ? model.context : 32768,
-          temperature: 0.2,
-          fallback: true
-        }
-      ]
-    }))
-    setExpanded((prev) => ({ ...prev, [id]: true }))
-    setNote({
-      text: inherited
-        ? model
-          ? tr("已加入「{name}」，沿用同一接口的 Key（默认备用）。", { name: name })
-          : tr("已加入「{name}」，沿用了同一接口已填的 API Key", { name: source.name })
-        : model
-          ? tr("已加入「{name}」，粘上 Key 保存即可（默认备用）。", { name: name })
-          : tr("已加入「{name}」，粘上 Key 后点「拉取模型列表」。", { name: source.name }),
-      kind: 'ok'
-    })
     setTab('list')
     window.setTimeout(() => {
       document.getElementById(`prov-${id}`)?.scrollIntoView({ block: 'center', behavior: 'smooth' })
@@ -379,6 +336,30 @@ export function Settings({
       setNote({ text: tr("检测失败：{0}", { "0": (err as Error).message }), kind: 'err' })
     } finally {
       setRtBusy(null)
+    }
+  }
+
+  /** 实测多槽：会真的发长请求，慢但不猜。结果留在卡片上，不弹窗 */
+  async function runSlotProbe(id: string) {
+    setSlotBusy(id)
+    try {
+      const r = await window.pico.llama.probeSlots(id)
+      setSlotResult((prev) => ({ ...prev, [id]: r }))
+    } catch (err) {
+      setSlotResult((prev) => ({
+        ...prev,
+        [id]: {
+          verdict: 'error',
+          slots: 0,
+          testCtx: 0,
+          singleMs: null,
+          concurrentMs: null,
+          promptTokens: null,
+          message: tr("实测失败：{0}", { "0": (err as Error).message })
+        }
+      }))
+    } finally {
+      setSlotBusy(null)
     }
   }
 
@@ -478,7 +459,16 @@ export function Settings({
     setBusy(true)
     try {
       await onSave(draft)
+      // 已经落盘了，之后以磁盘为准：再同步时不必再护住草稿里的选择
+      touchedActive.current = false
       onClose()
+    } catch (err) {
+      /**
+       * 保存失败必须说出来。之前只有 try/finally：主进程写盘失败会 rethrow，
+       * 这里既不提示也不关闭，用户看到的是「点了保存，什么都没发生」，
+       * 控制台里只留一条 unhandled rejection。
+       */
+      setNote({ text: tr("保存失败：{0}", { "0": (err as Error).message }), kind: 'err' })
     } finally {
       setBusy(false)
     }
@@ -552,6 +542,11 @@ export function Settings({
             const localList = rtState?.models ?? []
             const localOptions =
               localName && !localList.includes(localName) ? [localName, ...localList] : localList
+            // 本地服务探活通过 ≠ 模型在跑：没加载的一点显存都不占，黄灯标出来。
+            // 远程地址（配成远端端口的 Ollama）没有「启动」这回事，仍按可用处理
+            const idle =
+              probe.idle === true ||
+              (probe.state === 'ok' && rtKind !== null && probe.running === false && isLoopbackUrl(p.baseUrl))
             return (
               <div
                 key={p.id}
@@ -564,19 +559,30 @@ export function Settings({
                   onClick={() => setExpanded((prev) => ({ ...prev, [p.id]: !prev[p.id] }))}
                 >
                   <span className="prov-color" style={{ background: color }} />
-                  <StatusDot state={probe.state} error={probe.error} />
+                  <StatusDot state={idle ? 'ready' : probe.state} error={probe.error} />
                   <div className="prov-title">
                     <span className="prov-tname">{p.name || tr("未命名")}</span>
                     <span className="prov-tsub">{p.model || tr("未选择模型")}</span>
                   </div>
-                  <span className={`prov-state ${probe.state}`}>
-                    {probe.state === 'ok' ? tr("可用") : probe.state === 'checking' ? tr("检测中") : tr("不可用")}
+                  <span className={`prov-state ${idle ? 'ready' : probe.state}`}>
+                    {probe.state === 'ok'
+                      ? idle
+                        ? tr("可用 · 未启动")
+                        : rtKind
+                          ? tr("运行中")
+                          : tr("可用")
+                      : probe.state === 'checking'
+                        ? tr("检测中")
+                        : idle
+                          ? tr("未启动")
+                          : tr("不可用")}
                   </span>
                   {draft.activeId === p.id && <span className="prov-badge">{tr("当前使用")}</span>}
                   <button
                     className="btn"
                     onClick={(e) => {
                       e.stopPropagation()
+                      touchedActive.current = true
                       setDraft((prev) => ({ ...prev, activeId: p.id }))
                     }}
                     disabled={draft.activeId === p.id}
@@ -653,6 +659,61 @@ export function Settings({
                           value={p.temperature ?? 0.2}
                           onChange={(e) => patchProvider(p.id, { temperature: Number(e.target.value) })}
                         />
+                      </div>
+                      {/**
+                        * 留空 = 不发送该参数，用服务端默认。
+                        * 这两种语义必须分开：填 0 在 top_p 上等于贪心采样，
+                        * 和「不设置」是完全相反的效果。
+                        */}
+                      <div className="grid2">
+                        <div className="field">
+                          <label title={tr("越接近 1 越发散；本地小模型绕圈时压到 0.8~0.9 常比调温度有效")}>
+                            {tr("Top P（留空用服务端默认）")}
+                          </label>
+                          <input
+                            type="number"
+                            step="0.05"
+                            min="0.01"
+                            max="1"
+                            placeholder={tr("服务端默认")}
+                            value={p.topP ?? ''}
+                            onChange={(e) => {
+                              const v = e.target.value.trim()
+                              patchProvider(p.id, { topP: v ? Number(v) : undefined })
+                            }}
+                          />
+                        </div>
+                        <div className="field">
+                          <label title={tr("1.05~1.15 压重复；超过 1.3 会开始破坏正常用词")}>
+                            {tr("重复惩罚（留空用服务端默认）")}
+                          </label>
+                          <input
+                            type="number"
+                            step="0.01"
+                            min="0.5"
+                            max="2"
+                            placeholder={tr("服务端默认")}
+                            value={p.repeatPenalty ?? ''}
+                            onChange={(e) => {
+                              const v = e.target.value.trim()
+                              patchProvider(p.id, { repeatPenalty: v ? Number(v) : undefined })
+                            }}
+                          />
+                        </div>
+                      </div>
+                      <div className="field">
+                        <label
+                          style={{ display: 'flex', alignItems: 'center', gap: 6 }}
+                          title={tr("只对纯问答生效；带工具的请求会强制关掉，否则工具调用会被写成普通文本")}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={Boolean(p.jsonMode)}
+                            onChange={(e) => patchProvider(p.id, { jsonMode: e.target.checked })}
+                            style={{ width: 'auto' }}
+                          />
+                          {tr("要求合法 JSON 输出（仅纯问答）")}
+                        </label>
                       </div>
                     </div>
                     {rtKind === 'llama' && (
@@ -793,7 +854,7 @@ export function Settings({
                     )}
                     <div className="row">
                       <label
-                        style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 'calc(12px * var(--fs, 1))', color: '#8b8b95' }}
+                        style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 'calc(12px * var(--fs, 1))', color: 'var(--muted)' }}
                       >
                         {tr("看图能力")}<select
                           value={p.vision ?? 'auto'}
@@ -812,7 +873,7 @@ export function Settings({
                     </div>
                     <div className="row">
                       <label
-                        style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 'calc(12px * var(--fs, 1))', color: '#8b8b95' }}
+                        style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 'calc(12px * var(--fs, 1))', color: 'var(--muted)' }}
                       >
                         <input
                           type="checkbox"
@@ -825,7 +886,7 @@ export function Settings({
                     </div>
                     <div className="row">
                       <label
-                        style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 'calc(12px * var(--fs, 1))', color: '#8b8b95' }}
+                        style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 'calc(12px * var(--fs, 1))', color: 'var(--muted)' }}
                       >
                         <input
                           type="checkbox"
@@ -839,7 +900,7 @@ export function Settings({
                     </div>
                     <div className="row">
                       <label
-                        style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 'calc(12px * var(--fs, 1))', color: '#8b8b95' }}
+                        style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 'calc(12px * var(--fs, 1))', color: 'var(--muted)' }}
                       >
                         {tr("用途")}
                         <select
@@ -867,6 +928,31 @@ export function Settings({
                         </span>
                       </div>
                     )}
+                    {/* 多槽实测：会真发长请求，慢；但这是唯一能证明「开了 2 槽到底有没有用」的办法 */}
+                    <div className="row">
+                      <button
+                        type="button"
+                        disabled={slotBusy !== null}
+                        onClick={() => void runSlotProbe(p.id)}
+                      >
+                        {slotBusy === p.id ? tr("实测中…（可能几分钟）") : tr("实测多槽并发")}
+                      </button>
+                      <span
+                        className="note"
+                        style={{
+                          color:
+                            slotResult[p.id]?.verdict === 'parallel'
+                              ? 'var(--ok, inherit)'
+                              : slotResult[p.id] && slotResult[p.id].verdict !== 'unsupported'
+                                ? 'var(--warn, inherit)'
+                                : undefined
+                        }}
+                        title={slotResult[p.id]?.detail}
+                      >
+                        {slotResult[p.id]?.message ??
+                          tr("开多个槽到底有没有用：先发一个长请求，再并发两个，看上下文会不会被挤掉。")}
+                      </span>
+                    </div>
                   </div>
                 )}
               </div>
@@ -877,8 +963,6 @@ export function Settings({
         <div className="guide-body">
           {tab === 'base' && (
             <div className="guide-section">
-              {/* 一键把 core/ + 模型 + llama.cpp 备齐：给「先能聊起来」的人走的直线 */}
-              <SimpleCore onChanged={syncFromDisk} />
               <BaseTools />
               {/* 开源后最常见的问题：「怎么让别的工具用上这台机器的模型」 */}
               <Fold id="external-access" title={tr("外部接入（Cline / Cursor / 脚本）")}>
@@ -930,7 +1014,7 @@ export function Settings({
           {tab === 'api' && (
             <div className="guide-section">
               <p className="guide-lead">
-                {tr("云端模型只要 Base URL 和 API Key：新增供应商 → 填地址与 Key → 拉取模型 → 保存。")}</p>
+                {tr("云端模型只要 Base URL 和 API Key：点「添加」新增一条，填地址与 Key → 拉取模型 → 保存。这里不预置任何服务商，接口全部由你自己添加。")}</p>
               <div className="guide-actions">
                 <button className="btn primary" onClick={() => addProviderFromApi()}>
                   {tr("我有 API，添加")}</button>
@@ -949,29 +1033,9 @@ export function Settings({
                   {tr("按列表顺序依次尝试勾了「备用」的供应商；已输出一半时不切换。")}</span>
               </div>
 
-              <FreeModels onAdd={addFreeProvider} />
-
-              <Fold id="api-doc" title={tr("常见端点与安全提示")}>
-              <h3>{tr("常见端点")}</h3>
-              <ul className="guide-list">
-                <li>
-                  <b>OpenAI</b>：<code>https://api.openai.com/v1</code>{tr("，模型如")}<code>gpt-4o-mini</code>
-                </li>
-                <li>
-                  <b>Anthropic</b>：<code>https://api.anthropic.com</code>{tr("，模型如")}{' '}
-                  <code>claude-sonnet-4-20250514</code>
-                </li>
-                <li>
-                  <b>DeepSeek</b>：<code>https://api.deepseek.com/v1</code>
-                </li>
-                <li>{tr("其他 OpenAI 兼容服务同理，填对应的 Base URL 即可。")}</li>
-              </ul>
-              <h3>{tr("安全提示")}</h3>
-              <ul className="guide-list">
-                <li>{tr("API Key 仅保存在本机配置文件中，不会上传。")}</li>
-                <li>{tr("不要把 Key 提交到代码仓库或分享给他人。")}</li>
-              </ul>
-              </Fold>
+              <p className="note">
+                {tr("API Key 仅保存在本机配置文件中，不会上传；也不要把 Key 提交到代码仓库或分享给他人。")}
+              </p>
             </div>
           )}
         </div>

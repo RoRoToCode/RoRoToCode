@@ -4,9 +4,15 @@ import type {
   ChatMessage,
   FileChange,
   ProviderConfig,
-  SubAgentTask
+  SubAgentTask,
+  ToolCall
 } from '../shared/types'
 import type { ToolSpec } from './tools/spec'
+import { toolSpecs } from './tools/spec'
+import { settleToolArgs } from '../shared/toolargs'
+import { diagnoseReport } from './lsp'
+import { formatDiagGap, formatDiagnostics } from '../shared/diagnostics'
+import { createToolCallGuard } from '../shared/toolguard'
 import { chat } from './providers'
 import { classifyRisk, executeTool, previewWrite, previewPatch, patchTargets, toolTargetPath } from './tools'
 import type { RiskInfo } from './tools'
@@ -14,6 +20,7 @@ import { loadProjectPermissions } from './permissions'
 import { parseTextToolCalls } from './parse'
 import { recordChange } from './changes'
 import { diffLines, diffStats } from './diff'
+import { runHooks } from './hooks'
 
 /** 子 agent 写过的文件类型：只有这些需要留可撤销的快照 */
 const WRITE_TOOLS = new Set(['write_file', 'edit_file', 'patch'])
@@ -142,6 +149,14 @@ export async function runSubAgent(opts: SubAgentOptions): Promise<SubAgentTask> 
 
   // 项目级权限规则：子代理和主 agent 用同一套边界，安全不能因为「子」就放开
   const permRules = await loadProjectPermissions(opts.workspace)
+  /**
+   * 子 agent 只有 30 步，比父会话更经不起空转：同一个 grep / 同一个 patch
+   * 来回发几遍，步数就没了，交回去的还是一句「我还在看」。
+   * 护栏和主链路共用一套判据（同参数 + 结果没变才算空转）。
+   */
+  const callGuard = createToolCallGuard()
+  /** 「该查却没查」只提示一次 */
+  let gapNoted = false
 
   const messages: ChatMessage[] = [
     { id: 'child-system', role: 'system', content: childPrompt(opts.workspace, opts.web, opts.instructions), createdAt: Date.now() },
@@ -180,11 +195,57 @@ export async function runSubAgent(opts: SubAgentOptions): Promise<SubAgentTask> 
         createdAt: Date.now()
       })
 
-      for (const call of calls) {
+      for (const rawCall of calls) {
         if (opts.signal.aborted) throw new Error('已取消')
         const started = Date.now()
 
+        /**
+         * 和主 agent 走同一套参数容错。子 agent 烧的是同一份上下文，
+         * 一个坏 JSON 在它这里同样会变成「缺少 path → 我用法不对 → 再试一遍」的死循环。
+         */
+        const settled = settleToolArgs(rawCall, toolSpecs.find((t) => t.name === rawCall.name))
+        const call: ToolCall = { ...rawCall, args: settled.args }
+
+        if (settled.blocked) {
+          messages.push({
+            id: `child-t-${step}-${call.id}`,
+            role: 'tool',
+            content: clip(settled.blocked),
+            toolCallId: call.id,
+            toolName: call.name,
+            toolArgs: call.args,
+            createdAt: Date.now()
+          })
+          task.tools.push({
+            tool: call.name,
+            ok: false,
+            durationMs: Date.now() - started,
+            note: '参数不合法，未执行'
+          })
+          continue
+        }
+
         // 子 agent 干的是真活：改文件、跑命令一样要过审批，安全边界不能因为「子」就放开
+        const repeat = callGuard.check(call.name, call.args)
+        if (repeat.verdict === 'block') {
+          messages.push({
+            id: `child-t-${step}-${call.id}`,
+            role: 'tool',
+            content: clip(repeat.note),
+            toolCallId: call.id,
+            toolName: call.name,
+            toolArgs: call.args,
+            createdAt: Date.now()
+          })
+          task.tools.push({
+            tool: call.name,
+            ok: false,
+            durationMs: Date.now() - started,
+            note: '重复调用，已拦截'
+          })
+          continue
+        }
+
         const risk = classifyRisk(call.name, call.args, opts.workspace, permRules)
         let approved = true
         if (risk) {
@@ -214,6 +275,15 @@ export async function runSubAgent(opts: SubAgentOptions): Promise<SubAgentTask> 
         const targets: string[] = []
         if (call.name === 'patch') {
           targets.push(...patchTargets(opts.workspace, call.args, risk?.kind === 'outside'))
+        } else if (call.name === 'format') {
+          const list = Array.isArray(call.args.paths) ? (call.args.paths as unknown[]).map(String) : []
+          for (const p of list) {
+            try {
+              targets.push(toolTargetPath(opts.workspace, p, risk?.kind === 'outside'))
+            } catch {
+              // 越界路径交给工具自己报错
+            }
+          }
         } else if (WRITE_TOOLS.has(call.name)) {
           try {
             targets.push(toolTargetPath(opts.workspace, String(call.args.path ?? ''), risk?.kind === 'outside'))
@@ -226,7 +296,22 @@ export async function runSubAgent(opts: SubAgentOptions): Promise<SubAgentTask> 
 
         let output: string
         let ok = true
-        if (!approved) {
+        /**
+         * 钩子对子 agent 同样生效：一个「不许改 generated/」的钩子
+         * 不该因为改动是子 agent 做的就绕过去。
+         */
+        const preHook = approved
+          ? await runHooks('preToolUse', {
+              workspace: opts.workspace,
+              sessionId: opts.sessionId,
+              tool: call.name,
+              args: call.args
+            })
+          : { ran: 0 }
+        if (preHook.blocked) {
+          ok = false
+          output = `钩子拒绝了这个操作：${preHook.blocked}`
+        } else if (!approved) {
           ok = false
           output = '用户拒绝执行该操作。请换一种方式，或直接说明这件事没做成。'
         } else {
@@ -239,6 +324,16 @@ export async function runSubAgent(opts: SubAgentOptions): Promise<SubAgentTask> 
           } catch (err) {
             ok = false
             output = `执行失败：${(err as Error).message}`
+          }
+          if (approved) {
+            const postHook = await runHooks('postToolUse', {
+              workspace: opts.workspace,
+              sessionId: opts.sessionId,
+              tool: call.name,
+              args: call.args,
+              result: output
+            })
+            if (postHook.context) output += `\n\n【钩子】\n${postHook.context}`
           }
         }
 
@@ -258,9 +353,30 @@ export async function runSubAgent(opts: SubAgentOptions): Promise<SubAgentTask> 
             })
             if (change) opts.onChange(change)
           }
+          /**
+           * 子 agent 同一条规矩：改完立刻查一次编译，错误当场还给它。
+           * 子 agent 的步数被压到 30，比父会话更经不起「改坏了还往下改」——
+           * 错在这里被发现，能就地修；等到父会话收尾才发现，这 30 步已经全白跑。
+           */
+          const report = await diagnoseReport(opts.workspace, targets)
+          if (report.diags.length) {
+            output += `\n\n${formatDiagnostics(report.diags, {
+              workspace: opts.workspace,
+              filesWritten: targets.length
+            })}`
+          } else if (report.skipped === 'no-typescript' || report.skipped === 'unavailable') {
+            // 子 agent 的生命更短：说一次就够，别每改一个文件重复一遍
+            if (!gapNoted) {
+              gapNoted = true
+              output += `\n\n${formatDiagGap(report.skipped)}`
+            }
+          }
         }
 
         const durationMs = Date.now() - started
+        if (settled.note) output = `${settled.note}\n\n${output}`
+        callGuard.record(call.name, call.args, output)
+        if (repeat.verdict === 'warn') output += `\n\n${repeat.note}`
         const text = clip(output)
         messages.push({
           id: `child-t-${step}-${call.id}`,

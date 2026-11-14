@@ -1,6 +1,7 @@
 import type { ChatMessage, ProviderConfig, TokenUsage, ToolCall } from '../../shared/types'
+import { parseArgs, RAW_ARG_KEY } from '../../shared/toolargs'
 import { imageDataUrl } from '../vision'
-import { joinUrl, readError, requestSignal, sseLines } from './base'
+import { explainStreamFailure, joinUrl, readError, requestSignal, sseLines } from './base'
 import type { StreamOptions, StreamResult } from './base'
 
 type Block =
@@ -187,6 +188,8 @@ export async function streamAnthropic(opts: StreamOptions): Promise<StreamResult
         }
       }
     }
+  } catch (err) {
+    throw new Error(await explainStreamFailure(err, provider, signal))
   } finally {
     done()
   }
@@ -194,13 +197,15 @@ export async function streamAnthropic(opts: StreamOptions): Promise<StreamResult
   const toolCalls: ToolCall[] = []
   for (const call of calls.values()) {
     if (!call.name) continue
-    let args: Record<string, unknown> = {}
-    try {
-      args = call.json.trim() ? (JSON.parse(call.json) as Record<string, unknown>) : {}
-    } catch {
-      args = { _raw: call.json }
-    }
-    toolCalls.push({ id: call.id || `tool_${Math.random().toString(36).slice(2)}`, name: call.name, args })
+    // 三条 provider 走同一个容错层：Anthropic 官方不会吐坏 JSON，
+    // 但 baseUrl 指到本地代理时它就是另一个「小模型」，行为得一致
+    const parsed = parseArgs(call.json)
+    toolCalls.push({
+      id: call.id || `tool_${Math.random().toString(36).slice(2)}`,
+      name: call.name,
+      args: parsed.repair === 'failed' ? { [RAW_ARG_KEY]: call.json } : parsed.args,
+      ...(parsed.repair === 'none' ? {} : { argRepair: parsed.repair })
+    })
   }
 
   return { text, toolCalls, usage }
