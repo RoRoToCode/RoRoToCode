@@ -33,6 +33,7 @@ if (!fs.existsSync(exe)) {
 const bytes = fs.readFileSync(exe)
 const sha = crypto.createHash('sha256').update(bytes).digest('hex')
 const sizeMB = (bytes.length / 1024 ** 2).toFixed(1)
+writeShaFile(asset, sha)
 
 // NSIS 安装器是可选的，有就一起列出来
 // 只认本次的 NSIS 安装器。release/ 里可能残留旧版本 portable exe 或别的 exe，
@@ -41,8 +42,15 @@ const installers = fs.readdirSync(path.join(root, 'release'))
   .filter((f) => f.endsWith('.exe') && !f.endsWith('-portable.exe') && /setup/i.test(f))
   .map((f) => {
     const buf = fs.readFileSync(path.join(root, 'release', f))
-    return `| ${f} | ${(buf.length / 1024 ** 2).toFixed(1)} MB | \`${crypto.createHash('sha256').update(buf).digest('hex')}\` |`
+    const h = crypto.createHash('sha256').update(buf).digest('hex')
+    writeShaFile(f, h)
+    return `| ${f} | ${(buf.length / 1024 ** 2).toFixed(1)} MB | \`${h}\` |`
   })
+
+/** 每个 exe 旁边都放一份 .sha256，Release 上传时一并带上 */
+function writeShaFile(name, hex) {
+  fs.writeFileSync(path.join(root, 'release', `${name}.sha256`), `${hex}  ${name}\n`)
+}
 
 const lines = [
   '## 是什么',

@@ -33,11 +33,11 @@ jobs:
           cache: npm
 
       - name: 安装依赖
-        # CI 只做 tsc / eslint / node --test，不需要 Electron 运行时，
-        # 跳过 100MB+ 的二进制下载能省两分钟。
+        # 不要设 ELECTRON_SKIP_BINARY_DOWNLOAD=1 来省时间：单测会 require
+        # dist/main/store.js 等模块，它们顶层 require('electron')，而 electron 包在
+        # 二进制缺失时是直接抛 "Electron failed to install correctly"，不是返回路径字符串。
+        # 跳过下载的结果就是「类型检查和 lint 都过、单测必挂」（v0.1.2 起每次 push 都这么红的）。
         run: npm ci
-        env:
-          ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
 
       - name: 类型检查（主进程 + 渲染层）
         run: npm run typecheck

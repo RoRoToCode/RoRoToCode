@@ -62,6 +62,10 @@ jobs:
         run: npm run dist
 
       - name: 打 NSIS 安装器
+        # NSIS 是可选产物（winget 清单用的是 portable 那一个）。这一步在 2026-11-14 的
+        # v0.1.3 运行里失败过，把后面「生成文案 / 上传资产」全带偏了，最后一个 Release
+        # 只能手工补建、正文为空。改成不阻塞：装不出来就跳过，portable 照常发布。
+        continue-on-error: true
         run: npm run dist:installer
 
       - name: 生成 Release 文案与 winget 清单
@@ -84,16 +88,32 @@ jobs:
             Write-Warning "runner 上没有 winget，跳过 validate；请在本地跑 winget validate --manifest $m"
           }
 
-      - name: 创建 Release 并上传资产
+      - name: 创建或更新 Release
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # 只用自己生成的文案：--generate-notes 会把英文自动日志混进中文说明里，
-          # 而且不同 gh 版本对「自动日志 + 自定义文案」的组合支持不一致，容易在发布阶段翻车。
-          gh release create "v$env:VERSION" release/*.exe release/*.sha256 `
-            --title "v$env:VERSION" `
-            --notes-file release/RELEASE_NOTES.md
+          # 幂等：Release 已存在就覆盖资产 + 刷新文案，而不是直接报
+          # "a release with the same tag name already exists"。这样重跑 workflow 是安全操作。
+          # 只用自己生成的文案：--generate-notes 会把英文自动日志混进中文说明里。
+          $tag = "v$env:VERSION"
+          $files = @(Get-ChildItem release -File |
+            Where-Object { $_.Extension -in '.exe', '.sha256' } |
+            ForEach-Object { $_.FullName })
+          if ($files.Count -eq 0) { throw "release/ 下没有 exe 或 .sha256，先确认打包步骤是否成功" }
+          $files | ForEach-Object { Write-Host "  资产 $($_ | Split-Path -Leaf)" }
+
+          gh release view $tag --json tagName 2>$null | Out-Null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "Release $tag 已存在，覆盖资产并刷新文案"
+            gh release upload $tag @files --clobber
+            if ($LASTEXITCODE -ne 0) { throw "gh release upload 失败" }
+            gh release edit $tag --title $tag --notes-file release/RELEASE_NOTES.md
+            if ($LASTEXITCODE -ne 0) { throw "gh release edit 失败" }
+          } else {
+            gh release create $tag @files --title $tag --notes-file release/RELEASE_NOTES.md
+            if ($LASTEXITCODE -ne 0) { throw "gh release create 失败" }
+          }
 
       - name: 归档 winget 清单
         uses: actions/upload-artifact@v4
