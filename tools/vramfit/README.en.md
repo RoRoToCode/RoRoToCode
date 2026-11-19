@@ -144,7 +144,7 @@ Real output, abridged: RTX 3050 (8 GB) checking a 7B Q4_K_M.
      native 128K is supported, VRAM runs out first
   Agent     template 2.5 KB · ✓ tools branch · ✓ tool_call format
             supported at template level; real runs decide reliability
-  Speed     ~33 tok/s (224 GB/s ÷ 4.68 GB × 0.7)
+  Speed     ~29 tok/s (224 GB/s × 0.60 ÷ 4.68 GB)
 ```
 
 The number that matters isn't "it runs" — it's **"native 128K, but this machine tops out at 32K"**. Every report ends with a parameters block; `--about` is the full version.
@@ -203,7 +203,13 @@ One token reads the entire weight set from memory, so the bottleneck is **bandwi
 tok/s ≈ bandwidth(GB/s) × efficiency ÷ weight size(GB)
 ```
 
-Calibrated on an RTX 2080 (448 GB/s) with a 9B Q4_K_M (5.78 GB): `448 × 0.7 ÷ 5.78 = 54.3`, **measured 53.9**. That's where 0.7 comes from. All four tiers were actually loaded with llama.cpp on that machine:
+Efficiency is not a constant: it's tabulated by **backend family × weight bit-width**. At 16-bit only bandwidth utilisation counts; at 4-bit a dequantisation penalty stacks on top, interpolated in between. Bit-width isn't looked up in a table — it's derived from real file size ÷ parameter count, so new quant formats work too.
+
+The historical calibration point is an RTX 2080 (448 GB/s) with a 9B Q4_K_M (5.78 GB): `448 × 0.7 ÷ 5.78 = 54.3`, measured 53.9. The problem with a single point is that 0.7 systematically over-predicts on high-bandwidth cards like the 4090 — across the same four models it ran about 18% high, and per-backend/per-width tabulation brings that to roughly 3%.
+
+The trade-off, stated plainly: on that same 2080 the estimate becomes `448 × 0.60 ÷ 5.78 = 46.5`, about 14% below the measurement. **One measured point cannot cover every card**, so we chose accuracy on newer cards and conservatism on older ones, and widened the band from ±15% to **±20%** (speed only; the VRAM predictions below are unaffected).
+
+All four tiers were actually loaded with llama.cpp on that machine:
 
 | Context | Predicted | Measured VRAM | Error | Measured speed |
 |---|---|---|---|---|
@@ -212,12 +218,12 @@ Calibrated on an RTX 2080 (448 GB/s) with a 9B Q4_K_M (5.78 GB): `448 × 0.7 ÷ 
 | 32K | 6738 MiB | 6676 MiB | +0.9% | 53.9 tok/s |
 | 64K | 7762 MiB | 7737 MiB | +0.3% | 57.1 tok/s |
 
-Predictions run slightly high (conservative), all within 2%. 64K is marked ✗ on purpose: it did load, but with 251 MiB left — one browser tab and you're OOM. It recommends what you can safely use, not the largest thing that barely fits.
+VRAM predictions run slightly high (conservative), all within 2%. 64K is marked ✗ on purpose: it did load, but with 251 MiB left — one browser tab and you're OOM. It recommends what you can safely use, not the largest thing that barely fits.
 
 A few trade-offs:
 
 - **Weights don't fit** → it switches to RAM bandwidth (~60 GB/s), so you'll see `~6 tok/s`. That's what partial offload feels like.
-- **Under 2 GB of weights it only gives a ceiling**: a 0.6B Q4 computes to 395 on a 3050 but measures 70–120. Kernel launches, sampling and transfers dominate; the formula is meaningless there.
+- **Under 2 GB of weights it only gives a ceiling**: a 0.6B Q4 computes to 371 on a 3050 but measures 70–120. Kernel launches, sampling and transfers dominate; the formula is meaningless there.
 - **MoE reads low**: total size is used, but only some experts activate, so real speed is higher. The report says so.
 - **GPUs outside the built-in table get no speed number** rather than a guess.
 
@@ -272,10 +278,10 @@ All constants live in [`core/assumptions.mjs`](core/assumptions.mjs) — the rep
 | Weights | file bytes, shards scaled by count |
 | KV cache | `ctx × layers × n_kv_head × (k+v) × bytes per element`; f16=2 B, q8_0=1.0625 B, q4_0=0.5625 B |
 | Runtime overhead | fixed 800 MiB (CUDA context + compute buffers) |
-| Speed | `bandwidth × 0.7 ÷ weightGB`, ±15% |
+| Speed | `bandwidth × efficiency ÷ weightGB`; efficiency by backend and width, ±20% |
 | Thresholds | need > ceiling×0.85 → "close"; < 3B → runs only; < 8K → too short; 1–2 bit → "avoid" (empirical) |
 
-Hybrid linear attention (Qwen3-Next et al), sliding-window attention (Gemma 3/4), MTP layers, sharding and the native context boundary are handled automatically, and the report distinguishes what was read from what was inferred. One GPU only, no tensor parallelism.
+Hybrid linear attention (Qwen3-Next et al), sliding-window attention (Gemma 3/4), MTP layers, sharding and the native context boundary are handled automatically, and the report distinguishes what was read from what was inferred. Per-GPU results lead; multi-GPU adds a combined check (layer split, VRAM pooled via `-sm layer`, no tensor parallelism).
 
 ## Disclaimer
 
@@ -284,7 +290,7 @@ Hybrid linear attention (Qwen3-Next et al), sliding-window attention (Gemma 3/4)
 So:
 
 - VRAM predictions were calibrated on real hardware (within 2%), but that was four tiers on one RTX 2080. Other platforms and architectures will drift.
-- Speed is estimated from bandwidth, ±15%; small models and large MoE drift further.
+- Speed comes from bandwidth × tabulated efficiency, ±20%; small models and large MoE drift further.
 - `agent-ready` only means "it fits and the template has a tools branch" — **not that the model reliably calls tools**. `unknown` means metadata was incomplete, **not that it won't run**.
 - Results are a reference, not a promise about performance, compatibility or what to buy. The real answer is loading the model once on your machine.
 

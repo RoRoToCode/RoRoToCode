@@ -4,7 +4,7 @@
  */
 
 import { paramCountOf, quantFromName, quantTier, activeParamsFromName } from './quant.mjs'
-import { TUNING, KV_BYTES_PER_ELEM } from './assumptions.mjs'
+import { TUNING, KV_BYTES_PER_ELEM, deviceFamilyOf, decodeEfficiency } from './assumptions.mjs'
 import { t } from './i18n.mjs'
 
 /**
@@ -384,17 +384,24 @@ export function assess(meta, hw, opts = {}) {
   const speedWeights = moe?.activeBytes ?? weights
 
   // 生成速度：每吐一个 token 要把权重从显存读一遍，所以瓶颈是带宽不是算力。
-  // 用 RTX 2080 + 9B Q4_K_M 实测校准过：448 × 0.7 / 5.78 = 54.3，实测 53.9（±1%）。
-  // 这是「零上下文、batch=1、权重驻留显存」的解码峰值：真实解码每步还要读 KV cache，
+  // 峰值口径是「零上下文、batch=1、权重驻留显存」：真实解码每步还要读 KV cache，
   // 另外还有首字延迟、工具执行、排队，所以主界面的实测值必然低于这个数。
   // 部分 offload 时读的是系统内存，速度掉到内存带宽水平；纯 CPU 推理只有这一档。
   const ramBw = hw.ramBandwidthGBps
-  const eff = TUNING.memoryEfficiency
+  // 位宽从「真实文件体积 ÷ 参数量」反推：本工具本来就读真实 GGUF 体积，
+  // 这样不必维护量化名→bpw 对照表，新量化格式也能算。拿不到就保持空值，
+  // 让效率函数退回历史 0.7，而不是猜一个位宽出来。
+  const paramCount = paramCountOf(meta.file, meta.paramCount)
+  const bitsPerWeight = Number.isFinite(paramCount) && paramCount > 0 && weights > 0
+    ? (weights * 8) / paramCount
+    : null
+  const family = deviceFamilyOf(gpu, hw)
+  const eff = decodeEfficiency(family, bitsPerWeight)
   const gb = speedWeights / 1e9
   let speed = null
   if (!gpu) {
-    // 效率因子和显存分支共用同一个 TUNING 值：以前这里写死 0.7，
-    // 重新校准时 CPU 分支纹丝不动，两条路径悄悄给出不同口径。
+    // CPU 分支同样走分档函数；后端未知时它返回 TUNING.memoryEfficiency，
+    // 两条路径共用一处校准，改这里不会再出现「显存改了 CPU 没改」。
     speed = ramBw
       ? { bandwidth: ramBw, onVram: null, onRam: (ramBw * eff) / gb, efficiency: eff, cpu: true }
       : null
@@ -405,6 +412,10 @@ export function assess(meta, hw, opts = {}) {
       onRam: ramBw ? (ramBw * eff) / gb : null,
       efficiency: eff
     }
+  }
+  if (speed) {
+    speed.family = family
+    speed.bitsPerWeight = bitsPerWeight
   }
 
   // 按建议上下文折减：解码每步除了读权重，还要把整段 KV cache 读一遍。

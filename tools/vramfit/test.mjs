@@ -34,7 +34,7 @@ import {
   TUNING, ASSUMPTIONS, KV_BYTES_PER_ELEM, VALUE_FLAGS, setMirror, getMirror, DEFAULT_MIRROR, OFFICIAL,
   setLocale, getLocale, detectLocale, t, dictStats, bothLangs, labelWidth, assumptionsList, localeOf,
   speedCapFor, assumptionLines, mergedHardware, moeInfo, activeParamsFromName, launchArgsOf, isMla,
-  paramCountOf, verdictOf
+  paramCountOf, verdictOf, decodeEfficiency, deviceFamilyOf
 } from './core/index.mjs'
 import { appleWorkingSet, gpuBandwidth } from './cli/hardware.mjs'
 
@@ -981,17 +981,73 @@ test('JSON：CPU 推理的速度不能写成 0 tok/s', () => {
 
 // ───────────── 速度口径：零上下文峰值 / 封顶 / 上下文折减 ─────────────
 
-test('速度公式守住 RTX 2080 + 9B Q4 的实测校准点', () => {
-  // core/assess.mjs 注释里那个校准点：448 GB/s × 0.7 ÷ 5.78 GB = 54.3，实测 53.9。
-  // 把它写成断言，免得以后调效率因子时把已验证的校准悄悄改坏。
+test('速度公式：老契约走 0.7，明确后端后按分档，两者都留在 ±20% 内', () => {
+  // 本机实测点：448 GB/s + 9B Q4_K_M（5.78 GB），53.9 tok/s。
   const nineB = { ...meta8b, sizeBytes: 5.78e9 }
-  const hw = {
+  // 1) 只给卡名、不给 backend 的调用方（老 JSON 契约、第三方集成）继续吃 TUNING 的 0.7，
+  //    这一口径就是当年按这台机器拟合的，54.3 与实测 53.9 差 1%。
+  const legacy = {
     gpus: [{ name: 'RTX 2080', totalBytes: 8 * GB, usedBytes: 0, bandwidthGBps: 448 }],
     ramBytes: 32 * GB, ramBandwidthGBps: 50, platform: 'test'
   }
-  const r = assess(nineB, hw, { weightsBytes: 5.78e9 })
-  assert.ok(Math.abs(r.speed.onVram - 54.3) < 0.2, `公式值偏离校准点：${r.speed.onVram}`)
-  assert.ok(Math.abs(r.speed.onVram / 53.9 - 1) < 0.01, '和实测的差距应在 1% 内')
+  const a = assess(nineB, legacy, { weightsBytes: 5.78e9 })
+  assert.ok(Math.abs(a.speed.onVram - 54.3) < 0.2, `老契约应仍是 54.3，实际 ${a.speed.onVram}`)
+  assert.equal(a.speed.efficiency, TUNING.memoryEfficiency)
+
+  // 2) CLI 真实路径：探测到 cuda 就分档，Q4_K_M（5.14 bpw）按 0.60 算 → 46.5。
+  //    这条比实测低 ~14%，是「新卡更准、旧卡偏保守」这个取舍的代价，
+  //    误差带因此放宽到 ±20%（TUNING.speedErrorPct）。别把它当成回归。
+  const detected = {
+    gpus: [{ name: 'RTX 2080', totalBytes: 8 * GB, usedBytes: 0, bandwidthGBps: 448, backend: 'cuda' }],
+    ramBytes: 32 * GB, ramBandwidthGBps: 50, platform: 'test'
+  }
+  const b = assess(nineB, detected, { weightsBytes: 5.78e9 })
+  assert.equal(b.speed.family, 'cuda-consumer')
+  assert.ok(b.speed.onVram < a.speed.onVram, '分档后必须比 0.7 口径保守')
+  assert.ok(Math.abs(b.speed.onVram / 53.9 - 1) * 100 <= TUNING.speedErrorPct,
+    `偏差 ${(Math.abs(b.speed.onVram / 53.9 - 1) * 100).toFixed(1)}% 超出 ±${TUNING.speedErrorPct}%`)
+})
+
+test('解码效率按后端与位宽分档，不再全用 2080 的 0.7', () => {
+  // 16-bit 只看带宽利用率；4-bit 再叠加反量化惩罚，两者分开才解释得通实测差异
+  assert.equal(decodeEfficiency('cuda-consumer', 16), 0.75)
+  assert.ok(Math.abs(decodeEfficiency('cuda-consumer', 4) - 0.75 * 0.78) < 1e-9)
+  assert.ok(decodeEfficiency('cuda-consumer', 8) > decodeEfficiency('cuda-consumer', 4),
+    '位宽越高反量化惩罚越小')
+  assert.ok(decodeEfficiency('metal', 4) < decodeEfficiency('cuda-consumer', 4),
+    'Metal 的反量化惩罚比 CUDA 重')
+  // 后端未知 / 位宽拿不到 → 退回历史固定值，别拿猜出来的数冒充精确
+  assert.equal(decodeEfficiency('unknown', 4), TUNING.memoryEfficiency)
+  assert.equal(decodeEfficiency('cuda-consumer', null), TUNING.memoryEfficiency)
+  assert.equal(decodeEfficiency('cpu', 4), TUNING.memoryEfficiency)
+})
+
+test('设备族只在后端明确时启用，光凭卡名不猜', () => {
+  assert.equal(deviceFamilyOf({ name: 'RTX 4090' }), 'unknown',
+    '老调用方只给卡名：保持历史口径，不悄悄改校准点')
+  assert.equal(deviceFamilyOf({ name: 'RTX 4090', backend: 'cuda' }), 'cuda-consumer')
+  assert.equal(deviceFamilyOf({ name: 'NVIDIA A100', backend: 'cuda' }), 'cuda-datacenter')
+  assert.equal(deviceFamilyOf({ name: 'Radeon RX 7900', backend: 'vulkan' }), 'rocm')
+  assert.equal(deviceFamilyOf({ name: 'Apple M3 Max', backend: 'metal' }), 'metal')
+  assert.equal(deviceFamilyOf(null), 'cpu')
+})
+
+test('4090 + Q4：分档后速度从 0.7 口径降下来，接近 llama.cpp 基准', () => {
+  const weights = 9e9 * 4.75 / 8 // 9B，4.75 bpw
+  const meta = { ...meta8b, file: 'model-9B-Q4_K_M.gguf', paramCount: 9e9 }
+  const hw = {
+    gpus: [{ name: 'RTX 4090', totalBytes: 24 * GB, usedBytes: 0, bandwidthGBps: 1008, backend: 'cuda' }],
+    ramBytes: 64 * GB, ramBandwidthGBps: 80, platform: 'test'
+  }
+  const r = assess(meta, hw, { weightsBytes: weights, budget: 'static' })
+  const oldPeak = (1008 * TUNING.memoryEfficiency) / (weights / 1e9)
+  assert.equal(r.speed.family, 'cuda-consumer')
+  assert.ok(Math.abs(r.speed.bitsPerWeight - 4.75) < 1e-9, '位宽应从真实体积反推')
+  assert.ok(r.speed.efficiency < TUNING.memoryEfficiency - 0.08,
+    `4090 Q4 效率应明显低于 0.7，实际 ${r.speed.efficiency}`)
+  assert.ok(r.speed.onVram < oldPeak * 0.9,
+    `峰值应从旧口径 ${oldPeak.toFixed(1)} 降下来，实际 ${r.speed.onVram.toFixed(1)}`)
+  // 2080 那种只给卡名、不给后端的老契约仍走 0.7，历史测试在上面护着
 })
 
 test('CPU 推理的速度效率因子与 TUNING 同源，不再写死 0.7', () => {

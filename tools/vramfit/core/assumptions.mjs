@@ -36,7 +36,11 @@ export const TUNING = {
    */
   visionOverheadBytes: 384 * 1024 * 1024,
 
-  /** 显存带宽利用率：每吐一个 token 要把全部权重读一遍，实际有效带宽约为标称值的 70% */
+  /**
+   * 兜底效率（不是主口径）：只在拿不到后端族或权重位宽时使用。
+   * 0.7 是按 RTX 2080 + 9B Q4_K_M 实测（53.9 tok/s）拟合的单点值；
+   * 主路径见下面的 DECODE_EFFICIENCY，按后端族 × 位宽分档。
+   */
   memoryEfficiency: 0.7,
 
   /** 需要量超过上限的这个比例就标「接近上限」，提醒用户别再往上开上下文 */
@@ -94,7 +98,65 @@ export const TUNING = {
   speedCapTiny: 200,
 
   /** 速度估算的误差区间（百分比），只用于文案 */
-  speedErrorPct: 15
+  speedErrorPct: 20
+}
+
+/**
+ * 解码效率 = 带宽利用率（16-bit）× 反量化惩罚（按权重位宽插值）。
+ *
+ * 为什么不能只用一个数：原来的固定 0.7 是按 RTX 2080 + 9B Q4_K_M 实测校准的（53.9 tok/s），
+ * 对那张卡是对的；但把同一系数套到 4090 这类高带宽卡上，解码就系统性偏乐观 ——
+ * 4090 的带宽利用率实测约 0.75，可 4-bit 权重还要先解包，两步合起来只有约 0.59。
+ * 这两段效应分开列表，才能既解释 2080 的老实测、又解释新卡上的偏差。
+ *
+ * 数字来自公开的 llama.cpp pp/tg 基准拟合（不是我们自己测的）：
+ *   - cuda-consumer：4090 F16 ≈ 0.72 MBU、7B Q4_0 ≈ 0.57 MBU
+ *   - metal：M2 Ultra F16 ≈ 0.71、7B Q4_0 ≈ 0.42
+ *   - cuda-datacenter：HBM + CUDA graph 运行时可到 0.85
+ *   - rocm：同档内存上解码 kernel 落后 CUDA
+ *
+ * 只在探测到明确后端时启用分档；后端未知时退回 TUNING.memoryEfficiency（0.7），
+ * 保持历史校准口径，不拿猜出来的后端冒充精确。
+ */
+export const DECODE_EFFICIENCY = {
+  'cuda-consumer': { mbu: 0.75, dequant4: 0.78 },
+  'cuda-datacenter': { mbu: 0.85, dequant4: 0.85 },
+  rocm: { mbu: 0.72, dequant4: 0.7 },
+  metal: { mbu: 0.7, dequant4: 0.62 }
+}
+
+const DEQUANT_REFERENCE_BITS = 4
+const NATIVE_BITS = 16
+
+/**
+ * 从硬件描述推断设备族。只有明确的后端标识才会分档：
+ * 只给了卡名、没给 backend 的调用方（老的 JSON 契约、第三方集成）继续走兜底，
+ * 避免拿名字猜出来的族把已验证的校准点悄悄改掉。
+ */
+export function deviceFamilyOf(gpu, hw) {
+  if (!gpu) return 'cpu'
+  const backend = String(gpu.backend || '').toLowerCase()
+  const name = String(gpu.name || '').toLowerCase()
+  if (backend === 'metal' || hw?.osPlatform === 'darwin' || hw?.platform === 'darwin') return 'metal'
+  if (backend === 'rocm' || (backend === 'vulkan' && /amd|radeon/.test(name))) return 'rocm'
+  if (backend === 'cuda') {
+    // 数据中心卡：A/H/L 系列与老 Tesla/Quadro。消费卡 GeForce/RTX 走另一档。
+    return /\b(a100|a8000|a6000|a5000|a40|a30|h100|h200|h800|l40|l40s|l4|v100|p100|t4|a10)\b|tesla/.test(name)
+      ? 'cuda-datacenter'
+      : 'cuda-consumer'
+  }
+  return 'unknown'
+}
+
+/**
+ * 给定设备族和每权重位宽，返回有效带宽利用率。
+ * bpw 拿不到时退回历史固定值——宁可保守报粗估，也不编一个精度。
+ */
+export function decodeEfficiency(family, bitsPerWeight) {
+  const table = DECODE_EFFICIENCY[family]
+  if (!table || !Number.isFinite(bitsPerWeight) || bitsPerWeight <= 0) return TUNING.memoryEfficiency
+  const narrowness = Math.min(Math.max((NATIVE_BITS - bitsPerWeight) / (NATIVE_BITS - DEQUANT_REFERENCE_BITS), 0), 1)
+  return table.mbu * (1 - (1 - table.dequant4) * narrowness)
 }
 
 /**
@@ -206,15 +268,15 @@ export const ASSUMPTIONS = [
   {
     group: ['生成速度（零上下文解码峰值）', 'Generation speed (zero-context decode peak)'],
     items: [
-      { k: ['公式', 'Formula'], v: ['带宽 × 0.7 ÷ 权重 GB', 'bandwidth × 0.7 ÷ weight GB'],
-        note: ['瓶颈是带宽不是算力，已按 RTX 2080 + 9B 实测校准（±1%）。这是零上下文、batch=1、全权重驻留显存时的理论上限，不是实际能跑到的速度',
-          'Bandwidth-bound, not compute-bound; calibrated against an RTX 2080 with 9B (±1%). This is a theoretical ceiling at zero context, batch=1, all weights resident — not a speed you should expect in practice'] },
+      { k: ['公式', 'Formula'], v: ['带宽 × 效率 ÷ 权重 GB', 'bandwidth × efficiency ÷ weight GB'],
+        note: ['瓶颈是带宽不是算力。效率按显卡后端和权重量化位宽分档：带宽利用率 × 4-bit 反量化惩罚，取自 llama.cpp 公开 pp/tg 基准；后端未知时退回 0.7（RTX 2080 + 9B 实测校准点）。这是零上下文、batch=1、权重驻留显存时的理论上限，不是实际能跑到的速度',
+          'Bandwidth-bound, not compute-bound. Efficiency is tabulated by backend and weight width: bandwidth utilisation × 4-bit dequantisation penalty, fitted to published llama.cpp pp/tg benchmarks; unknown backends fall back to 0.7 (calibrated on an RTX 2080 with 9B). This is a theoretical ceiling at zero context, batch=1, all weights resident — not a speed you should expect in practice'] },
       { k: ['不计上下文', 'Context excluded'], v: ['不计 KV cache 读取', 'KV cache reads excluded'],
         note: ['解码每步还要把整段 KV cache 读一遍，上下文越长越慢；另给「按建议上下文」的折减值，仍属静态推算',
           'Each decode step also reads the whole KV cache, so longer contexts are slower. A context-adjusted figure is reported separately; it is still a static estimate'] },
-      { k: ['误差', 'Error'], v: ['约 ±15%', 'about ±15%'],
-        note: ['受驱动、batch 设置、KV 精度影响；不含首字延迟、工具执行与排队，长上下文下会明显低于峰值',
-          'Depends on driver, batch settings and KV precision; excludes time-to-first-token, tool runs and queueing. Long contexts land well below the peak'] },
+      { k: ['误差', 'Error'], v: ['约 ±20%', 'about ±20%'],
+        note: ['受驱动、batch 设置、KV 精度影响；不含首字延迟、工具执行与排队，长上下文下会明显低于峰值。分档系数取自公开基准，本机 RTX 2080 + 9B Q4_K_M 的实测点（53.9）现落在 -14% 侧，故误差带放宽到 ±20%',
+          'Depends on driver, batch settings and KV precision; excludes time-to-first-token, tool runs and queueing. Long contexts land well below the peak. Family factors come from published benchmarks, and our own RTX 2080 + 9B Q4_K_M measurement (53.9) now lands 14% low, hence the ±20% band'] },
       { k: ['小模型', 'Small models'], v: ['< 2 GB 封顶 200，其余 400 tok/s', 'cap 200 under 2 GB, 400 otherwise'],
         note: ['每 token 的固定开销会压住公式值，公式对小模型失效；命令行与 JSON 都套用同一个封顶',
           'Per-token overhead dominates, so the formula stops holding. CLI and JSON apply the same cap'] },

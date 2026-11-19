@@ -627,7 +627,10 @@ function render(meta, hw, result, opts = {}) {
   L.push(drow(t('p.overhead'), t('p.overheadVal', { n: fmtSize(overhead) })))
   L.push(drow(t('p.kv'), t('p.kvVal', { n: KV_BYTES_PER_ELEM[opts.kvType ?? 'f16'] })))
   L.push(drow(t('p.ceiling'), limitBasisText(result.limitBasis)))
-  L.push(drow(t('p.speed'), t('p.speedVal', { e: TUNING.memoryEfficiency, p: TUNING.speedErrorPct })))
+  // 这里必须打印「实际用到的那个效率」，不能再写死 0.7：
+  // 分档后同一份报告可能按 0.60 算，页脚却印 0.7，用户一验算就发现对不上。
+  const effShown = Number(result.speed?.efficiency ?? TUNING.memoryEfficiency)
+  L.push(drow(t('p.speed'), t('p.speedVal', { e: effShown.toFixed(2), p: TUNING.speedErrorPct })))
   L.push(drow(t('p.threshold'), t('p.thresholdVal', {
     r: TUNING.tightRatio, p: fmtNum(TUNING.minAgentParams), c: fmtCtx(TUNING.minAgentContext)
   })))
@@ -1253,6 +1256,14 @@ function toJson(results) {
         : jsonSpeed(result.speed?.atCtx, result.speed?.basisBytes ?? totalBytes),
       speedCtx: result.speed?.atCtxTokens ?? null,
       speedBasis: 'zero-context-decode-peak',
+      /**
+       * 速度效率来源：family 是被识别的后端族，efficiency 是「带宽利用率 × 反量化惩罚」；
+       * 后端未知时 family='unknown'、efficiency 退回 0.7（2080 实测校准点）。
+       * 让脚本能解释一个数是怎么来的，而不是只拿到一个孤零零的 tok/s。
+       */
+      speedFamily: result.speed?.family ?? null,
+      speedEfficiency: result.speed?.efficiency ?? null,
+      speedBitsPerWeight: result.speed?.bitsPerWeight ?? null,
       /**
        * MoE：速度按激活专家估算，显存仍按全权重。ratio=null 表示拿不到激活数、速度未修正。
        * source: kv = 元数据 expert_used_count；name = 文件名 A22B 兜底；null = 未修正。
