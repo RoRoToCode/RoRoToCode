@@ -1,10 +1,10 @@
 # RoRoTo Code
 
-![platform](https://img.shields.io/badge/platform-Windows-blue)
+![platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-blue)
 ![node](https://img.shields.io/badge/node-%3E%3D22-brightgreen)
 ![license](https://img.shields.io/badge/license-MIT-green)
 
-> 把 llama.cpp / GGUF 从「能跑起来」做到「能当 coding agent 稳定用」的 Windows 本地工程化层。
+> 把 llama.cpp / GGUF 从「能跑起来」做到「能当 coding agent 稳定用」的跨平台本地工程化层。
 
 本地跑大模型最麻烦的从来不是「怎么启动」，而是**判断**和**善后**：
 
@@ -13,7 +13,7 @@
 - 界面写着「GPU · CUDA」，为什么显存一动不动、速度只有 1/5？
 - 14B 吐出来的工具参数不是合法 JSON、思考把输出预算吃光、同一段话复读三遍……
 
-RoRoTo Code 是一个 Windows 桌面 coding agent，把本地模型这条链路——选模型、装后端、定上下文、看住进程、兜住小模型的坏脾气——整条收敛掉。Ollama、LM Studio、OpenAI 兼容 API 与 Anthropic 也放在同一个界面里，但**本地 GGUF 是主战场**。
+RoRoTo Code 是一个跨平台桌面 coding agent（Windows / macOS / Linux），把本地模型这条链路——选模型、装后端、定上下文、看住进程、兜住小模型的坏脾气——整条收敛掉。Ollama、LM Studio、OpenAI 兼容 API 与 Anthropic 也放在同一个界面里，但**本地 GGUF 是主战场**。
 
 ---
 
@@ -31,7 +31,8 @@ node tools/vramfit/check.mjs Qwen2.5-Coder-14B-Q4_K_M.gguf --json
 静态推算的口径是公开的，不是黑盒：
 
 - 显存占用 ≈ **权重字节 + `ctx × KV 层数 × n_kv_head × (k_dim + v_dim) × 每元素字节` + 200 MiB 开销**（滑窗层、GQA、MoE、混合线性注意力分别折算）
-- Windows 可用上限 ≈ `min(空闲显存 × 0.92, 总显存 × 0.94)`；读不到已用显存时按 `总量 × 0.6` 保守估
+- 可用上限 ≈ **`总显存 × 0.94`**（默认 `--budget static`：按物理容量静态算，不看当前谁占着显存）
+- 想按「此刻还剩多少」算就加 `--budget auto`：`min(空闲显存 × 0.92, 总显存 × 0.94)`；读不到已用显存时退回 `总量 × 0.6`
 - 生成速度 ≈ `显存带宽 × 0.7 ÷ 权重 GB`，再随上下文增长折减
 
 输出给出 4K / 8K / 16K / 32K / 64K / 128K 各档能否装下、建议上下文、`agent-ready / runs-only / not-recommended` 判定与预估 tok/s。报告会分辨「能跑」和「能当 agent 用」——3B 以下只判 `runs-only`，工具调用模板缺失也会点名。
@@ -39,11 +40,13 @@ node tools/vramfit/check.mjs Qwen2.5-Coder-14B-Q4_K_M.gguf --json
 **agent 余量**是主程序在体检报告上补的一层（`src/main/vramfit.ts`）：按本程序自己的系统提示与工具定义约 6000 token、每轮工具往返约 1800 token，算出「装完这些之后还能跑几轮」，而不只是「上下文能开多大」。这是本地小模型最该看的数字。
 
 > 体检是静态推算，不是实测。真正的加载结果由下面的启动探测链兜底。
+>
+> 为什么默认按**静态容量**而不是空闲显存：空闲值是一次快照，开个游戏、关个浏览器同一份报告就在「装得下 32K」和「一档都装不下」之间跳；更麻烦的是它会被"释放了"骗过去 —— 程序退出后显存记回空闲，可那块显存已被 WDDM 换页打散、访问要换回来，速度并不会恢复。静态口径回答「这张卡的容量最多能开到哪一档」，可复现、可对比；真实余量由启动时的探测链按实测占用再收一次。
 
 ### 2. 装包：显卡后端不靠猜
 
-- **三层探测选后端**：`nvidia-smi`（含驱动 CUDA 版本、算力）→ WMI 显卡名 → 才落 CPU；N 卡装 CUDA + cudart，A 卡 / Intel 核显装 Vulkan，选包时避开「运行时比驱动新」的组合。想钉死后端设 `ROROTO_LLAMA_BACKEND=cuda|vulkan|cpu`。
-- **自动补齐运行库**：只解出 `ggml-cuda.dll` 而没有 cuBLAS / cudart 时，llama.cpp 会**静默退回 CPU**——界面显示 GPU，实际速度只有 1/5。现在缺哪几个 dll 会直接点名，并在安装时单独下载 `cudart` 包补齐。
+- **三层探测选后端**：`nvidia-smi`（含驱动 CUDA 版本、算力）→ 系统显卡名（Windows WMI / macOS `system_profiler` / Linux `lspci`）→ 才落 CPU。Windows / Linux 上 N 卡装 CUDA + cudart、A 卡 / Intel 核显装 Vulkan；macOS 只有官方 macos 包（Metal 编入包内，无 CUDA / Vulkan）。选包时避开「运行时比驱动新」的组合。想钉死后端设 `ROROTO_LLAMA_BACKEND=cuda|vulkan|cpu`。
+- **自动补齐运行库**：只解出 `ggml-cuda.dll`（Linux 是 `libggml-cuda.so`）而没有 cuBLAS / cudart 时，llama.cpp 会**静默退回 CPU**——界面显示 GPU，实际速度只有 1/5。现在缺哪几个运行库会直接点名，并在安装时单独下载 `cudart` 包补齐。
 - **装完和启动前各跑一次 `llama-server --list-devices`**：列不出 GPU 就警告；用户显式绑卡却看不到设备，直接以 `GPU_UNAVAILABLE` 拒绝启动，不再假装成功。
 - **下载不抢跑**：4 个源并发测速排序，换源前每个源至少给 15 秒窗口（一次瞬时 429/403 不会把四个源几秒内全判死），`Range` 断点续传换源不丢进度，解压前校验 `PK` 防止把镜像错误页当安装包。等待期间点「取消」立即返回。
 
@@ -75,7 +78,7 @@ node tools/vramfit/check.mjs Qwen2.5-Coder-14B-Q4_K_M.gguf --json
 
 ### 6. 多实例与多来源
 
-按供应商建实例，每个实例有自己的端口、绑的显卡和 PID；双卡可以各跑一个模型（`-dev CUDA0 -ngl 999`，不做跨卡切分）。端口真的 bind 探测，`8080 → 8083` 顺延后可再扫 64 个端口，崩溃重启也会重新确认端口。
+按供应商建实例，每个实例有自己的端口、绑的显卡和 PID。多卡有两种用法，互斥：**分别调用**——双卡各跑一个模型（`-dev CUDA0` / `-dev CUDA1`，`-ngl 999`）；**合并显存**——一个模型按层切分摊到多张卡（`-dev CUDA0,CUDA1 -sm layer -ngl 999`），显存池为各卡容量之和，让单卡装不下的大模型也能跑。同一张卡不能既单独用又参与合并。端口真的 bind 探测，`8080 → 8083` 顺延后可再扫 64 个端口，崩溃重启也会重新确认端口。
 
 模型来源：本地 GGUF（含离线把 Ollama 的 blob 搬进来、自动配对 mmproj）、Ollama（原生协议以带上 `num_ctx`）、LM Studio、任意 OpenAI 兼容 API、Anthropic。云端条目不预置，需要自己在设置里添加。
 
@@ -97,15 +100,38 @@ node tools/vramfit/check.mjs <模型.gguf> --json       # 可进 CI / 脚本
 
 ---
 
+## 平台支持
+
+| 能力 | Windows | Linux | macOS |
+|---|---|---|---|
+| llama.cpp 后端 | CUDA / Vulkan / CPU | CUDA / Vulkan / ROCm / CPU | Metal / CPU（内置） |
+| 官方产物 | `-bin-win-*.zip` | `-bin-ubuntu-*.tar.gz` | `-bin-macos-*.tar.gz` |
+| 显卡探测 | WMI / 注册表 + nvidia-smi | lspci + nvidia-smi | system_profiler |
+| 进程树终止 | `taskkill /T` | `ps` + `kill` | `ps` + `kill` |
+| 默认 shell | cmd.exe / PowerShell | `$SHELL` | `$SHELL` |
+| 密钥加密 | DPAPI（safeStorage） | libsecret / 降级 | Keychain |
+| 打包 | portable / NSIS | AppImage / deb | dmg / zip |
+
+`tools/vramfit` 与 SDK 本身零依赖、跨平台，三个系统都能单独使用。
+
+---
+
 ## 安装
 
-要求 **Windows 10/11**。
+| 平台 | 要求 | 安装包 |
+|---|---|---|
+| Windows | Windows 10/11 x64 | `RoRoToCode-<版本>-portable.exe`（免安装）/ `-setup.exe`（NSIS 向导） |
+| macOS | macOS 12+（Apple Silicon / Intel） | `RoRoToCode-<版本>-<arch>.dmg` / `.zip` |
+| Linux | x64，glibc 2.28+ | `RoRoToCode-<版本>-x64.AppImage` / `.deb` |
 
 ```powershell
-winget install RoRoToCode.RoRoToCode   # winget 清单通过社区仓库审核后可用
+winget install RoRoToCode.RoRoToCode   # Windows；winget 清单通过社区仓库审核后可用
 ```
 
-也可以从 [Releases](https://github.com/RoRoToCode/RoRoToCode/releases) 直接下载 `RoRoToCode-<版本>-portable.exe`，免安装双击即用；需要安装向导（可选安装目录）时用 `RoRoToCode-<版本>-setup.exe`。首次启动后在设置里选本地 GGUF → 一键安装 llama.cpp → 体检 → 起服务。
+也可以从 [Releases](https://github.com/RoRoToCode/RoRoToCode/releases) 直接下载对应平台的安装包。首次启动后在设置里选本地 GGUF → 一键安装 llama.cpp → 体检 → 起服务。
+
+> macOS 首次打开未签名 / 未公证的包时，系统会拦一次：右键「打开」或在「系统设置 → 隐私与安全性」里放行即可。正式分发建议在 CI 里配置 Developer ID 证书并公证。
+> Linux 的 AppImage 需要先 `chmod +x`；本地模型后端走 CUDA（NVIDIA）或 Vulkan（AMD / Intel），没有显卡则自动落 CPU。
 
 运行时的大文件（llama.cpp 运行库、GGUF 模型、简易核心）默认存在用户数据目录，升级版本不会丢；需要「模型跟 exe 放一起」时设 `ROROTO_PORTABLE=1`，自定义位置设 `ROROTO_DATA_DIR`。配置、会话、日志一直都在用户数据目录。
 
@@ -115,18 +141,22 @@ winget install RoRoToCode.RoRoToCode   # winget 清单通过社区仓库审核�
 
 ## 快速开始
 
-要求 **Windows + Node 22+**（进程管理、显卡探测、密钥加密用到 `taskkill` / WMI / DPAPI）。
+要求 **Node 22+**（Windows / macOS / Linux 均可）。平台相关的进程管理、显卡探测、密钥加密分别走 `taskkill`/WMI/DPAPI、`ps`+`kill`/`system_profiler`/Keychain、`ps`+`kill`/`lspci`/libsecret。
 
 ```bash
 npm install
 npm run dev        # vite + electron，热更新
 npm run build      # 编译主进程 + 打包渲染进程
 npm start          # 构建后启动
-npm run dist       # 打 portable exe
-npm test           # 462 项纯函数单测
+npm run dist       # Windows：portable exe
+npm run dist:mac   # macOS：dmg + zip
+npm run dist:linux # Linux：AppImage + deb
+npm test           # 463 项纯函数单测
 npm run typecheck  # 主进程 + 渲染层
 npm run lint
 ```
+
+> 交叉打包不可用：macOS 包必须在 macOS 上打，Linux 包建议在 Linux 上打。CI 的 `release.yml` 用 `windows-latest / macos-latest / ubuntu-latest` 三平台矩阵分别构建。
 
 启动后在设置里选本地 GGUF → 一键安装 llama.cpp → 体检 → 起服务。`npm run smoke:realmodel` 会起真的 llama-server、加载真的 gguf 走一次真对话（配置写临时 userData，不碰真实数据）。
 
@@ -148,7 +178,10 @@ Claude Code 走 Anthropic 协议，不能直连 llama-server，本程序也不�
 
 ```bash
 curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:7788/status
-RoRoToCode.exe --headless --port=7788   # 无窗口模式，可交给 nssm / 计划任务
+# 无窗口模式，可交给 systemd / launchd / nssm / 计划任务
+"RoRoTo Code.exe" --headless --port=7788   # Windows
+open -a "RoRoTo Code" --args --headless --port=7788   # macOS
+./RoRoToCode-*.AppImage --headless --port=7788        # Linux
 ```
 
 > 主进程持有单实例锁，`--headless` 不能与 GUI 同时运行。
@@ -161,7 +194,7 @@ agent 工具调用与子代理并行、diff 预览与逐块审阅、计划模式
 
 ## 质量
 
-`npm test` 462 项全过，`npm run typecheck` 与 `npm run lint` 零报错；`.github/workflows/ci.yml` 在每次 push / PR 的 `windows-latest` 上固化这三道门。测试数随提交变化，以本地实跑为准。
+`npm test` 463 项全过，`npm run typecheck` 与 `npm run lint` 零报错；`.github/workflows/ci.yml` 在每次 push / PR 上固化这三道门（Windows 跑全量，macOS / Linux 跑类型检查与 lint）。测试数随提交变化，以本地实跑为准。
 
 ## 许可与第三方组件
 

@@ -195,7 +195,6 @@ const api: PicoAPI = {
     cancelInstall: () => ipcRenderer.invoke('llama:cancelInstall'),
     configure: () => ipcRenderer.invoke('llama:configure'),
     models: () => ipcRenderer.invoke('llama:models'),
-    deleteModel: (rel: string) => ipcRenderer.invoke('llama:deleteModel', rel),
     start: (
       model?: string,
       ctx?: number,
@@ -204,7 +203,8 @@ const api: PicoAPI = {
     status: (providerId?: string) => ipcRenderer.invoke('llama:status', providerId),
     stop: (providerId?: string) => ipcRenderer.invoke('llama:stop', providerId),
     instances: () => ipcRenderer.invoke('llama:instances'),
-    devices: () => ipcRenderer.invoke('llama:devices'),
+    devices: (refresh?: boolean) => ipcRenderer.invoke('llama:devices', Boolean(refresh)),
+    devicesInfo: (refresh?: boolean) => ipcRenderer.invoke('llama:devicesInfo', Boolean(refresh)),
     probeSlots: (providerId?: string) => ipcRenderer.invoke('llama:probeSlots', providerId),
     backend: () => ipcRenderer.invoke('llama:backend'),
     checkUpdate: () => ipcRenderer.invoke('llama:checkUpdate'),
@@ -239,7 +239,8 @@ const api: PicoAPI = {
   },
   vramfit: {
     available: () => ipcRenderer.invoke('vramfit:available'),
-    check: (file: string, gpuIndex?: number) => ipcRenderer.invoke('vramfit:check', file, gpuIndex)
+    check: (file: string, gpuIndex?: number, poolGb?: number | null) =>
+      ipcRenderer.invoke('vramfit:check', file, gpuIndex, poolGb)
   },
   worker: {
     plan: (providerId?: string) => ipcRenderer.invoke('worker:plan', providerId),
@@ -280,6 +281,12 @@ const api: PicoAPI = {
   local: {
     status: (kind: LocalRuntimeKind) => ipcRenderer.invoke('local:status', kind),
     start: (kind: LocalRuntimeKind) => ipcRenderer.invoke('local:start', kind),
+    stop: (kind: LocalRuntimeKind) =>
+      ipcRenderer.invoke('local:stop', kind) as Promise<{
+        ok: boolean
+        freed: string[]
+        message: string
+      }>,
     configure: (kind: LocalRuntimeKind, model?: string, opts?: { activate?: boolean }) =>
       ipcRenderer.invoke('local:configure', kind, model, opts),
     pull: (name: string) => ipcRenderer.invoke('local:pull', name),

@@ -4,6 +4,7 @@ import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import zlib from 'node:zlib'
 import { pdfToText } from './pdf'
+import { isWin } from './platform'
 
 /**
  * 把附件里的文字抽出来，直接塞进消息。
@@ -427,6 +428,8 @@ try {
 `
 
 function wordComText(absPath: string): Promise<string | null> {
+  // Word COM 只有 Windows 有；macOS / Linux 直接跳过，走后面的纯文本解析
+  if (!isWin) return Promise.resolve(null)
   return new Promise((resolve) => {
     const out = path.join(
       os.tmpdir(),

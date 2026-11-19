@@ -1,7 +1,9 @@
 import type { ChatMessage, ProviderConfig, TokenUsage, ToolCall } from '../../shared/types'
 import { parseArgs, RAW_ARG_KEY } from '../../shared/toolargs'
 import { imageDataUrl } from '../vision'
-import { explainStreamFailure, joinUrl, readError, requestSignal, sseLines } from './base'
+import { outputBudget, timeoutForOutput } from './budget'
+import { requestTokens } from '../../shared/tokens'
+import { explainStreamFailure, guardFor, joinUrl, readError, requestSignal, sseLines } from './base'
 import type { StreamOptions, StreamResult } from './base'
 
 type Block =
@@ -86,12 +88,20 @@ function toAnthropic(messages: ChatMessage[]): { system: string; messages: Anthr
 export async function streamAnthropic(opts: StreamOptions): Promise<StreamResult> {
   const { provider, tools } = opts
   const base = provider.baseUrl.replace(/\/+$/, '')
-  const { signal, done } = requestSignal(opts.signal, 10 * 60 * 1000)
+  // 和 OpenAI 那条路径同一套预算：留 8192 写死在这里，长文件必然被切一次
+  const maxOut = outputBudget(provider, requestTokens(opts.messages, tools), opts.escalate)
+  const { signal, abort, done } = requestSignal(opts.signal, timeoutForOutput(maxOut))
+  /**
+   * 这条路径以前没有看门狗，只有一个跟输出量挂钩的总超时 ——
+   * 云端不吐字时会一路等到十分钟开外，界面全程「生成中」。
+   * 和另外两条路共用一个（openai / ollama），时限也共用同一份分级。
+   */
+  const guard = guardFor(provider, abort)
   const converted = toAnthropic(opts.messages)
 
   const body: Record<string, unknown> = {
     model: provider.model,
-    max_tokens: 8192,
+    max_tokens: maxOut,
     stream: true,
     temperature: provider.temperature ?? 0.2,
     messages: converted.messages
@@ -119,20 +129,26 @@ export async function streamAnthropic(opts: StreamOptions): Promise<StreamResult
       signal
     })
   } catch (err) {
+    guard.stop()
     done()
-    throw new Error(`连接失败：${(err as Error).message}`)
+    // 和另外两条路同一套解释：被看门狗掐断时要说出真实原因，而不是「连接失败」
+    throw new Error(await explainStreamFailure(err, provider, signal))
   }
 
   if (!res.ok) {
+    guard.stop()
     done()
     throw new Error(await readError(res))
   }
   if (!res.body) {
+    guard.stop()
     done()
     throw new Error('响应没有数据流')
   }
 
   let text = ''
+  /** 近似生成 token 数，用于界面实时进度 */
+  let genUnits = 0
   const calls = new Map<number, { id: string; name: string; json: string }>()
   // Anthropic 把输入用量放在 message_start，输出用量放在 message_delta，要分开累
   let usage: TokenUsage | undefined
@@ -180,17 +196,25 @@ export async function streamAnthropic(opts: StreamOptions): Promise<StreamResult
       if (evt.type === 'content_block_delta') {
         if (evt.delta?.type === 'text_delta' && evt.delta.text) {
           text += evt.delta.text
+          // 真拿到正文才算「活过来了」：空帧、usage 帧都不该重置首字时限
+          guard.touch()
           opts.onText(evt.delta.text)
+          genUnits++
         }
         if (evt.delta?.type === 'input_json_delta' && evt.delta.partial_json) {
           const entry = calls.get(evt.index ?? 0)
           if (entry) entry.json += evt.delta.partial_json
+          // 工具参数也是生成出来的，同样要计入实时进度（写文件时耗时全在这里）
+          guard.touch()
+          genUnits++
         }
+        if (genUnits > 0) opts.onProgress?.(genUnits)
       }
     }
   } catch (err) {
     throw new Error(await explainStreamFailure(err, provider, signal))
   } finally {
+    guard.stop()
     done()
   }
 

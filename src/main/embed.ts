@@ -38,9 +38,17 @@ interface EmbedCache {
   files: Record<string, CacheEntry>
 }
 
-const CACHE_VERSION = 1
+const CACHE_VERSION = 2
 /** 一次最多向量化多少个文件：几千个文件的仓库全量算要几十秒，超出部分先按词面排 */
 const MAX_FILES = 1500
+/**
+ * 超过这个大小、且能提出符号的文件，按符号切成独立检索单元。
+ *
+ * 小文件整文件向量化就够（命中文件 ≈ 命中内容）；但一个几千行、塞满几十个
+ * 互不相关函数的 utils.ts，整文件向量几乎没有区分度 —— 命中它等于没命中，
+ * 模型还得自己翻。切块之后「登录怎么校验的」能直接落到具体函数那一行。
+ */
+const CHUNK_MIN_BYTES = 60 * 1024
 /** 失败的补救冷却：服务没开的时候不要每轮都去撞一次 */
 let deadUntil = 0
 
@@ -126,6 +134,37 @@ function descriptor(f: FileNode): string {
   const sym = f.symbols.slice(0, 12).join(' ')
   const sum = (f.summary || '').replace(/\s+/g, ' ').slice(0, 120)
   return `${f.path}\n${sym}\n${sum}`.trim()
+}
+
+/** 一个检索单元：大文件可能拆成多块，小文件就是整个文件 */
+interface Unit {
+  /** 缓存键：小文件是文件路径，大文件块是 `path#sym:line` */
+  key: string
+  /** 喂给 embedding 的文本 */
+  text: string
+  /** 命中后回给模型的标注（文件 + 可选符号与行号） */
+  label: string
+  /** 该单元所属文件（用于粗筛命中与 pool 构建） */
+  file: FileNode
+}
+
+/**
+ * 把一个文件拆成检索单元。
+ *
+ * 拆块条件：文件超过 CHUNK_MIN_BYTES 且能提出符号块。其余一律整文件一个单元，
+ * 保持既有的「命中文件 ≈ 命中内容」语义不变。
+ */
+function unitsOf(f: FileNode): Unit[] {
+  if (!f.blocks || !f.blocks.length || f.size < CHUNK_MIN_BYTES) {
+    return [{ key: f.path, text: descriptor(f), label: f.path, file: f }]
+  }
+  const head = (f.summary || '').replace(/\s+/g, ' ').slice(0, 80)
+  return f.blocks.map((b) => ({
+    key: `${f.path}#${b.name}:${b.line}`,
+    text: `${f.path}\n${b.name}\n${head}`.trim(),
+    label: `${f.path} · ${b.name}（第 ${b.line} 行）`,
+    file: f
+  }))
 }
 
 function hashOf(text: string): string {
@@ -219,30 +258,37 @@ export async function semanticMap(
     const hay = `${f.path} ${f.symbols.join(' ')} ${f.summary}`.toLowerCase()
     return terms.some((t) => hay.includes(t))
   })
-  const pool = (literal.length >= 20 ? literal : files).slice(0, MAX_FILES)
+  const poolFiles = (literal.length >= 20 ? literal : files).slice(0, MAX_FILES)
 
-  const cache = await loadCache(root, ep.model)
-  const need: FileNode[] = []
-  for (const f of pool) {
-    const h = hashOf(descriptor(f))
-    const hit = cache.files[f.path]
-    if (!hit || hit.hash !== h) need.push(f)
+  // 拆检索单元：大文件按符号切块、小文件整文件。切块会放大数量，再套一个单元数上限。
+  const units: Unit[] = []
+  for (const f of poolFiles) {
+    units.push(...unitsOf(f))
+    if (units.length >= MAX_FILES * 4) break
   }
 
-  // 新文件按每批 16 个算，别把本地服务一次性压死
+  const cache = await loadCache(root, ep.model)
+  const need: Unit[] = []
+  for (const u of units) {
+    const h = hashOf(u.text)
+    const hit = cache.files[u.key]
+    if (!hit || hit.hash !== h) need.push(u)
+  }
+
+  // 新单元按每批 16 个算，别把本地服务一次性压死
   for (let i = 0; i < need.length; i += 16) {
     const chunk = need.slice(i, i + 16)
     const vecs = await embedBatch(
       ep,
-      chunk.map((f) => descriptor(f))
+      chunk.map((u) => u.text)
     )
     if (!vecs) {
       // 服务没起来 / 模型不支持 embedding：冷却五分钟，期间直接走词面检索
       deadUntil = Date.now() + 5 * 60 * 1000
       return null
     }
-    chunk.forEach((f, k) => {
-      cache.files[f.path] = { hash: hashOf(descriptor(f)), vec: toB64(vecs[k]) }
+    chunk.forEach((u, k) => {
+      cache.files[u.key] = { hash: hashOf(u.text), vec: toB64(vecs[k]) }
       if (!cache.dim) cache.dim = vecs[k].length
     })
   }
@@ -255,20 +301,30 @@ export async function semanticMap(
   }
   const qvec = fromB64(toB64(qv[0]))
 
-  const scored: Array<{ f: FileNode; s: number }> = []
-  for (const f of pool) {
-    const hit = cache.files[f.path]
+  const scored: Array<{ u: Unit; s: number }> = []
+  for (const u of units) {
+    const hit = cache.files[u.key]
     if (!hit) continue
-    scored.push({ f, s: cosine(qvec, fromB64(hit.vec)) })
+    scored.push({ u, s: cosine(qvec, fromB64(hit.vec)) })
   }
   scored.sort((a, b) => b.s - a.s)
-  const top = scored.slice(0, Math.max(1, Math.min(60, limit)))
+  // 同一个大文件可能命中多块，按文件去重、保留每个文件的最高分块，避免结果被一个 utils.ts 刷屏
+  const seen = new Set<string>()
+  const top: Array<{ u: Unit; s: number }> = []
+  for (const hit of scored) {
+    if (seen.has(hit.u.file.path)) continue
+    seen.add(hit.u.file.path)
+    top.push(hit)
+    if (top.length >= Math.max(1, Math.min(60, limit))) break
+  }
 
   if (!top.length) return null
   const lines = top.map((h, i) => {
-    const sym = h.f.symbols.length ? `  ${h.f.symbols.slice(0, 10).join('、')}` : ''
-    const sum = h.f.summary ? `  — ${h.f.summary}` : ''
-    return `${i + 1}. ${h.f.path}${sym}${sum}`
+    // 块命中：label 已带「文件 · 符号（第 N 行）」；整文件命中：label 就是路径
+    if (h.u.label !== h.u.file.path) return `${i + 1}. ${h.u.label}`
+    const sym = h.u.file.symbols.length ? `  ${h.u.file.symbols.slice(0, 10).join('、')}` : ''
+    const sum = h.u.file.summary ? `  — ${h.u.file.summary}` : ''
+    return `${i + 1}. ${h.u.file.path}${sym}${sum}`
   })
   return [
     `语义检索「${q}」命中 ${top.length} 个文件（本地 embedding，按相关度排序）：`,

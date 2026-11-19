@@ -1,6 +1,7 @@
 import { t as tr } from '../i18n'
 import { useEffect, useRef, useState } from 'react'
 import { shortGpuName } from '../../shared/ollamagpu'
+import { isMultiDevice } from '../../shared/providers'
 import type { LocalGpuSnapshot, ProviderConfig, RunningLocalModel } from '../../shared/types'
 
 export type ProbeState = 'checking' | 'ok' | 'fail'
@@ -22,16 +23,29 @@ export interface ProbeInfo {
   idle?: boolean
 }
 
-export function StatusDot({ state, error, title }: { state: DotState; error?: string; title?: string }) {
+export function StatusDot({
+  state,
+  error,
+  title,
+}: {
+  state: DotState
+  error?: string
+  title?: string
+}) {
   if (state === 'running' || state === 'ok') {
-    return <span className="dot ok" title={title ?? (state === 'running' ? tr("运行中") : tr("可用"))} />
+    return (
+      <span className="dot ok" title={title ?? (state === 'running' ? tr('运行中') : tr('可用'))} />
+    )
   }
   if (state === 'ready') {
-    return <span className="dot ready" title={title ?? tr("可用，尚未启动")} />
+    return <span className="dot ready" title={title ?? tr('可用，尚未启动')} />
   }
   if (state === 'fail') {
     return (
-      <span className="dot fail" title={error ? tr("不可用：{error}", { error: error }) : tr("不可用")}>
+      <span
+        className="dot fail"
+        title={error ? tr('不可用：{error}', { error: error }) : tr('不可用')}
+      >
         <svg width="9" height="9" viewBox="0 0 10 10" aria-hidden="true">
           <path
             d="M1.8 1.8l6.4 6.4M8.2 1.8l-6.4 6.4"
@@ -43,14 +57,22 @@ export function StatusDot({ state, error, title }: { state: DotState; error?: st
       </span>
     )
   }
-  return <span className="dot checking" title={tr("检测中")} />
+  return <span className="dot checking" title={tr('检测中')} />
 }
 
 /** 小显卡图标：模型菜单里区分「跑在哪张卡上」比文字更快认出来 */
 function GpuIcon() {
   return (
     <svg width="11" height="11" viewBox="0 0 12 12" fill="none" aria-hidden="true">
-      <rect x="1.2" y="3.2" width="9.6" height="5.6" rx="1.1" stroke="currentColor" strokeWidth="1.1" />
+      <rect
+        x="1.2"
+        y="3.2"
+        width="9.6"
+        height="5.6"
+        rx="1.1"
+        stroke="currentColor"
+        strokeWidth="1.1"
+      />
       <circle cx="4.4" cy="6" r="1.1" stroke="currentColor" strokeWidth="1" />
       <path d="M7.6 4.9h2M7.6 7.1h2" stroke="currentColor" strokeWidth="1" strokeLinecap="round" />
     </svg>
@@ -68,10 +90,21 @@ interface Props {
 }
 
 type Device = { id: string; name: string; vramMiB?: number; freeMiB?: number }
-type Instance = { key: string; port: number; model: string; device: string; pid: number | null; ctx: number }
+type Instance = {
+  key: string
+  port: number
+  model: string
+  device: string
+  pid: number | null
+  ctx: number
+}
 
 /** 模型名对齐：Ollama 的 `/api/ps` 一定带 tag，配置里的名字可能省略 `:latest` */
-const normModelName = (s?: string): string => (s ?? '').trim().toLowerCase().replace(/:latest$/, '')
+const normModelName = (s?: string): string =>
+  (s ?? '')
+    .trim()
+    .toLowerCase()
+    .replace(/:latest$/, '')
 
 /** 只认本机服务：配了远程地址的「Ollama」条目，本机这份运行清单跟它没关系 */
 const isLoopbackUrl = (url?: string): boolean =>
@@ -80,7 +113,14 @@ const isLoopbackUrl = (url?: string): boolean =>
 /** 6.3 GB，显存说明用 */
 const gb = (n: number): string => `${(n / 1024 ** 3).toFixed(1)} GB`
 
-export function ModelPicker({ providers, activeId, probes, onSelect, onRefresh, onOpenSettings }: Props) {
+export function ModelPicker({
+  providers,
+  activeId,
+  probes,
+  onSelect,
+  onRefresh,
+  onOpenSettings,
+}: Props) {
   const [open, setOpen] = useState(false)
   const boxRef = useRef<HTMLDivElement | null>(null)
   /** llama.cpp 认到的设备（CUDA0 / Vulkan0 …），用来把配置里的 device 翻译成人能看的显卡名 */
@@ -96,7 +136,7 @@ export function ModelPicker({ providers, activeId, probes, onSelect, onRefresh, 
     devices: [],
     guessed: false,
     models: [],
-    loaded: []
+    loaded: [],
   })
   /**
    * 实时数据（实例 / 已加载清单）到底问到过没有。
@@ -229,21 +269,24 @@ export function ModelPicker({ providers, activeId, probes, onSelect, onRefresh, 
    */
   function liveGpu(r: RunningLocalModel): { text: string; title: string } {
     if (r.vramBytes <= 0) {
-      return { text: 'CPU', title: tr("模型现在跑在内存里（没占到显存）：{0}", { "0": r.model }) }
+      return {
+        text: 'CPU',
+        title: tr('模型现在跑在内存里（没占到显存）：{0}', { '0': r.model }),
+      }
     }
     const pct = r.sizeBytes > 0 ? Math.min(100, Math.round((r.vramBytes / r.sizeBytes) * 100)) : 100
     const names = r.devices
     const head = names[0] ? shortGpuName(names[0]) : 'GPU'
     const text = names.length > 1 ? `${head} +${names.length - 1}` : head
     const facts = [
-      tr("运行中：{0}", { "0": r.model }),
+      tr('运行中：{0}', { '0': r.model }),
       r.sizeBytes > 0
-        ? tr("显存 {0} / {1}", { "0": gb(r.vramBytes), "1": gb(r.sizeBytes) })
-        : tr("显存 {0}", { "0": gb(r.vramBytes) }),
-      pct >= 95 ? tr("全部在显卡上") : tr("只有 {0}% 在显卡上，其余在内存", { "0": String(pct) }),
-      names.length > 1 ? tr("用到 {0} 张卡", { "0": String(names.length) }) : '',
-      names.length ? names.join('、') : tr("型号没读到，只确认占用了显存"),
-      r.guessed ? tr("显卡名按本机推断") : ''
+        ? tr('显存 {0} / {1}', { '0': gb(r.vramBytes), '1': gb(r.sizeBytes) })
+        : tr('显存 {0}', { '0': gb(r.vramBytes) }),
+      pct >= 95 ? tr('全部在显卡上') : tr('只有 {0}% 在显卡上，其余在内存', { '0': String(pct) }),
+      names.length > 1 ? tr('用到 {0} 张卡', { '0': String(names.length) }) : '',
+      names.length ? names.join('、') : tr('型号没读到，只确认占用了显存'),
+      r.guessed ? tr('显卡名按本机推断') : '',
     ].filter(Boolean)
     return { text, title: facts.join(' · ') }
   }
@@ -266,32 +309,48 @@ export function ModelPicker({ providers, activeId, probes, onSelect, onRefresh, 
     // 没在跑：不显示显卡。绑没绑卡是配置，不是现状
     if (!inst) return null
 
-    const suffix = tr(" · 运行中 :{0} · {1}K 上下文", { "0": inst.port, "1": String(Math.round(inst.ctx / 1024)) })
+    const suffix = tr(' · 运行中 :{0} · {1}K 上下文', {
+      '0': inst.port,
+      '1': String(Math.round(inst.ctx / 1024)),
+    })
     const raw = (inst.device || '').trim()
     if (!raw) {
       const auto = devices[0]
       // 没绑卡（auto）：实际就是 list-devices 的第一块，写清楚这是自动选的
-      if (!auto) return { text: tr("自动"), title: tr("运行中，由 llama.cpp 自动选择") + suffix }
+      if (!auto)
+        return {
+          text: tr('自动'),
+          title: tr('运行中，由 llama.cpp 自动选择') + suffix,
+        }
       return {
         text: auto.name.replace(/^NVIDIA\s+(GeForce\s+)?/i, ''),
-        title: tr("运行中，由 llama.cpp 自动选择（{0}）", { "0": auto.name }) + suffix
+        title: tr('运行中，由 llama.cpp 自动选择（{0}）', { '0': auto.name }) + suffix,
       }
     }
     if (raw.toUpperCase() === 'CPU') {
-      return { text: 'CPU', title: tr("运行在处理器上，不占显存") + suffix }
+      return { text: 'CPU', title: tr('运行在处理器上，不占显存') + suffix }
     }
     const low = raw.toLowerCase()
     const hit =
       devices.find((d) => d.id.toLowerCase() === low) ??
-      devices.find((d) => low.startsWith(d.id.toLowerCase()) || d.id.toLowerCase().startsWith(low)) ??
+      devices.find(
+        (d) => low.startsWith(d.id.toLowerCase()) || d.id.toLowerCase().startsWith(low),
+      ) ??
       null
-    if (!hit) return { text: raw, title: tr("已绑定显卡：{0}", { "0": raw }) + suffix }
+    if (!hit) return { text: raw, title: tr('已绑定显卡：{0}', { '0': raw }) + suffix }
     const mem =
-      hit.vramMiB && hit.vramMiB > 0 ? tr("{0} GB 显存", { "0": (hit.vramMiB / 1024).toFixed(0) }) : ''
+      hit.vramMiB && hit.vramMiB > 0
+        ? tr('{0} GB 显存', { '0': (hit.vramMiB / 1024).toFixed(0) })
+        : ''
     return {
       // 名字去掉 NVIDIA / GeForce 前缀，顶栏那个小胶囊才放得下
       text: hit.name.replace(/^NVIDIA\s+(GeForce\s+)?/i, ''),
-      title: tr("已绑定显卡：{0}（{1}）{2}", { "0": hit.name, "1": hit.id, "2": mem }) + suffix
+      title:
+        tr('已绑定显卡：{0}（{1}）{2}', {
+          '0': hit.name,
+          '1': hit.id,
+          '2': mem,
+        }) + suffix,
     }
   }
 
@@ -313,8 +372,20 @@ export function ModelPicker({ providers, activeId, probes, onSelect, onRefresh, 
 
   const empty = providers.length === 0
   const active = providers.find((p) => p.id === activeId) ?? providers[0] ?? null
-  const activeProbe = probes[active?.id ?? ''] ?? { state: 'checking' as ProbeState }
+  const activeProbe = probes[active?.id ?? ''] ?? {
+    state: 'checking' as ProbeState,
+  }
   const activeGpu = active ? gpuOf(active) : null
+
+  /**
+   * 每条模型各占一行，主 / 子只作为行内标记显示。
+   *
+   * 以前「一卡一模型」会折叠成一行「工作组（主 + 子）」，点它等于选组内的主模型 ——
+   * 但用户在菜单里看不出哪条是主、哪条是子，也没法换。现在角色由「④ 模型列表」
+   * 显式设定，这里逐条列出、逐条可点，行尾标清它当前是主还是子。
+   */
+  type MenuItem = { kind: 'provider'; p: ProviderConfig }
+  const items: MenuItem[] = providers.map((p) => ({ kind: 'provider', p }))
 
   return (
     <div className="model-picker" ref={boxRef}>
@@ -325,7 +396,7 @@ export function ModelPicker({ providers, activeId, probes, onSelect, onRefresh, 
           setOpen(next)
           if (next) onRefresh()
         }}
-        title={activeGpu ? tr("切换模型 · 当前显卡：{0}", { "0": activeGpu.text }) : tr("切换模型")}
+        title={activeGpu ? tr('切换模型 · 当前显卡：{0}', { '0': activeGpu.text }) : tr('切换模型')}
       >
         {empty ? (
           <span className="model-trigger-warn">!</span>
@@ -333,8 +404,20 @@ export function ModelPicker({ providers, activeId, probes, onSelect, onRefresh, 
           <StatusDot state={dotOf(active, activeProbe)} error={activeProbe.error} />
         )}
         <span className="model-trigger-text">
-          {empty ? tr("还没有模型 · 点这里添加") : active ? tr("{name} · {1}", { name: active.name, "1": active.model || tr("未选择模型") }) : tr("未配置模型")}
+          {empty
+            ? tr('还没有模型 · 点这里添加')
+            : active
+              ? tr('{name} · {1}', {
+                  name: active.name,
+                  '1': active.model || tr('未选择模型'),
+                })
+              : tr('未配置模型')}
         </span>
+        {active && active.role === 'worker' && active.id !== activeId && (
+          <span className="model-trigger-role" title={tr('这条是子智能体，给子代理干活')}>
+            {tr('子')}
+          </span>
+        )}
         {activeGpu && (
           <span className="model-trigger-gpu" title={activeGpu.title}>
             <GpuIcon />
@@ -342,25 +425,32 @@ export function ModelPicker({ providers, activeId, probes, onSelect, onRefresh, 
           </span>
         )}
         <svg className="chev" width="9" height="9" viewBox="0 0 10 10" aria-hidden="true">
-          <path d="M2 4l3 3 3-3" stroke="currentColor" strokeWidth="1.4" fill="none" strokeLinecap="round" />
+          <path
+            d="M2 4l3 3 3-3"
+            stroke="currentColor"
+            strokeWidth="1.4"
+            fill="none"
+            strokeLinecap="round"
+          />
         </svg>
       </button>
 
       {open && (
         <div className="model-menu">
           <div className="model-menu-head">
-            <span>{tr("选择模型")}</span>
+            <span>{tr('选择模型')}</span>
             <button
               className="model-menu-refresh"
               onClick={() => onRefresh()}
-              title={tr("重新检测可用性")}
+              title={tr('重新检测可用性')}
             >
-              {tr("重新检测")}</button>
+              {tr('重新检测')}
+            </button>
           </div>
           {empty && (
             <div className="model-menu-empty">
-              <div className="model-menu-empty-title">{tr("还没有任何模型")}</div>
-              <div className="model-menu-empty-tip">{tr("请点击模型设置 添加模型")}</div>
+              <div className="model-menu-empty-title">{tr('还没有任何模型')}</div>
+              <div className="model-menu-empty-tip">{tr('请点击模型设置 添加模型')}</div>
               {onOpenSettings && (
                 <button
                   className="btn primary sm"
@@ -369,11 +459,13 @@ export function ModelPicker({ providers, activeId, probes, onSelect, onRefresh, 
                     onOpenSettings()
                   }}
                 >
-                  {tr("打开模型设置")}</button>
+                  {tr('打开模型设置')}
+                </button>
               )}
             </div>
           )}
-          {providers.map((p) => {
+          {items.map((item) => {
+            const p = item.p
             const probe = probes[p.id] ?? { state: 'checking' as ProbeState }
             const dot = dotOf(p, probe)
             const gpu = gpuOf(p)
@@ -385,13 +477,36 @@ export function ModelPicker({ providers, activeId, probes, onSelect, onRefresh, 
                   onSelect(p.id)
                   setOpen(false)
                 }}
+                title={
+                  p.role === 'worker' && p.id !== activeId
+                    ? tr('子智能体：主 agent 派 task 时会用它干活')
+                    : undefined
+                }
               >
                 <StatusDot state={dot} error={probe.error} />
                 <span className="model-item-body">
                   <span className="model-item-name">
                     {p.name}
-                    <span className="model-item-id">{p.model || tr("未选择模型")}</span>
+                    <span className="model-item-id">{p.model || tr('未选择模型')}</span>
                   </span>
+                  {p.id === activeId ? (
+                    <span className="model-item-role main" title={tr('主智能体：对话正在用它')}>
+                      {tr('主')}
+                    </span>
+                  ) : p.role === 'worker' ? (
+                    <span className="model-item-role" title={tr('子智能体：给子代理干活')}>
+                      {tr('子')}
+                    </span>
+                  ) : null}
+                  {/* 多卡合成：一个模型摊到几张卡上，跟主 / 子角色无关，单独标一枚 */}
+                  {p.runtime === 'llama' && isMultiDevice(p.device) && (
+                    <span
+                      className="model-item-merged"
+                      title={tr('合成：多张显卡一起跑这一个模型')}
+                    >
+                      {tr('合成')}
+                    </span>
+                  )}
                   {gpu && (
                     <span className="model-item-gpu" title={gpu.title}>
                       <GpuIcon />
@@ -399,11 +514,14 @@ export function ModelPicker({ providers, activeId, probes, onSelect, onRefresh, 
                     </span>
                   )}
                   {probe.state === 'checking' && (
-                    <span className="model-item-state checking">{probe.error ?? tr("正在检测…")}</span>
+                    <span className="model-item-state checking">
+                      {probe.error ?? tr('正在检测…')}
+                    </span>
                   )}
-                  {probe.state === 'ok' && (
+                  {/* 线上模型一直在线，没有「启动」概念，绿灯点已表达可用，不用再挂状态文字 */}
+                  {probe.state === 'ok' && isLocalProvider(p) && (
                     <span className={`model-item-state ${dot === 'running' ? 'ok' : 'ready'}`}>
-                      {dot === 'running' ? tr("运行中") : tr("可用 · 未启动")}
+                      {dot === 'running' ? tr('运行中') : tr('可用 · 未启动')}
                     </span>
                   )}
                   {probe.state === 'fail' && probe.error && (
@@ -413,13 +531,13 @@ export function ModelPicker({ providers, activeId, probes, onSelect, onRefresh, 
                     </span>
                   )}
                 </span>
-                {p.id === active?.id && <span className="model-item-check">{tr("当前")}</span>}
+                {p.id === active?.id && <span className="model-item-check">{tr('当前')}</span>}
               </button>
             )
           })}
           {!empty && (
             <div className="model-menu-foot">
-              {tr("绿点=模型已加载在跑，黄点=可用但没启动，红叉=连不上或模型不存在")}
+              {tr('绿点=模型已加载在跑，黄点=可用但没启动，红叉=连不上或模型不存在')}
             </div>
           )}
         </div>

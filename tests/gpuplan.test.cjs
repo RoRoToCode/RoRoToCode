@@ -114,6 +114,16 @@ test('驱动支持的 CUDA 版本决定装哪个包（不再写死 12.4）', () 
     'llama-b6000-bin-win-vulkan-x64.zip')
 })
 
+test('跨平台产物名解析：ubuntu / macos 也能认出来', () => {
+  // 解析函数与平台无关：同一套规则要能读懂三个系统的官方命名
+  assert.equal(packageCudaCode('llama-b6000-bin-ubuntu-cuda-12.8-x64.tar.gz'), 1208)
+  assert.equal(packageCudaCode('llama-b6000-bin-macos-arm64.tar.gz'), null)
+  assert.equal(isMainPackage('llama-b6000-bin-ubuntu-x64.tar.gz'), true)
+  assert.equal(isMainPackage('llama-b6000-bin-macos-arm64.tar.gz'), true)
+  // Linux 的 cudart 包名带 build tag，仍不能被当成主程序包
+  assert.equal(isMainPackage('cudart-llama-b6000-bin-ubuntu-cuda-12.8-x64.tar.gz'), false)
+})
+
 test('镜像兜底的 CUDA 候选顺序同样跟着驱动走', () => {
   // 驱动 13.4 + Blackwell：先试 13.4
   assert.match(candidateNames('b6000', 'cuda', { cudaCode: 1304, computeCap: 12.0 })[0], /cuda-13\.4/)

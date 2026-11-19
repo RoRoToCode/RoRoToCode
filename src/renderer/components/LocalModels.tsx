@@ -10,6 +10,7 @@ import type {
 } from '../../shared/types'
 import type { PartialOffloadMode as LayerMode } from '../../shared/ctxtune'
 import { partialModeOf } from '../../shared/ctxtune'
+import { deviceIndex, deviceList, isMultiDevice } from '../../shared/providers'
 import { Chevron, useCollapse } from './Collapse'
 import { DownloadBar } from './DownloadBar'
 import { LocalRuntime } from './LocalRuntime'
@@ -60,12 +61,67 @@ export interface LocalModelsHandle {
   count: () => number
 }
 
+/** 一个本地槽位：一条 llama.cpp 实例对应一张卡 */
+type LlamaSlot = {
+  id: string
+  name: string
+  device?: string
+  model?: string
+  /** 这条实例当前的角色：主（对话在用）/ 子（给子代理干活）/ 未指定 */
+  role?: 'main' | 'worker'
+  /** 落盘配置里的上下文档位：档位行按它高亮（这一页只改草稿，写盘走「保存到列表」） */
+  contextWindow?: number
+}
+
 interface Props {
   /** 配置（草稿）里各本地供应商正在使用的模型，key 为供应商 id */
   currentModels?: Record<string, string>
   /** 在这里点选模型时回调，让「模型列表」里的选择跟着变 */
   onSelectModel?: (model: string, providerId?: string) => void
   onConfigChanged?: () => void | Promise<void>
+  /**
+   * 草稿里所有的 llama.cpp 实例（一卡一条）。
+   *
+   * 卡槽要回答的是「这张卡上是谁、用的哪个模型」，光看 currentModels 不够：
+   * 那个只给了模型名，给不出「哪张卡被占、哪张还空着」。
+   */
+  llamaSlots?: LlamaSlot[]
+  /**
+   * 点一张卡 → 父组件找到（或新建）绑这张卡的实例，返回它的 id。
+   *
+   * 供应商的增删属于草稿，这个面板没有写权，所以只能回调上去做。
+   * 返回 id 而不是 Promise：点卡的反馈必须是这一帧就切过去，
+   * 等一下再切会让用户以为点空了。
+   */
+  onPickDevice?: (deviceId: string) => string | undefined
+  /**
+   * 切换「合并多卡」：把这条实例绑到多张卡上（一个模型摊开跑），或者拆回单卡。
+   *
+   * 会落到草稿并写盘 —— 主进程启动时读的是磁盘配置，只改内存里的草稿
+   * 会出现「界面显示已合并，启动出来还是单卡」。
+   */
+  onToggleMultiGpu?: (providerId: string, on: boolean) => Promise<{ ok: boolean; message?: string }>
+  /**
+   * 「保存到列表」：把这份配置落盘，然后把视线交给「④ 模型列表」。
+   *
+   * 这一页是**配置**的地方：选卡、选模型、挑上下文档位，再落盘。
+   * 启动与停止只在「④ 模型列表」里做 —— 这一页不再有任何启动/停止入口，
+   * 避免一个模型被两处同时拉起（曾经因此并发起了两个 llama-server）。
+   *
+   * patch 是页面本地改过的字段（目前只有上下文档位），随这次落盘一起写进去。
+   */
+  onSaveToList?: (
+    providerId: string,
+    patch?: { contextWindow?: number }
+  ) => Promise<void>
+  /**
+   * 档位草稿上抛：`ctx` 为 null 表示「跟随已落盘的值」（也就是没改）。
+   *
+   * 为什么需要：底部的「保存」和这里的「保存到列表」是同一个写盘动作的两个入口。
+   * 档位只活在这一页的 state 里，父组件保存时拿不到 —— 于是「点档位 → 直接点保存」
+   * 会把选的档悄悄丢掉。把待写盘的值交给父组件，两条保存路径行为才一致。
+   */
+  onCtxDraft?: (providerId: string, ctx: number | null) => void
 }
 
 /** 模型可能带目录，比较时只看文件名 */
@@ -73,7 +129,13 @@ const baseName = (p: string) => p.split(/[\\/]/).pop() ?? p
 const sameModel = (a?: string, b?: string) =>
   !!a && !!b && baseName(a).toLowerCase() === baseName(b).toLowerCase()
 
-type LlamaAction = 'install' | 'configure' | 'models' | 'start' | 'stop'
+/**
+ * 这一页会做的动作：只有「装 / 写配置 / 扫模型」。
+ *
+ * 启动与停止**不在这一页** —— 它们只在「④ 模型列表」里做。
+ * 一个模型只能有一个启动入口，才不会再出现两个入口同时拉起一个实例。
+ */
+type LlamaAction = 'install' | 'configure' | 'models' | 'merge'
 
 /** llama.cpp 认的设备（`--list-devices` 的解析结果），id 形如 CUDA0 / Vulkan1 */
 type LlamaDevice = { id: string; name: string; vramMiB?: number; freeMiB?: number }
@@ -113,17 +175,63 @@ function verdictOf(v: VramfitReport['verdict']): { tone: 'ok' | 'warn' | 'bad'; 
  * 顶部「获取模型 / 刷新」在设置面板里，刷新通过 ref 调进来。
  */
 export const LocalModels = forwardRef<LocalModelsHandle, Props>(function LocalModels(
-  { currentModels, onSelectModel, onConfigChanged },
+  {
+    currentModels,
+    onSelectModel,
+    onConfigChanged,
+    llamaSlots = [],
+    onPickDevice,
+    onSaveToList,
+    onCtxDraft,
+    onToggleMultiGpu
+  },
   ref
 ) {
-  /** llama.cpp 当前用的模型（其余本地服务各自从 currentModels 取） */
-  const currentModel = currentModels?.llamacpp ?? ''
+  /**
+   * 当前操作的是哪个本地实例 —— 也就是「哪张卡」。
+   *
+   * 一个实例只绑一张卡，所以「切换显卡」和「切换实例」是同一个动作。
+   * 以前这里写死 'llamacpp'：多实例时永远只认第一条，第二张卡在界面上
+   * 等于不存在 —— 能看到下拉里选了 CUDA1，点启动却还是启动第一条。
+   */
+  const [activeId, setActiveId] = useState(() =>
+    llamaSlots.some((s) => s.id === 'llamacpp') ? 'llamacpp' : (llamaSlots[0]?.id ?? 'llamacpp')
+  )
+  /** 实际下发给主进程的实例 id：父组件没传槽位时退回老行为，别让整块面板失灵 */
+  const activePid = activeId || llamaSlots[0]?.id || 'llamacpp'
+  /** llama.cpp 当前实例用的模型（其余本地服务各自从 currentModels 取） */
+  const currentModel = currentModels?.[activePid] ?? ''
   const [llamaOpen, toggleLlama] = useCollapse('llama-card', true)
   const [llamaBusy, setLlamaBusy] = useState<LlamaAction | null>(null)
   const [llamaMsg, setLlamaMsg] = useState('')
+  /** 「保存到列表」进行中：按钮要立刻有反应，同时防连点写两次盘 */
+  const [listBusy, setListBusy] = useState(false)
+  /**
+   * 页面上手选的上下文档位（还没落盘）。
+   *
+   * 这一页只做配置：点档位不再「按它重启服务」，只是把选择记在草稿里，
+   * 跟着「保存到列表」一起写进 provider.contextWindow；启动在「④ 模型列表」。
+   * null = 没手选，跟随落盘值（也就没改过）。
+   */
+  const [ctxPick, setCtxPick] = useState<number | null>(null)
+  // 换了实例（换卡）就作废上一次的档位选择，否则会把 A 卡的档写到 B 卡上
+  useEffect(() => {
+    setCtxPick(null)
+  }, [activePid])
+  /**
+   * 把待写盘的档位告诉父组件：底部「保存」也要能带上它。
+   *
+   * 放在 effect 里而不是各个 onClick 里 —— 换卡时上面那个 effect 会把 ctxPick 抹成
+   * null，这一条跟着把「待写盘」也清掉，两条保存路径看到的是同一个值。
+   */
+  useEffect(() => {
+    onCtxDraft?.(activePid, ctxPick)
+  }, [activePid, ctxPick, onCtxDraft])
   /** 安装进度（下载中带速度，解压时切文案） */
   const [setup, setSetup] = useState<SetupProgress | null>(null)
   const [llamaModels, setLlamaModels] = useState<string[]>([])
+  /** 模型列表默认只露 3 个，点「展开」才显示所有（模型多了整页铺开太长） */
+  const [modelsExpanded, setModelsExpanded] = useState(false)
   /** 相对路径 → 字节数；主进程 stat 出来的，拿不到的文件不会出现在这里 */
   const [sizes, setSizes] = useState<Record<string, number>>({})
   /** 每个模型的看图状态（主进程扫描时算好的：有没有配套投影器） */
@@ -162,7 +270,6 @@ export const LocalModels = forwardRef<LocalModelsHandle, Props>(function LocalMo
    * `mode !== off && (fits === false 或 文件比预算大) && 有卡` 才降级。
    */
   const [layerMode, setLayerMode] = useState<LayerMode>('auto')
-  const [warming, setWarming] = useState(false)
   const [backend, setBackend] = useState<{
     backend: string
     gpuReady: boolean
@@ -267,12 +374,21 @@ export const LocalModels = forwardRef<LocalModelsHandle, Props>(function LocalMo
   }, [])
 
   /** 体检一次：读文件头、算显存，结果由主进程缓存，重复点同一文件很快 */
-  async function runFit(file: string) {
+  async function runFit(file: string, deviceStr?: string) {
     if (!file) return
     const seq = ++fitSeq.current
+    /**
+     * 按「这条实例实际会用的卡」体检。
+     *
+     * 以前固定不传卡号，体检永远按第 0 张卡算 —— 双卡机器上给第二张卡选的模型
+     * 拿到的是第一张卡的结论。合并模式还要把卡组容量一起传下去，否则
+     * 面板报的是单卡的 8G，「合并后能跑 14B」在界面上根本看不出来。
+     */
+    const dev = deviceStr ?? llamaSlots.find((s) => s.id === activePid)?.device ?? ''
+    const pool = isMultiDevice(dev) ? poolOf(dev) : null
     setFitBusy(true)
     try {
-      const r = await window.pico.vramfit.check(file)
+      const r = await window.pico.vramfit.check(file, deviceIndex(dev), pool)
       if (alive.current && seq === fitSeq.current) setFit(r)
     } catch (err) {
       if (alive.current && seq === fitSeq.current) setFit({ ok: false, message: (err as Error).message })
@@ -322,28 +438,48 @@ export const LocalModels = forwardRef<LocalModelsHandle, Props>(function LocalMo
     void (async () => {
       try {
         const r = await window.pico.llama.models()
+        const devs = await window.pico.llama.devices().catch(() => [])
         if (!alive.current) return
         setLlamaModels(r.models)
         setVision(r.vision ?? {})
         setSizes(r.sizes ?? {})
-        const s = await window.pico.llama.status('llamacpp')
+        setDevices(devs)
+      } catch {
+        // 扫描失败不阻塞面板
+      }
+    })()
+  }, [])
+
+  /**
+   * 认一次「当前这张卡」的状态：挂载和切卡都走这里。
+   *
+   * 以前只在挂载时探一次、且固定探第一条实例。多卡之后这样会串台：
+   * 切到第二张卡，徽章和显存条还停在上一张卡上 —— 看起来两张都在跑，
+   * 实际只有一张；用户接下来点「停止服务」停的也是错的那个。
+   */
+  useEffect(() => {
+    let cancelled = false
+    void (async () => {
+      try {
+        const s = await window.pico.llama.status(activePid)
         const all = await window.pico.llama.instances().catch(() => [])
-        const devs = await window.pico.llama.devices().catch(() => [])
-        if (!alive.current) return
+        if (cancelled || !alive.current) return
         setLlamaRunning(s.running)
         setRunning(all)
-        setDevices(devs)
-        if (s.running && s.models?.[0]) setRunningModel(s.models[0])
+        setRunningModel(s.running ? (s.models?.[0] ?? '') : '')
         /**
          * 空闲卸载不是错误，但必须说出来：否则面板显示「未运行」，
          * 用户会以为服务崩了，跑去手动点启动（其实发消息就会自动加载）。
          */
         if (!s.running && s.idle) setLlamaMsg(s.message)
       } catch {
-        // 扫描失败不阻塞面板
+        // 探不到就保持原状
       }
     })()
-  }, [])
+    return () => {
+      cancelled = true
+    }
+  }, [activePid])
 
   /**
    * 订阅自动校准的进度。
@@ -385,7 +521,7 @@ export const LocalModels = forwardRef<LocalModelsHandle, Props>(function LocalMo
     let stopped = false
     const poll = async (): Promise<void> => {
       try {
-        const s = await window.pico.llama.status('llamacpp')
+        const s = await window.pico.llama.status(activePid)
         if (stopped || !alive.current) return
         if (s.running && s.vram) setVram(s.vram)
         else if (!s.running) setVram(null)
@@ -428,12 +564,148 @@ export const LocalModels = forwardRef<LocalModelsHandle, Props>(function LocalMo
 
   /** 人话版显卡描述；清单拿不到时退回设备 id，不让界面空着 */
   function gpuText(device?: string): string {
+    /**
+     * 合并模式是多张卡：把每张都写上，并给出合计显存 ——
+     * 只写第一张的话，用户会以为「合并开关没生效」。
+     */
+    const list = deviceList(device)
+    if (list.length > 1) {
+      const parts = list.map((d) => {
+        const g = gpuOf(d)
+        return g ? `${g.name}（${g.id}）` : d
+      })
+      const gb = poolOf(device)
+      return `${parts.join(' + ')}${gb ? ` · 合计 ${gb.toFixed(1)} GB` : ''}`
+    }
     const g = gpuOf(device)
     if (g) {
       const vram = g.vramMiB ? ` · ${(g.vramMiB / 1024).toFixed(1)} GB` : ''
       return `${g.name}（${g.id}${vram}）`
     }
     return (device ?? '').trim() || tr("由 llama.cpp 自动选择")
+  }
+
+  /**
+   * 一组卡的显存池（GB）。
+   *
+   * 用**容量**而不是空闲：体检现在是静态口径（按物理容量算），
+   * 单卡按容量、多卡按空闲求和会让结论「卡越多越悲观」——
+   * 桌面上开着游戏时，第二张卡会直接从预算里消失。
+   */
+  function poolOf(device?: string): number | null {
+    const list = deviceList(device)
+    if (!list.length) return null
+    let sum = 0
+    let got = false
+    for (const d of list) {
+      const g = gpuOf(d)
+      if (!g) continue
+      const v = g.vramMiB ?? g.freeMiB
+      if (typeof v !== 'number') continue
+      got = true
+      sum += v
+    }
+    return got && sum > 0 ? sum / 1024 : null
+  }
+
+  /**
+   * 卡组的物理显存合计（GB）。
+   *
+   * 和 poolOf 的区别：那个算「现在还能用多少」，模型已经在跑时只剩几百兆，
+   * 拿来标「合并后有多大」会吓人。展示容量用总量，判断装不装得下才用空闲。
+   */
+  function totalGbOf(device?: string): number {
+    let sum = 0
+    for (const id of deviceList(device)) {
+      const g = gpuOf(id)
+      if (g?.vramMiB) sum += g.vramMiB
+    }
+    return sum / 1024
+  }
+
+  /** 当前选中的那条实例（父组件没传槽位、或实例刚被删时为 null） */
+  const activeSlot = llamaSlots.find((s) => s.id === activePid) ?? null
+
+  /** 当前实例是不是「合并多卡跑一个模型」 */
+  const merged = isMultiDevice(activeSlot?.device)
+  /** 合并池（GB）：卡组当前空闲之和。拿不到就当没数，不要编 */
+  const mergedGb = merged ? poolOf(activeSlot?.device) : null
+  /** 合并实例是不是正在跑（按实例 key 对，不按模型名：两个卡组可以跑同一个模型） */
+  const mergedRunning = merged && running.some((r) => r.key === activePid && isMultiDevice(r.device))
+  /** 本机全部 N 卡的物理总量（GB），只用于「合并能凑出多少」这类说明 */
+  const allGpuGb = devices.reduce((s, d) => s + (d.vramMiB ?? 0), 0) / 1024
+  /** 合并池的物理容量（GB）：按钮上直接报「当前：合并模式 XX GB」 */
+  const mergedCapGb = merged ? totalGbOf(activeSlot?.device) || allGpuGb : 0
+
+  /**
+   * 切换合并模式。
+   *
+   * 这里只改配置并落盘，**不顺手重启**：重启要 10 秒，用户可能只是想先看看
+   * 「合并后能不能装下这个模型」（体检会立刻跟着变）。等他在「④ 模型列表」点
+   * 「启动」时，startLlama 会因为 device 变了而自动重启到这个新卡组。
+   */
+  async function toggleMerge(on: boolean) {
+    if (!onToggleMultiGpu) return
+    setLlamaBusy('merge')
+    setLlamaMsg('')
+    try {
+      const r = await onToggleMultiGpu(activePid, on)
+      setLlamaMsg(r.message ?? (r.ok ? tr("已切换") : tr("切换失败")))
+      if (r.ok) {
+        // 卡组变了，体检结论也跟着变（8G 装不下 / 16G 装得下）——
+        // 不等这里手动重算：父组件的槽位一更新，体检 effect 会自己按新卡组跑一次
+        void loadDevices()
+      }
+    } catch (err) {
+      setLlamaMsg(tr("切换失败：{0}", { "0": (err as Error).message }))
+    } finally {
+      setLlamaBusy(null)
+    }
+  }
+
+  /**
+   * 这张卡归谁 —— 显式绑定的优先。
+   *
+   * 「自动」实例（device 为空）实际就落在第一张卡上：llama.cpp 不传 -dev 时
+   * 自己挑第一块。不做这个映射，第一张卡会显示「空闲」，用户点下去会再建一条，
+   * 结果两条都压在同一张卡上 —— 起第二个时第一个还会被停掉。
+   */
+  function slotOwnerOf(devId: string): LlamaSlot | undefined {
+    const low = devId.trim().toLowerCase()
+    const pinned = llamaSlots.find((s) => (s.device ?? '').trim().toLowerCase() === low)
+    if (pinned) return pinned
+    if ((devices[0]?.id ?? '').trim().toLowerCase() === low) {
+      return llamaSlots.find((s) => !(s.device ?? '').trim())
+    }
+    return undefined
+  }
+
+  /** 这张卡上有没有正在跑的实例（同样把「自动」算作第一张卡） */
+  function liveOn(devId: string) {
+    const low = devId.trim().toLowerCase()
+    const exact = running.find((r) => (r.device ?? '').trim().toLowerCase() === low)
+    if (exact) return exact
+    if ((devices[0]?.id ?? '').trim().toLowerCase() === low) {
+      return running.find((r) => !(r.device ?? '').trim())
+    }
+    return undefined
+  }
+
+  /**
+   * 点一张卡：切到这张卡的实例；还没有就让父组件建一条。
+   *
+   * 切换后必须清掉 picked —— 否则上一张卡选的模型会被带过来，
+   * 「保存到列表」就变成「把上一个卡上的模型搬到这张卡」，而不是「给这张卡选模型」。
+   */
+  function pickSlot(d: LlamaDevice) {
+    const owner = slotOwnerOf(d.id)
+    const id = onPickDevice?.(d.id) ?? owner?.id
+    if (!id) return
+    setActiveId(id)
+    setPicked('')
+    setLlamaMsg(
+      tr("已切到 {0}：下面点一个模型，这张卡就把它跑起来。", { "0": `${d.id} · ${d.name}` })
+    )
   }
 
   // 列表变化时校正选中项：优先保留用户已选，其次用配置里的当前模型，最后退回第一个
@@ -446,47 +718,18 @@ export const LocalModels = forwardRef<LocalModelsHandle, Props>(function LocalMo
   }, [llamaModels, currentModel])
 
   // 选中的模型自动体检：点一下就能看到「跑不跑得动、能开多大上下文」，不用再找按钮
+  // 卡组变了也要重算：同一个模型在 8G 单卡上装不下、在 16G 合并池里就装得下
   useEffect(() => {
     if (!fitReady) return
     setFit(null)
     if (picked) void runFit(picked)
-    // runFit 每次渲染都是新函数，放进来会无限触发；它只依赖 picked
+    // runFit 每次渲染都是新函数，放进来会无限触发；它只依赖 picked 与卡组
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [picked, fitReady])
-
-  /** 后台等 llama-server 就绪：就绪后刷新模型列表与配置（不阻塞界面） */
-  async function watchServer(maxMs = 90000) {
-    setWarming(true)
-    const deadline = Date.now() + maxMs
-    try {
-      while (alive.current && Date.now() < deadline) {
-        await new Promise((r) => window.setTimeout(r, 1500))
-        if (!alive.current) return
-        const s = await window.pico.llama.status('llamacpp')
-        if (!s.running) continue
-        setLlamaRunning(true)
-        const ml = await window.pico.llama.models()
-        if (!alive.current) return
-        setLlamaModels(ml.models)
-        setVision(ml.vision ?? {})
-        setSizes(ml.sizes ?? {})
-        await onConfigChanged?.()
-        if (!alive.current) return
-        setLlamaMsg(
-          tr("本地模型已就绪：{0}", { "0": s.models?.[0] ?? ml.models[0] ?? tr("已加载") }) +
-            tr("（已设为当前使用）")
-        )
-        setRunningModel(s.models?.[0] ?? ml.models[0] ?? '')
-        return
-      }
-    } finally {
-      if (alive.current) setWarming(false)
-    }
-  }
+  }, [picked, fitReady, activeSlot?.device])
 
   /** 探一次 llama-server 状态：更新徽章、实例、当前模型，并把状态文案返回（供「自动配置」拼消息） */
   async function probeStatus(): Promise<{ running: boolean; message: string }> {
-    const s = await window.pico.llama.status('llamacpp')
+    const s = await window.pico.llama.status(activePid)
     if (!alive.current) return { running: s.running, message: s.message }
     setLlamaRunning(s.running)
     setRunning(await window.pico.llama.instances().catch(() => []))
@@ -496,7 +739,7 @@ export const LocalModels = forwardRef<LocalModelsHandle, Props>(function LocalMo
       .get()
       .then((cfg) => {
         if (!alive.current) return
-        const p = cfg.providers?.find((x) => x.id === 'llamacpp')
+        const p = cfg.providers?.find((x) => x.id === activePid)
         setRealProbe(p?.ctxProbe ?? null)
         // 同一份配置里带着分层模式：顺手校准一次，省得单独再读一遍文件
         setLayerMode(partialModeOf({ mode: cfg.llamaPartialOffloadMode, enabled: cfg.llamaPartialOffload }))
@@ -518,72 +761,14 @@ export const LocalModels = forwardRef<LocalModelsHandle, Props>(function LocalMo
     return r
   }
 
-  /** 删一个模型文件。二次确认放在这里，主进程只负责执行和校验。 */
-  async function removeOne(rel: string) {
-    const name = baseName(rel)
-    const ask = tr("删除「{0}」？\n文件会从磁盘移除，不能恢复。正在运行时请先点「停止服务」。", {
-      "0": name
-    })
-    if (!window.confirm(ask)) return
-    const r = await window.pico.llama.deleteModel(rel)
-    setLlamaMsg(r.message)
-    if (r.ok) await refreshModels()
-  }
-
   /**
-   * 清理没有被任何供应商引用的模型。
+   * 这一页只负责「装 / 写配置 / 扫模型」。
    *
-   * 「未使用」的判据是 all providers 的 model 字段 + 正在跑的实例：
-   * currentModels 是全部供应商的 id → model 映射，所以工人模型、备用模型
-   * 都在里面，不会误删正在用的那份。
+   * 以前还带 action='start' | 'stop'：点一下就把 llama-server 拉起来。
+   * 那正是「本地模型」页与「模型列表」页各起一个实例、最终并发起出两份的根源，
+   * 现在整条启动/停止路径都从这一页删掉，改到「④ 模型列表」。
    */
-  async function cleanUnused() {
-    const inUse = new Set(
-      Object.values(currentModels ?? {})
-        .map((v) => baseName(v || '').toLowerCase())
-        .filter(Boolean)
-    )
-    if (llamaRunning && runningModel) inUse.add(baseName(runningModel).toLowerCase())
-
-    const unused = llamaModels.filter((m) => !inUse.has(baseName(m).toLowerCase()))
-    if (!unused.length) {
-      setLlamaMsg(tr("没有可清理的模型：目录里每个都被某个供应商用着"))
-      return
-    }
-    const bytes = unused.reduce((s, m) => s + (sizes[m] ?? 0), 0)
-    const ask = tr("将删除 {0} 个没有被任何供应商使用的模型，共 {1}：\n{2}\n\n删除后不能恢复。", {
-      "0": String(unused.length),
-      "1": gb(bytes),
-      "2": unused.map((m) => baseName(m)).join('\n')
-    })
-    if (!window.confirm(ask)) return
-
-    let freed = 0
-    const failed: string[] = []
-    for (const m of unused) {
-      // 逐个删而不是并发：机械盘上并发删大文件反而更慢，也会让失败原因串在一起
-      const r = await window.pico.llama.deleteModel(m)
-      if (r.ok) freed += r.freedBytes ?? 0
-      else failed.push(`${baseName(m)}：${r.message}`)
-    }
-    await refreshModels()
-    setLlamaMsg(
-      failed.length
-        ? tr("已释放 {0}，但有 {1} 个没删掉：\n{2}", {
-            "0": gb(freed),
-            "1": String(failed.length),
-            "2": failed.join('\n')
-          })
-        : tr("已清理 {0} 个模型，释放 {1}", { "0": String(unused.length), "1": gb(freed) })
-    )
-  }
-
-  /**
-   * ctx 不传 = 自动定档；传了 = 按这一档启动。
-   * ctxExplicit 区分「用户手点的档」和「按建议按钮」之外的内部调用：
-   * 手点的档要告诉主进程别在就绪后按实测显存自动升/降档。
-   */
-  async function runLlama(action: LlamaAction, ctx?: number, ctxExplicit = false) {
+  async function runLlama(action: LlamaAction) {
     if (llamaBusy) return
     // 主进程里已经有一份安装在下：切走再回来点按钮不该起第二份
     if (action === 'install' && setup && ACTIVE_SETUP.includes(setup.state)) {
@@ -632,52 +817,6 @@ export const LocalModels = forwardRef<LocalModelsHandle, Props>(function LocalMo
         setLlamaMsg(tr("正在扫描本地 .gguf 模型…"))
         const r = await refreshModels()
         setLlamaMsg(r.message)
-      } else if (action === 'start') {
-        const target = picked || llamaModels[0]
-        if (!target) {
-          setLlamaMsg(tr("还没有本地模型：点顶部「获取模型」下载，或放进 models/。"))
-          return
-        }
-        setLlamaMsg(
-          tr("正在启动 llama-server（{0}）并创建模型配置…", { "0": baseName(target) }) +
-            (ctx ? tr(" · 上下文 {0}", { "0": kctx(ctx) }) : '')
-        )
-        // activate：这是用户主动点的「启动并使用」，启动后必须把这条设成当前模型，
-        // 否则回到对话界面还是上一个模型（顶栏、发消息都按 activeId 走）
-        const r = await window.pico.llama.start(target, ctx, {
-          providerId: 'llamacpp',
-          activate: true,
-          ctxExplicit
-        })
-        setLlamaMsg(r.message)
-        if (r.ok) {
-          if (r.model) setRunningModel(r.model)
-          // 配置已落盘：先刷新，模型立刻出现在选择器/设置里
-          await onConfigChanged?.()
-          // 新实例起来了，顺便把实例与显卡清单捞一遍，界面上立刻能报「哪块卡在跑」
-          void window.pico.llama.instances().then((all) => {
-            if (alive.current) setRunning(all)
-          }).catch(() => undefined)
-          void loadDevices()
-          // 模型加载放到后台，就绪后再校正一次
-          void watchServer()
-        }
-      } else if (action === 'stop') {
-        /**
-         * 手动停止。
-         *
-         * 以前只有空闲卸载这一条路能收回显存，用户开个游戏前得等十分钟。
-         * 这里直接调主进程的 stopLlama：它会连同子进程一起收掉并清掉「空闲卸载」记录，
-         * 下次发消息走的是正常启动路径，不会被误判成「睡醒了叫起来」。
-         */
-        setLlamaMsg(tr("正在停止 llama-server…"))
-        const r = await window.pico.llama.stop('llamacpp')
-        // 停完必须复核：只信返回值的话，进程真没退干净时面板会一直写「未运行」
-        const s = await probeStatus().catch(() => null)
-        setLlamaMsg(s ? `${r.message}\n${s.message}` : r.message)
-        void window.pico.llama.instances().then((all) => {
-          if (alive.current) setRunning(all)
-        }).catch(() => undefined)
       }
     } catch (err) {
       setLlamaMsg(tr("操作失败：{0}", { "0": (err as Error).message }))
@@ -699,16 +838,37 @@ export const LocalModels = forwardRef<LocalModelsHandle, Props>(function LocalMo
     count: () => llamaModels.length
   }))
 
-  /** 正在跑的那个实例：先按模型名对上，对不上就取第一条（单实例时两条路结果一样） */
-  const runningInstance = running.find((r) => sameModel(r.model, runningModel)) ?? running[0] ?? null
-  /** 本地模型占用的磁盘总量：看不见体积的话，「清理」就无从下手 */
-  const totalBytes = llamaModels.reduce((s, m) => s + (sizes[m] ?? 0), 0)
+  /**
+   * 正在跑的那个实例：先按「当前这张卡」对上。
+   *
+   * 两张卡可以跑同一个模型，只按模型名匹配会挑到另一张卡上那条，
+   * 「运行中的显卡」就指向了错误的一边。
+   */
+  const slotDevice = (activeSlot?.device ?? '').trim().toLowerCase()
+  const runningInstance =
+    (slotDevice
+      ? running.find((r) => (r.device ?? '').trim().toLowerCase() === slotDevice)
+      : undefined) ??
+    running.find((r) => sameModel(r.model, runningModel)) ??
+    running[0] ??
+    null
   /** 它落在哪块卡上 —— 用户问的就是这句，别只给个 CUDA0 */
   const runningGpu = runningInstance ? gpuOf(runningInstance.device) : null
   /** 显卡清单拿不到时（老版本 llama.cpp）退回设备 id，总之别让这一栏空着 */
-  const runningGpuLabel = runningGpu?.name ?? (runningInstance?.device ?? '').trim()
-  /** 当前实例实际开的上下文：档位行据此高亮，点别的档就是切档重启 */
+  const runningGpuLabel =
+    runningInstance && isMultiDevice(runningInstance.device)
+      ? tr("{0}（合计 {1} GB）", {
+          "0": deviceList(runningInstance.device)
+            .map((id) => gpuOf(id)?.name ?? id)
+            .join('+'),
+          "1": totalGbOf(runningInstance.device).toFixed(0)
+        })
+      : runningGpu?.name ?? (runningInstance?.device ?? '').trim()
+  /** 当前实例实际开的上下文：档位行据此标「运行中那一档」 */
   const activeCtx = runningInstance?.ctx ?? null
+  /** 落盘配置里的档位：手选过就以手选为准，否则显示配置里存的那一档 */
+  const slotCtx = llamaSlots.find((s) => s.id === activePid)?.contextWindow ?? null
+  const pickedCtx = ctxPick ?? slotCtx ?? null
   const fitReport = fit?.ok ? fit.report : null
   const fitVerdict = fitReport ? verdictOf(fitReport.verdict) : null
   const fitCtx = fitReport?.recommendedCtx ?? null
@@ -771,18 +931,18 @@ export const LocalModels = forwardRef<LocalModelsHandle, Props>(function LocalMo
     <>
       <div className="fit-tiers">
       {/*
-        「自动」在「一档都装不下 + 分层关着」时也会 OOM：主进程按装不下就是
-        -ngl 999，进程秒退。这里一并禁掉，别只在档位按钮上拦。
+        「建议」在体检还没算出档位时没有意义（点了也无从写入）→ 禁用。
+        注意这里**不再启动服务**：点档位只是把选择记进草稿，随「保存到列表」落盘。
       */}
       <button
         type="button"
         className="fit-tier auto"
-        disabled={!!llamaBusy || (!!fitReport && !fitCtx && !canLayer)}
-        onClick={() => void runLlama('start')}
+        disabled={!!llamaBusy || !fitCtx}
+        onClick={() => fitCtx && setCtxPick(fitCtx)}
         title={
-          !!fitReport && !fitCtx && !canLayer
-            ? tr("整模型装不下任何一档，且分层加载已关闭：先换更小的模型或打开分层")
-            : tr("自动定档：按体检建议与实测显存挑一档（默认）")
+          !fitCtx
+            ? tr("还没有可用档位：等体检算出来，或直接点下面某一档")
+            : tr("按体检建议把 {0} 写进配置（保存后生效）", { "0": kctx(fitCtx) })
         }
       >
         {tr("自动")}
@@ -796,13 +956,13 @@ export const LocalModels = forwardRef<LocalModelsHandle, Props>(function LocalMo
          *
          * 三种状态：
          * - 装得下（绿）；其中 `tight` 的标个「紧」（只剩几十上百 MiB，长对话容易挤）
-         * - 装不下（灰虚框）：点了会按显存逐层分配。开关关着时禁用并划掉
+         * - 装不下（灰虚框）：启动时会按显存逐层分配。开关关着时禁用并划掉
          * - 超过训练窗口：一律禁用（llama.cpp 会把窗口裁回原生值，标了也是假的）
          */
         const beyond = row.beyondNative === true
         const needsLayer = row.fits === false && !beyond
         const blocked = beyond || (needsLayer && !canLayer)
-        const on = activeCtx === row.ctx
+        const on = pickedCtx === row.ctx
         const suggested = fitCtx === row.ctx
         const tight = row.fits === true && row.tight === true
         return (
@@ -811,14 +971,14 @@ export const LocalModels = forwardRef<LocalModelsHandle, Props>(function LocalMo
             type="button"
             className={`fit-tier ${row.fits === null ? 'unknown' : blocked ? 'bad' : needsLayer ? 'partial' : 'ok'}${on ? ' on' : ''}${suggested ? ' suggested' : ''}`}
             disabled={!!llamaBusy || blocked}
-            onClick={() => void runLlama('start', row.ctx, true)}
+            onClick={() => setCtxPick(row.ctx)}
             title={
               beyond
                 ? tr("这档超过模型训练窗口（{0}），llama.cpp 会把窗口裁回原生值，选它没有意义", {
                     "0": kctx(fitCtx ?? row.ctx)
                   })
                 : needsLayer && canLayer
-                  ? tr("体检判断 {0} 装不下（需要 {1} / 预算 {2}）：会按显存逐层分配，一部分层留在 CPU/内存，能跑但明显变慢", {
+                  ? tr("体检判断 {0} 装不下（需要 {1} / 预算 {2}）：保存这档后，启动时会按显存逐层分配，一部分层留在 CPU/内存，能跑但明显变慢", {
                       "0": kctx(row.ctx),
                       "1": row.needBytes ? gb(row.needBytes) : '—',
                       "2": budgetText
@@ -829,7 +989,7 @@ export const LocalModels = forwardRef<LocalModelsHandle, Props>(function LocalMo
                         "1": row.needBytes ? gb(row.needBytes) : '—',
                         "2": budgetText
                       })
-                    : tr("以 {0} 上下文启动（{1} tokens），锁定该档、不再自动调档", {
+                    : tr("把 {0}（{1} tokens）写进配置：以后启动都按这一档，不再自动调档", {
                         "0": kctx(row.ctx),
                         "1": String(row.ctx)
                       })
@@ -919,9 +1079,7 @@ export const LocalModels = forwardRef<LocalModelsHandle, Props>(function LocalMo
               {runningGpuLabel ? ` · ${runningGpuLabel}` : ''}
               {runningInstance?.partial ? ` · ${tr("部分卸载")}` : ''}
             </span>
-          ) : (
-            warming && <span className="guide-badge warming">{tr("加载中…")}</span>
-          )}
+          ) : null}
           <Chevron open={llamaOpen} />
         </div>
         {backend?.installed && !backend.gpuReady && (
@@ -932,8 +1090,6 @@ export const LocalModels = forwardRef<LocalModelsHandle, Props>(function LocalMo
           <p className="guide-warn">
             {tr("还没装 llama.cpp：点下面「一键安装 / 下载」即可。")}</p>
         )}
-        <p className="guide-lead">
-          {tr("自动下载解压到")}<code>llama.cpp/</code>{tr("，用本机 GGUF 模型启动服务。")}</p>
         {llamaRunning && vram && vram.totalMiB > 0 && (
           <div className="guide-vram">
             <div className="guide-vram-head">
@@ -968,7 +1124,7 @@ export const LocalModels = forwardRef<LocalModelsHandle, Props>(function LocalMo
             按钮一律用基础 .btn 样式（和「自动配置」同一个颜色）：
             以前「可更新」带描边强调色、「停止服务」带红字，四个按钮摆一排像四种状态，
             眼睛先被颜色带走、反而看不出哪个是主操作。状态改由文字和图标表达
-            （「可更新 → b1234」），颜色只留给「一键启动」这个主按钮。
+            （「可更新 → b1234」），颜色只留给这一页唯一的出口「保存到列表」。
           */}
           <button
             className="btn"
@@ -996,22 +1152,57 @@ export const LocalModels = forwardRef<LocalModelsHandle, Props>(function LocalMo
             title={tr("写入本地模型配置，并顺手报一次服务状态")}
           >
             {llamaBusy === 'configure' ? tr("配置中…") : tr("自动配置")}</button>
+          {/*
+            合并多卡：一个模型摊到全部卡上，显存池从 8G 变成 16G。
+            「每个卡单独跑一个模型」和「多卡跑一个模型」抢的是同一批卡，
+            所以这是一个开关，而不是再加一个实例 —— 开着的时候卡槽整排
+            合并成一块，避免用户以为还能往第二张卡上再塞一个模型。
+
+            按钮文案只报「现在是哪种模式」（合并模式 XX GB / 一卡一模型 XX 张卡），
+            不写「点了会怎样」：动词式文案在两个状态之间来回换，看一眼根本分不清
+            当前落在哪种模式下。点了会做什么放在 title 里。
+          */}
           <button
-            className="btn primary"
-            disabled={!!llamaBusy}
-            onClick={() => void runLlama('start')}
-            title={picked ? tr("启动并使用：{0}", { "0": baseName(picked) }) : tr("启动 llama-server")}
+            className={`btn${merged ? ' on' : ''}`}
+            disabled={!!llamaBusy || devices.length < 2}
+            onClick={() => void toggleMerge(!merged)}
+            title={
+              devices.length < 2
+                ? tr("只有一张可用显卡，合并没有意义")
+                : merged
+                  ? tr("拆回一卡一模型：每个实例各占一张卡，主 / 子在「④ 模型列表」里逐条设定")
+                  : tr("把这几张卡合成一个显存池跑同一个模型（约 {0} GB）：大模型能全量上卡，不用再分层跑到 CPU", {
+                      "0": allGpuGb.toFixed(0)
+                    })
+            }
           >
-            {llamaBusy === 'start' ? tr("启动中…") : tr("一键启动")}
+            {llamaBusy === 'merge'
+              ? tr("切换中…")
+              : merged
+                ? tr("当前：合并模式 {0} GB", {
+                    "0": mergedCapGb ? mergedCapGb.toFixed(0) : '?'
+                  })
+                : tr("当前：一卡一模型 · {0} 张卡", { "0": String(devices.length) })}
           </button>
-          {llamaRunning && (
+          {/*
+            这一页的出口，站在「停止服务」原来的位置上。
+            这一页只做配置：启动与停止都搬到「④ 模型列表」，一个模型只有一个启动入口，
+            才不会出现两处各拉起一个 llama-server（曾经就因为并发启动起了两个）。
+          */}
+          {onSaveToList && (
             <button
-              className="btn"
-              disabled={!!llamaBusy}
-              onClick={() => void runLlama('stop')}
-              title={tr("立刻停掉本机 llama-server 并释放显存。下次发消息会自动重新加载，上下文档位保持不变。")}
+              className="btn primary"
+              disabled={listBusy}
+              title={tr("把这份配置写入磁盘，然后到「④ 模型列表」启动它")}
+              onClick={() => {
+                if (listBusy) return
+                setListBusy(true)
+                void onSaveToList(activePid, ctxPick ? { contextWindow: ctxPick } : undefined).finally(
+                  () => setListBusy(false)
+                )
+              }}
             >
-              {llamaBusy === 'stop' ? tr("停止中…") : tr("停止服务")}
+              {listBusy ? tr("保存中…") : tr("保存到列表")}
             </button>
           )}
         </div>
@@ -1027,45 +1218,156 @@ export const LocalModels = forwardRef<LocalModelsHandle, Props>(function LocalMo
           </div>
         )}
         {llamaMsg && <div className="guide-msg">{llamaMsg}</div>}
+        {devices.length > 0 && (
+          <div className="gpu-slots">
+            <div className="gpu-slots-head">
+              <b>{tr("显卡")}</b>
+              {/**
+                * 单卡机器上不写「共 1 张，点一张为它选模型」：卡槽自己就带
+                * 「当前 / 空闲 · 点我选模型」标记，同一件事说两遍只是噪音。
+                * 多卡和合并态才留说明 —— 那两种情况下「点哪张」真的会改变结果。
+                */}
+              {(merged || devices.length > 1) && (
+                <span className="guide-pick-hint">
+                  {merged
+                    ? tr("合并模式：这几张卡一起跑同一个模型")
+                    : tr("一卡一模型：共 {0} 张，点一张为它选模型；主 / 子在「④ 模型列表」里设定", {
+                        "0": String(devices.length)
+                      })}
+                </span>
+              )}
+            </div>
+            {merged ? (
+              /**
+               * 合并模式：整排卡槽合成一块。
+               *
+               * 不给「点某一张单独选模型」的入口 —— 卡已经被合并实例占住了，
+               * 再点一张去建单卡实例会和它抢同一张卡，起新的时候旧的就崩。
+               */
+              <div className="gpu-merged">
+                <div className="gpu-merged-top">
+                  <span className="gpu-merged-badge">{tr("合并")}</span>
+                  <span className="gpu-merged-names">
+                    {deviceList(activeSlot?.device).map((id) => gpuText(id)).join('  +  ')}
+                  </span>
+                  {mergedRunning && <span className="gpu-slot-live">{tr("运行中")}</span>}
+                </div>
+                <div className="gpu-merged-sub">
+                  {activeSlot?.model ? baseName(activeSlot.model) : tr("还没选模型")}
+                  {mergedGb ? tr(" · 合计约 {0} GB 可用", { "0": mergedGb.toFixed(1) }) : ''}
+                  {tr(" · 按层切分（-sm layer），大模型可全量上卡")}
+                </div>
+              </div>
+            ) : (
+            <div className="gpu-slot-row">
+              {devices.map((d) => {
+                const owner = slotOwnerOf(d.id)
+                const live = liveOn(d.id)
+                const on = owner?.id === activePid
+                return (
+                  <button
+                    key={d.id}
+                    type="button"
+                    className={`gpu-slot ${on ? 'on' : ''} ${owner ? 'used' : 'free'}`}
+                    onClick={() => pickSlot(d)}
+                    title={
+                      owner
+                        ? tr("{0}：{1}（点了就切到这张卡，之后选的模型装在它上面）", {
+                            "0": gpuText(d.id),
+                            "1": owner.model ? baseName(owner.model) : tr("还没选模型")
+                          })
+                        : tr("{0} 还空着：点它为这张卡开一个实例并选模型", { "0": gpuText(d.id) })
+                    }
+                  >
+                    <span className="gpu-slot-top">
+                      <span className="gpu-slot-id">{d.id}</span>
+                      {live && <span className="gpu-slot-live">{tr("运行中")}</span>}
+                      {on && <span className="gpu-slot-here">{tr("当前")}</span>}
+                      {/*
+                        角色来自「④ 模型列表」：这一页只负责「这张卡上装哪个模型」，
+                        主 / 子不在这里改，但必须看得见 —— 否则用户不知道这次配的
+                        是给对话用的主模型，还是给子代理干活的子智能体。
+                      */}
+                      {owner?.role === 'main' && (
+                        <span className="gpu-slot-role main">{tr("主")}</span>
+                      )}
+                      {owner?.role === 'worker' && (
+                        <span className="gpu-slot-role">{tr("子")}</span>
+                      )}
+                    </span>
+                    <span className="gpu-slot-name">{d.name}</span>
+                    <span className="gpu-slot-sub">
+                      {owner
+                        ? owner.model
+                          ? baseName(owner.model)
+                          : tr("未选模型")
+                        : tr("空闲 · 点我选模型")}
+                    </span>
+                    <span className="gpu-slot-vram">
+                      {d.vramMiB ? `${(d.vramMiB / 1024).toFixed(0)} GB` : ''}
+                      {/* 跑着实例的卡不报「空闲」：那串数是探测时的快照，
+                          模型已经上去之后还写「空闲 6.9 GB」会直接把人带偏 */}
+                      {!live && typeof d.freeMiB === 'number'
+                        ? tr(" · 空闲 {0} GB", { "0": (d.freeMiB / 1024).toFixed(1) })
+                        : ''}
+                    </span>
+                  </button>
+                )
+              })}
+            </div>
+            )}
+          </div>
+        )}
+        {/**
+          * 这里原来还有一整块「工作组」摘要（组名、整组 N 张卡 M 个就绪、
+          * 主模型是哪张卡、逐卡的「工作模型」卡片、并行体检按钮与结果）。
+          *
+          * 全部去掉了：上面「显卡」那一排已经写明每张卡上是哪个模型。
+          * 现在主 / 子由「④ 模型列表」显式指定，这一页不再有「自动进组」这回事，
+          * 再铺一遍摘要只会和列表页的结论打架。
+          */}
         {llamaModels.length > 0 && (
           <div className="guide-pick">
             <div className="guide-pick-head">
               <b>{tr("使用哪个本地模型")}</b>
-              <span className="guide-pick-hint">
-                {tr("共")}{llamaModels.length} {tr("个，点一下选中")}{llamaRunning && runningModel ? tr(" · 当前运行：{0}", { "0": baseName(runningModel) }) : ''}
-                {llamaRunning && runningGpuLabel
-                  ? tr(" · 显卡 {0}", { "0": runningGpuLabel })
-                  : ''}
-              </span>
+              {/* 点完卡再选模型，这里回显「装到哪张卡」：两卡各一个实例时，
+                  没有这行标签，用户分不清下面点的这个模型落在谁身上。
+                  只有一张卡就没这个问题 —— 报个 CUDA0 只是多一行字。 */}
+              {activeSlot && (merged || devices.length > 1) && (
+                <span
+                  className={`gpu-pick-target${merged ? ' merged' : ''}`}
+                  title={
+                    merged
+                      ? tr("现在选的模型会摊到这几张卡上跑")
+                      : tr("现在选的模型会装到这张卡上")
+                  }
+                >
+                  {merged
+                    ? tr("合并 {0}", { "0": deviceList(activeSlot.device).join('+') })
+                    : activeSlot.device || tr("自动")}
+                </span>
+              )}
+              {/* 「共 N 个，点一下选中」「当前运行：xxx」「显卡 xxx」这三句都去掉了：
+                  列表本来就是点一下就选中；运行中的模型自己带「运行中」和显卡标签，
+                  再在表头重复一遍只是占地方。 */}
             </div>
-            <div className="guide-disk">
-              <span>
-                {totalBytes > 0
-                  ? tr("{0} 个模型，共占磁盘 {1}", {
-                      "0": String(llamaModels.length),
-                      "1": gb(totalBytes)
-                    })
-                  : tr("共 {0} 个模型", { "0": String(llamaModels.length) })}
-              </span>
-              <button
-                type="button"
-                className="btn sm"
-                onClick={() => void cleanUnused()}
-                title={tr("删掉没有被任何供应商引用的模型（配套投影器一起删），删前后都有确认")}
-              >
-                {tr("清理未使用")}
-              </button>
-            </div>
+            {/**
+              * 这一行原来是「N 个模型，共占磁盘 X GB」+「清理未使用」按钮，两样都去掉了：
+              * 每个模型自己带体积标签，合计没有额外信息；而删除模型属于用户自己的磁盘操作，
+              * 这个程序不该替人决定「哪些算没用的」—— 误删一次就是几十 GB 重新下载。
+              */}
             <div className="guide-models">
-              {llamaModels.map((m) => {
+              {(modelsExpanded ? llamaModels : llamaModels.slice(0, 3)).map((m) => {
                 const on = sameModel(m, picked)
                 const isRunning = llamaRunning && sameModel(m, runningModel)
                 const needRestart = on && llamaRunning && !!runningModel && !isRunning
                 return (
                   /**
-                   * 这里用 div 而不是 button：里面还要放「删除」按钮，
-                   * 而 HTML 不允许按钮嵌套按钮（内层点击会冒泡成两层触发）。
+                   * 用 div + role 而不是 button：这一行是「选中」，外层的点击区域要整片可点，
                    * 键盘可达性由 role + onKeyDown 补回来。
+                   *
+                   * 行尾那个「×（从磁盘删除）」已经去掉了：删模型文件是用户自己的磁盘操作，
+                   * 不该做成列表里一个手滑就中的小叉。要删就去 models/ 里删。
                    */
                   <div
                     key={m}
@@ -1075,13 +1377,13 @@ export const LocalModels = forwardRef<LocalModelsHandle, Props>(function LocalMo
                     onClick={() => {
                       setPicked(m)
                       // 同步到「模型列表」里的下拉框，两边始终是同一个模型
-                      onSelectModel?.(baseName(m), 'llamacpp')
+                      onSelectModel?.(baseName(m), activePid)
                     }}
                     onKeyDown={(e) => {
                       if (e.key !== 'Enter' && e.key !== ' ') return
                       e.preventDefault()
                       setPicked(m)
-                      onSelectModel?.(baseName(m), 'llamacpp')
+                      onSelectModel?.(baseName(m), activePid)
                     }}
                     title={m}
                   >
@@ -1119,29 +1421,38 @@ export const LocalModels = forwardRef<LocalModelsHandle, Props>(function LocalMo
                         {gb(sizes[m])}
                       </span>
                     ) : null}
-                    <button
-                      type="button"
-                      className="guide-model-del"
-                      title={tr("从磁盘删除这个模型（含配套投影器），不能恢复")}
-                      onClick={(e) => {
-                        // 不加就同时触发外层的「选中」：删完顺手把模型也切了
-                        e.stopPropagation()
-                        void removeOne(m)
-                      }}
-                    >
-                      ×
-                    </button>
                   </div>
                 )
               })}
             </div>
-            {picked && (
-              <div className="guide-pick-picked">
-                {tr("将使用")}<b>{baseName(picked)}</b>
-                {llamaRunning && runningModel && !sameModel(picked, runningModel)
-                  ? tr("（点「一键启动」会自动停掉当前服务再加载它）")
-                  : ''}
-              </div>
+            {llamaModels.length > 3 && (
+              <button
+                type="button"
+                className="guide-models-more"
+                onClick={() => setModelsExpanded((v) => !v)}
+                title={
+                  modelsExpanded
+                    ? tr('收起模型列表，只显示前 3 个')
+                    : tr('展开全部 {length} 个本地模型', { length: llamaModels.length })
+                }
+              >
+                {modelsExpanded ? tr('收起') : tr('展开全部 {length} 个', { length: llamaModels.length })}
+                <svg
+                  className={modelsExpanded ? 'up' : ''}
+                  width="9"
+                  height="9"
+                  viewBox="0 0 10 10"
+                  aria-hidden="true"
+                >
+                  <path
+                    d="M2 4l3 3 3-3"
+                    stroke="currentColor"
+                    strokeWidth="1.4"
+                    fill="none"
+                    strokeLinecap="round"
+                  />
+                </svg>
+              </button>
             )}
             {picked && vision[picked] === 'missing' && (
               <p className="guide-warn">
@@ -1172,7 +1483,7 @@ export const LocalModels = forwardRef<LocalModelsHandle, Props>(function LocalMo
                     className="fit-refresh"
                     disabled={fitBusy}
                     onClick={() => void runFit(picked)}
-                    title={tr("重新体检（显存被别的程序占用时结果会变）")}
+                    title={tr("重新体检（按显卡容量静态估算，与当前占用无关；改过文件或 KV 精度才需要）")}
                   >
                     {tr("重算")}
                   </button>
@@ -1189,20 +1500,21 @@ export const LocalModels = forwardRef<LocalModelsHandle, Props>(function LocalMo
                       <span>
                         {gb(fitReport.budget.limitBytes)}
                         {fitReport.gpu ? ` · ${fitReport.gpu.name}` : ` · ${tr("CPU 推理")}`}
-                        {/* A 卡 / 核显读不到已用显存时预算按 60% 保守估，不解释一句会被当成「算错了」 */}
-                        {fitReport.gpu?.usedUnknown ? (
+                        {/*
+                          静态口径：按显卡总容量算，与此刻谁占着显存无关。
+                          必须写出来 —— 否则用户开着游戏点启动、速度掉下来，会以为是这份预算算错了。
+                          动态口径时代这里还有一句「本地服务正占着显存，档位偏保守」，
+                          现在不成立了：预算不再看当前占用。
+                        */}
+                        {fitReport.budget.basis === 'static' ? (
                           <em className="fit-dim">
-                            {tr("（读不到当前已用显存，按总显存 60% 保守估）")}
+                            {tr("（静态口径：按显卡总容量的 94% 估算，不看当前谁占着显存）")}
                           </em>
                         ) : null}
-                        {/*
-                          服务自己正占着显存，体检只能按「现在还剩多少」算 ——
-                          于是档位会集体偏悲观，看起来像「一档都装不下」。
-                          不说明的话，用户会以为模型跑不动，其实只是自己占了自己的。
-                        */}
-                        {llamaRunning ? (
+                        {/* A 卡 / 核显读不到已用显存时预算按 60% 保守估，不解释一句会被当成「算错了」 */}
+                        {fitReport.gpu?.usedUnknown && fitReport.budget.basis !== 'static' ? (
                           <em className="fit-dim">
-                            {tr("（本地服务正在跑，剩余显存被它占着；档位会偏保守，重启后才准）")}
+                            {tr("（读不到当前已用显存，按总显存 60% 保守估）")}
                           </em>
                         ) : null}
                       </span>
@@ -1244,7 +1556,7 @@ export const LocalModels = forwardRef<LocalModelsHandle, Props>(function LocalMo
                             ) : (
                               <b className="fit-warn">{tr("一档都装不下")}</b>
                             )}
-                            <em className="fit-dim fit-sub">
+                            <em className="fit-dim">
                               {tr("（多占 {0}）", { "0": gb(fitReport.vision.totalBytes) })}
                             </em>
                           </span>
@@ -1274,8 +1586,8 @@ export const LocalModels = forwardRef<LocalModelsHandle, Props>(function LocalMo
                       <span title={tr("按带宽公式算出的上限，不是实测；实测值见下方「实测」一栏，两者可能差一倍以上")}>
                         {fitTok ? `~${fitTok} tok/s` : '—'}
                         {fitCtxTok && fitReport.speedCtx ? (
-                          <em className="fit-dim fit-sub">
-                            {tr("{ctx} 上下文估算约 {n} tok/s", {
+                          <em className="fit-dim">
+                            {' '}{tr("{ctx} 上下文估算约 {n} tok/s", {
                               ctx: kctx(fitReport.speedCtx),
                               n: String(fitCtxTok)
                             })}
@@ -1310,63 +1622,33 @@ export const LocalModels = forwardRef<LocalModelsHandle, Props>(function LocalMo
                       ) : null}
                     </div>
 
-                    {/* 各档上下文直接可点：点哪档就按哪档重启服务，选中态跟着实际实例走 */}
+                    {/* 各档上下文只改配置：点哪档就记哪档，跟着「保存到列表」落盘 */}
                     <div className="fit-tier-head">
-                      <b>{tr("启动上下文")}</b>
+                      <b>{tr("上下文档位")}</b>
                       <span className="fit-dim">
-                        {tr("点一档就按它重启服务，绿=装得下、灰虚框=装不下")}
+                        {tr("点一档写进配置，保存后生效；绿=装得下、灰虚框=装不下")}
                       </span>
                       {activeCtx ? (
                         <span className="fit-tier-current">
-                          {tr("当前 {0}", { "0": kctx(activeCtx) })}
+                          {tr("运行中 {0}", { "0": kctx(activeCtx) })}
                         </span>
                       ) : null}
                     </div>
                     {tierButtons(fitReport.tiers)}
 
-                    <div className="fit-foot">
-                      {fitCtx ? (
-                        <button
-                          type="button"
-                          className="btn primary"
-                          disabled={!!llamaBusy}
-                          onClick={() => void runLlama('start', fitCtx, true)}
-                          title={tr("按体检算出的上下文启动并锁定该档：{0}", { "0": `${kctx(fitCtx)} tokens` })}
-                        >
-                          {tr("按建议上下文启动（{0}）", { "0": kctx(fitCtx) })}
-                        </button>
-                      ) : canLayer && fitReport.tiers?.length ? (
-                        /**
-                         * 整模型装不下，但开了分层：给一个能点的出口，而不是只留一句
-                         * 「换更小的模型」。用最小一档 —— 档越大，KV cache 越会把显存
-                         * 挤满，分到 CPU 的层就越多、越慢。
-                         */
-                        <>
-                          <button
-                            type="button"
-                            className="btn"
-                            disabled={!!llamaBusy}
-                            onClick={() => void runLlama('start', fitReport.tiers[0].ctx, true)}
-                            title={tr(
-                              "整模型装不下：按 {0} 启动并交给 llama.cpp 逐层分配，一部分层会留在 CPU，能跑但明显变慢",
-                              { "0": kctx(fitReport.tiers[0].ctx) }
-                            )}
-                          >
-                            {tr("按 {0} 分层启动（会变慢）", { "0": kctx(fitReport.tiers[0].ctx) })}
-                          </button>
-                          <span className="fit-dim">
-                            {tr("或换更小的模型 / 更低的量化，速度差好几倍。")}
-                          </span>
-                        </>
-                      ) : (
+                    {/**
+                      * 这里原来还有「用建议档位（X K）」按钮和「静态推算，实际以加载一次为准」：
+                      * 上面那排档位按钮已经把「建议」标出来了（suggested 高亮），
+                      * 再给一个按钮做同一件事只是第二个入口；那句免责声明留着也没人看。
+                      * 只有「一档都装不下」还值得说一句 —— 这时用户需要一个出口，不是一段解释。
+                      */}
+                    {!fitCtx && !(canLayer && fitReport.tiers?.length) && (
+                      <div className="fit-foot">
                         <span className="fit-dim">
                           {tr("一档上下文都装不下，建议换更小的模型或更低的量化。")}
                         </span>
-                      )}
-                      <span className="fit-dim">
-                        {tr("静态推算，实际以加载一次为准")}
-                      </span>
-                    </div>
+                      </div>
+                    )}
                   </>
                 )}
               </div>
@@ -1376,11 +1658,11 @@ export const LocalModels = forwardRef<LocalModelsHandle, Props>(function LocalMo
             {picked && !fitReport && !fitBusy && (
               <div className="fit-box">
                 <div className="fit-tier-head">
-                  <b>{tr("启动上下文")}</b>
-                  <span className="fit-dim">{tr("体检没出来，仍可直接选一档启动")}</span>
+                  <b>{tr("上下文档位")}</b>
+                  <span className="fit-dim">{tr("体检没出来，仍可直接选一档写进配置")}</span>
                   {activeCtx ? (
                     <span className="fit-tier-current">
-                      {tr("当前 {0}", { "0": kctx(activeCtx) })}
+                      {tr("运行中 {0}", { "0": kctx(activeCtx) })}
                     </span>
                   ) : null}
                 </div>
@@ -1389,8 +1671,16 @@ export const LocalModels = forwardRef<LocalModelsHandle, Props>(function LocalMo
             )}
           </div>
         )}
-        <p className="guide-note">
-          {tr("端口留空自动探测；两个实例绑不同显卡即可同时跑。.gguf 放进")}<code>models/</code> {tr("或")}<code>llama.cpp/</code> {tr("即可识别。")}</p>
+        {/**
+          * 底部这行只留说明。
+          *
+          * 「保存到列表」已经挪到上面按钮行的末位（原「停止服务」的位置）——
+          * 它是这一页唯一的出口，和「一键安装 / 自动配置」排在一起才不会看着像附注。
+          */}
+        <div className="guide-note-row">
+          <p className="guide-note">
+            {tr("端口留空自动探测；两个实例绑不同显卡即可同时跑。.gguf 放进")}<code>models/</code> {tr("或")}<code>llama.cpp/</code> {tr("即可识别。")}</p>
+        </div>
         {running.length > 1 && (
           <p className="guide-note">
             {tr("当前有 {n} 个实例在跑：", { n: running.length })}
@@ -1403,7 +1693,7 @@ export const LocalModels = forwardRef<LocalModelsHandle, Props>(function LocalMo
         kind="ollama"
         step={tr("方式 B")}
         title="Ollama"
-        desc={tr("没装就先「一键安装 / 下载」，再点「一键启动」。")}
+        desc={tr("没装就先「一键安装 / 下载」，再点「保存到列表」。")}
         port={11434}
         canPull
         currentModel={currentModels?.ollama}
@@ -1415,7 +1705,7 @@ export const LocalModels = forwardRef<LocalModelsHandle, Props>(function LocalMo
         kind="lmstudio"
         step={tr("方式 C")}
         title="LM Studio"
-        desc={tr("自带 Local Server：装好后点「一键启动」即可。")}
+        desc={tr("自带 Local Server：装好后点「保存到列表」即可。")}
         port={1234}
         currentModel={currentModels?.lmstudio}
         onSelectModel={(m) => onSelectModel?.(m, 'lmstudio')}

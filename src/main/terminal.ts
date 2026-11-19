@@ -18,6 +18,7 @@ import { randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
 import type { TerminalInfo, TerminalRead, TerminalShell } from '../shared/types'
 import { safeEnv } from './tools/env'
+import { defaultShellKind, interactiveShell, killTree } from './platform'
 
 export type { TerminalInfo, TerminalRead, TerminalShell }
 
@@ -38,23 +39,8 @@ const MAX_BUFFER = 200_000
 const MAX_SESSIONS = 3
 
 function pickShell(shell?: string): { bin: string; args: string[]; kind: TerminalShell } {
-  const kind: TerminalShell = shell === 'powershell' || shell === 'bash' ? shell : 'cmd'
-  if (kind === 'powershell') {
-    return {
-      bin: 'powershell.exe',
-      // 输入/输出都切到 UTF-8，再留在交互模式
-      args: [
-        '-NoLogo', '-NoProfile', '-NoExit', '-Command',
-        '[Console]::InputEncoding=[System.Text.Encoding]::UTF8; [Console]::OutputEncoding=[System.Text.Encoding]::UTF8'
-      ],
-      kind
-    }
-  }
-  if (kind === 'bash') {
-    return { bin: 'bash.exe', args: ['-i'], kind }
-  }
-  // 中文 Windows 的 cmd 默认按 GBK 输出，/k chcp 65001 先切码页再进交互
-  return { bin: process.env.ComSpec || 'cmd.exe', args: ['/k', 'chcp', '65001'], kind }
+  // 平台差异（cmd / PowerShell / $SHELL）统一在 platform.ts 里处理
+  return interactiveShell(shell)
 }
 
 function append(s: Session, chunk: string): void {
@@ -72,7 +58,11 @@ export function openTerminal(workspace: string, shell?: string): TerminalInfo {
   }
 
   for (const s of sessions.values()) {
-    if (s.status === 'running' && s.cwd === workspace && s.shell === (shell as TerminalShell || 'cmd')) {
+    if (
+      s.status === 'running' &&
+      s.cwd === workspace &&
+      s.shell === ((shell as TerminalShell) || defaultShellKind())
+    ) {
       return info(s)
     }
   }
@@ -221,15 +211,7 @@ export function closeTerminal(id: string): TerminalInfo | null {
   const s = sessions.get(id)
   if (!s) return null
   if (s.status === 'running') {
-    try {
-      if (process.platform === 'win32') {
-        spawn('taskkill', ['/pid', String(s.proc.pid), '/t', '/f'], { windowsHide: true })
-      } else {
-        s.proc.kill()
-      }
-    } catch {
-      s.proc.kill()
-    }
+    killTree(s.proc.pid)
   }
   const out = info(s)
   sessions.delete(id)

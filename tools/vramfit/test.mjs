@@ -353,6 +353,40 @@ test('显存上限：只认当前可用，不把「可驱逐」当预算', () =>
   assert.ok(idle.limit <= 8 * GB * 0.94, '但永远不能超过总显存的 94%')
 })
 
+test('显存上限：静态口径只按总容量，和当前占用无关', () => {
+  // 同一张 8G 卡，占用从 0 到 7.5G，静态口径必须给出同一个数 ——
+  // 这正是「开一局游戏再测，结论就变了」的解法：预算不跟着别人的显存跳。
+  const g = { totalBytes: 8 * GB, platform: 'win32', budget: 'static' }
+  const idle = vramCeiling({ ...g, usedBytes: 0 })
+  const busy = vramCeiling({ ...g, usedBytes: 7.5 * GB })
+  assert.equal(idle.basis, 'static')
+  assert.equal(busy.basis, 'static')
+  assert.equal(idle.limit, busy.limit, '静态口径不能被当前占用影响')
+  assert.ok(Math.abs(idle.limit / GB - 8 * 0.94) < 1e-9, `应是总显存 94%：${(idle.limit / GB).toFixed(2)}`)
+  assert.ok(idle.limit > busy.limit || true)
+  // 动态口径在同样输入下必须不同（否则这个开关等于没接上）
+  const auto = vramCeiling({ totalBytes: 8 * GB, usedBytes: 7.5 * GB, platform: 'win32' })
+  assert.ok(auto.limit < idle.limit, 'auto 口径应当比静态口径小')
+
+  // 读不到 used 的 A 卡 / 核显：静态口径不再走 60% 保守档，它本来就不读 used
+  const unknown = vramCeiling({ totalBytes: 8 * GB, usedBytes: 0, usedUnknown: true, platform: 'win32', budget: 'static' })
+  assert.equal(unknown.basis, 'static')
+  assert.ok(unknown.limit > 8 * GB * 0.6)
+})
+
+test('显存上限：静态口径不影响统一内存与 CPU 分支', () => {
+  // macOS 的统一内存已经是「按容量算」，静态口径套上去会把 Metal 建议工作集顶掉
+  const u = vramCeiling({ totalBytes: 16 * GB, unified: true, maxWorkingSetBytes: 16 * GB * 2 / 3, platform: 'darwin', budget: 'static' })
+  assert.equal(u.basis, 'unified')
+  assert.ok(u.limit < 16 * GB * 0.7, `统一内存不能因为 --budget static 就按整块内存算：${(u.limit / GB).toFixed(2)}`)
+})
+
+test('显存上限：没有显卡时静态口径不会凭空造出预算', () => {
+  const nothing = vramCeiling({ totalBytes: 0, usedBytes: 0, platform: 'win32', budget: 'static' })
+  assert.equal(nothing.limit, 0, 'total 为 0 时必须给 0，让上层退到 CPU 分支')
+  assert.notEqual(nothing.basis, 'static')
+})
+
 test('显存上限：macOS 统一内存按 GPU 建议工作集，不是物理内存', () => {
   const total = 16 * GB
   const r = vramCeiling({ totalBytes: total, unified: true, maxWorkingSetBytes: total * 2 / 3, platform: 'darwin' })

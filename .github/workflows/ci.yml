@@ -1,11 +1,14 @@
 name: CI
 
 # 为什么要有这个文件：
-# 仓库里有 462 项单测和一批 smoke 脚本，但没有任何机制保证它们被跑。
+# 仓库里有 460+ 项单测和一批 smoke 脚本，但没有任何机制保证它们被跑。
 # 改动全靠手工 npm test，一次忘记就等于没有保护。这里把「类型 + lint + 单测」
 # 固化成每次 push / PR 必过的一道门。
 #
-# 注意：smoke 脚本需要真实 Electron 窗口，跑不了无头 CI，故意不放在这里。
+# 平台策略：
+#  - Windows：全量门（类型 + lint + 单测）——测试里的路径断言按 win32 写，最贴近真实环境。
+#  - macOS / Linux：跨平台门（类型 + lint）——保证新增的平台分支能被编译和被 lint 看到。
+#    smoke 脚本需要真实 Electron 窗口，跑不了无头 CI，故意不放在这里。
 
 on:
   push:
@@ -18,9 +21,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  check:
-    # 项目只支持 Windows（代码里有 taskkill / DPAPI / ProgramFiles 等专有调用），
-    # 测试里的路径断言也按 win32 写，所以直接跑 windows 更贴近真实环境。
+  check-windows:
     runs-on: windows-latest
     timeout-minutes: 20
 
@@ -36,7 +37,6 @@ jobs:
         # 不要设 ELECTRON_SKIP_BINARY_DOWNLOAD=1 来省时间：单测会 require
         # dist/main/store.js 等模块，它们顶层 require('electron')，而 electron 包在
         # 二进制缺失时是直接抛 "Electron failed to install correctly"，不是返回路径字符串。
-        # 跳过下载的结果就是「类型检查和 lint 都过、单测必挂」（v0.1.2 起每次 push 都这么红的）。
         run: npm ci
 
       - name: 类型检查（主进程 + 渲染层）
@@ -47,3 +47,28 @@ jobs:
 
       - name: 单测
         run: npm test
+
+  check-posix:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: 安装依赖
+        run: npm ci
+
+      - name: 类型检查
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint

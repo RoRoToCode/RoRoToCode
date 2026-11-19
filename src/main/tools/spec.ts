@@ -12,25 +12,41 @@ export interface ToolSpec {
 export const toolSpecs: ToolSpec[] = [
   {
     name: 'read_file',
-    description: '读取工作区内某个文本文件的内容。修改文件前必须先读它。',
+    description:
+      '读取工作区内某个文件的内容。修改文件前必须先读它。' +
+      '文本文件返回带行号的内容；图片文件（png/jpg/webp 等）会把画面直接传给你看（不是路径），' +
+      '用于查看截图、图表、UI 效果等视觉内容。' +
+      '同一个文件内容没变时，重复读只会得到一句「未变化」的提示（省上下文），确实要再看全文就传 force:true。',
     parameters: {
       type: 'object',
       properties: {
         path: { type: 'string', description: '相对工作区的路径' },
         offset: { type: 'number', description: '起始行号（从 1 开始），可选' },
-        limit: { type: 'number', description: '读取行数，可选' }
+        limit: { type: 'number', description: '读取行数，可选' },
+        force: {
+          type: 'boolean',
+          description: '即使该文件自上次读取后没有变化，也返回完整内容'
+        }
       },
       required: ['path']
     }
   },
   {
     name: 'write_file',
-    description: '新建或整体覆盖一个文件。只在创建新文件或需要完全重写时使用。',
+    description:
+      '新建或整体覆盖一个文件。只在创建新文件或需要完全重写时使用。' +
+      '单次调用的 content 有硬上限（16000 字符），超了会被直接拒绝：一次性吐大文件必然被输出上限截断在半句，' +
+      '然后只会反复重写。正确做法是分段：先 write_file 写骨架（结构、函数签名、结尾留一个标记注释），' +
+      '再用 write_file({append:true}) 或 edit_file 一段一段往后接。',
     parameters: {
       type: 'object',
       properties: {
         path: { type: 'string', description: '相对工作区的路径' },
-        content: { type: 'string', description: '完整文件内容' }
+        content: { type: 'string', description: '要写入的内容（append 为 true 时是追加的片段）' },
+        append: {
+          type: 'boolean',
+          description: '为 true 时把 content 追加到文件末尾，而不是覆盖整个文件。分段写大文件用它是成本最低的方式'
+        }
       },
       required: ['path', 'content']
     }
@@ -114,17 +130,23 @@ export const toolSpecs: ToolSpec[] = [
   {
     name: 'run_shell',
     description:
-      '在工作区执行命令。Windows 默认用 cmd.exe；需要 unix 命令时把 shell 设为 bash（需已安装 Git Bash）。' +
-      '构建、安装依赖、跑测试这类可能超过 2 分钟的命令，把 background 设为 true 先挂到后台，再用 shell_bg 看日志。',
+      '在工作区执行命令。Windows 默认用 cmd.exe；需要 unix 命令（tail/head/grep/sed/ls 等）时把 shell 设为 bash（需已安装 Git Bash）。' +
+      '构建、安装依赖、跑测试这类可能超过 2 分钟的命令，把 background 设为 true 先挂到后台，再用 shell_bg 看日志。' +
+      'GUI / 长驻程序（tkinter、pygame、flask、dev server、服务进程）不会自己退出，一律用 background:true 启动，' +
+      '隔几秒用 shell_bg 看日志确认没 Traceback、进程还在，验完 shell_bg kill 回收 —— 前台等它只会被超时杀掉。',
     parameters: {
       type: 'object',
       properties: {
         command: { type: 'string', description: '要执行的命令' },
-        shell: { type: 'string', enum: ['cmd', 'powershell', 'bash'], description: '默认 cmd' },
+        shell: {
+          type: 'string',
+          enum: ['cmd', 'powershell', 'bash'],
+          description: '默认 cmd；跑 unix 命令要显式设 bash'
+        },
         timeout_ms: { type: 'number', description: '超时毫秒数，默认 120000' },
         background: {
           type: 'boolean',
-          description: '后台运行：立刻返回任务 id 和日志文件，用 shell_bg 查看进度'
+          description: '后台运行：立刻返回任务 id 和日志文件，用 shell_bg 查看进度。GUI / 长驻程序必须用它'
         }
       },
       required: ['command']
@@ -133,7 +155,8 @@ export const toolSpecs: ToolSpec[] = [
   {
     name: 'shell_bg',
     description:
-      '查看或管理由 run_shell(background=true) 启动的后台命令：list 列出全部，log 读某个任务的日志，kill 结束它。',
+      '查看或管理由 run_shell(background=true) 启动的后台命令：list 列出全部，log 读某个任务的日志，kill 结束它。' +
+      '验证 GUI / 长驻程序就是「background 启动 → 等几秒 → log 看有没有 Traceback → 还活着就算通过 → kill 回收」。',
     parameters: {
       type: 'object',
       properties: {
@@ -173,7 +196,11 @@ export const toolSpecs: ToolSpec[] = [
   {
     name: 'update_todos',
     description:
-      '更新当前任务的执行计划（整表覆盖）。多步骤任务开始时先列出计划，之后每完成一步就再调用一次更新状态，让用户看得见进度。',
+      '更新当前任务的执行计划（整表覆盖）。多步骤任务开始时先列出计划，之后每完成一步就再调用一次更新状态，让用户看得见进度。' +
+      '计划要按「能跑起来的状态」切：每一项做完时，产物都得能打开、能看到东西。' +
+      '反例：先写完所有函数再接事件、最后调样式 —— 中间几步页面全是死的，一次都验不了。' +
+      '按顺序推进：前一项还没 completed 就把后一项标完成，会被拒绝并在结果里说明；' +
+      '刚写的页面在浏览器里打开报错时，也不能把这一步标成完成。',
     parameters: {
       type: 'object',
       properties: {
@@ -253,7 +280,7 @@ export const toolSpecs: ToolSpec[] = [
   {
     name: 'task',
     description:
-      '把一个子任务派给独立的子 agent 去做。子 agent 有自己的上下文和循环，会自己读文件、改代码、跑命令，最后只把结论回传给你——中间几十次读文件的细节不会占用你的上下文。适合：① 要翻阅大量文件才能回答的问题（「这个仓库的鉴权怎么走的」）；② 互不相关的多个模块各改一处，可以一次派多个 task 并行；③ 需要大量搜索/探查的活。简单的一两步操作不要用，自己直接做更快。',
+      '把一个子任务派给独立的子 agent 去做。子 agent 有自己的上下文和循环，会自己读文件、改代码、跑命令，最后只把结论回传给你——中间几十次读文件的细节不会占用你的上下文。适合：① 要翻阅大量文件才能回答的问题（「这个仓库的鉴权怎么走的」）；② 互不相关的多个模块各改一处，可以一次派多个 task 并行；③ 需要大量搜索/探查的活；④ **只读的检查类活（审查刚改的代码、找 bug、核对需求和实现对不对得上、检查有没有漏掉的调用点）**——这类活更适合一次派两三个并行，每个盯一个角度。**纯阅读、不改代码的活一律用 mode=explore**：只读工具表更短更省 token，小模型也能跑，而且保证不会误改文件。简单的一两步操作不要用，自己直接做更快。',
     parameters: {
       type: 'object',
       properties: {
@@ -262,6 +289,12 @@ export const toolSpecs: ToolSpec[] = [
           type: 'string',
           description:
             '给子 agent 的完整任务说明。它看不到当前对话，所以要把背景、要做什么、涉及哪些路径、期望交付什么都写清楚。并行派多个子任务时，不要让它们改同一批文件。'
+        },
+        mode: {
+          type: 'string',
+          enum: ['explore'],
+          description:
+            '子 agent 的工作模式。填 explore = 只读探查：子 agent 只能读文件、搜索、查网页、跳定义/查引用，不能改文件、不能跑命令，工具表更短所以更省 token，适合「梳理某个模块怎么走的」「找出所有调用某函数的地方」「审查这段改动有没有问题」这类纯阅读的活。多个 explore 子任务互不写盘，可以放心在同一轮一起派。不填 = 完整模式，子 agent 能读能写能跑命令。'
         }
       },
       required: ['description', 'prompt']
@@ -344,6 +377,21 @@ export const toolSpecs: ToolSpec[] = [
         },
         dry_run: { type: 'boolean', description: '只校验并返回将要发生的改动清单，不写盘。默认 false' }
       }
+    }
+  },
+  {
+    name: 'rollback',
+    description:
+      '把某个文件恢复到之前某一轮改动前的状态。工作区会自动给每次写文件前的旧内容留快照（非 git 仓库也能用）。' +
+      '当你把文件改坏、需要回到上一版时用它，而不是凭记忆重写。' +
+      'action=list 列出所有可回滚的快照（新到旧，含序号、文件、时间）；action=restore 按序号把那个文件拷回。',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['list', 'restore'], description: 'list=列出快照；restore=按 seq 回滚' },
+        seq: { type: 'number', description: 'restore 时的快照序号（来自 list）' }
+      },
+      required: ['action']
     }
   },
   {

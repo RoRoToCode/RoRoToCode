@@ -67,7 +67,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
 // 版本号写死在这里，由 test.mjs 对着 package.json 校验 —— 单文件 bin 不去读包元数据，
 // 少一次文件系统访问，也避免 npx 缓存目录里包结构变了就崩。
-const VERSION = '1.0.2'
+const VERSION = '1.0.4'
 
 // ───────────────────────────── GGUF 解析 ─────────────────────────────
 
@@ -265,6 +265,7 @@ function render(meta, hw, result, opts = {}) {
       : t('f.basis.wddm', { p: Math.round((1 - TUNING.wddmTotalFactor) * 100) })),
     'wddm-unknown': () => t('f.basis.wddmUnknown', { p: Math.round(TUNING.wddmUnknownBudgetFactor * 100) }),
     free: () => t('f.basis.free', { p: Math.round((1 - TUNING.freeFactor) * 100) }),
+    static: () => t('f.basis.static', { p: Math.round(TUNING.wddmTotalFactor * 100) }),
     unified: () => t('f.basis.unified', { p: Math.round((1 - TUNING.unifiedReserve) * 100) }),
     ram: () => t('f.basis.ram', { p: Math.round(TUNING.ramFactor * 100) })
   }[result.limitBasis]
@@ -278,8 +279,14 @@ function render(meta, hw, result, opts = {}) {
   } else if (meta.slidingWindow) {
     L.push(note(t('f.slidingOnly', { w: fmtCtx(meta.slidingWindow) })))
   }
+  /**
+   * 别的程序占着显存时说一句 —— 但静态口径下这句话不能再说成「所以预算变小了」：
+   * 结论明明是按总容量算的，再配一句「被占用了」会让人以为上面的上限已经扣过。
+   * 静态口径下它的含义变成「你并没有独占这张卡，真跑起来会掉速甚至失败」。
+   */
   if (gpu && !gpu.unified && !gpu.shared && (gpu.usedBytes ?? 0) > 1.5 * GB) {
-    L.push(`    ${' '.repeat(LW)}${paint(t('f.usedWarn', { n: fmtGB(gpu.usedBytes) }), 'yellow')}`)
+    const key = result.limitBasis === 'static' ? 'f.usedWarnStatic' : 'f.usedWarn'
+    L.push(`    ${' '.repeat(LW)}${paint(t(key, { n: fmtGB(gpu.usedBytes) }), 'yellow')}`)
   }
 
   if (!result.estimated) {
@@ -435,6 +442,7 @@ function limitBasisText(basis) {
   if (basis === 'wddm') return t('lb.wddm', { f: TUNING.wddmFreeFactor, t: TUNING.wddmTotalFactor })
   if (basis === 'wddm-unknown') return t('lb.wddmUnknown', { f: TUNING.wddmUnknownBudgetFactor })
   if (basis === 'free') return t('lb.free', { f: TUNING.freeFactor })
+  if (basis === 'static') return t('lb.static', { t: TUNING.wddmTotalFactor })
   if (basis === 'unified') return t('lb.unified', { r: TUNING.unifiedReserve })
   if (basis === 'ram') return t('lb.ram', { r: TUNING.ramFactor })
   return t('lb.other')
@@ -465,6 +473,7 @@ ${opt('--ascii', 'u.optAscii')}
 ${opt('--kv <type>', 'u.optKv')}
 ${opt('--vram 8', 'u.optVram')}
 ${opt('--gpu 1', 'u.optGpu')}
+${opt('--budget static', 'u.optBudget')}
 ${opt('--mmproj <file>', 'u.optMmproj')}
 ${opt('--mirror <url>', 'u.optMirror')}
 ${opt('--lang zh|en', 'u.optLang')}
@@ -721,7 +730,7 @@ async function expandTargets(raw, opts = {}) {
 }
 
 /** 整仓库对比：远程读每个量化的元数据，出一张「该下哪个」的表 */
-async function runRepo(repo, { jsonOut = false, kvType = 'f16', hw = makeHardware() } = {}) {
+async function runRepo(repo, { jsonOut = false, kvType = 'f16', hw = makeHardware(), budget = 'auto' } = {}) {
   const { urls, sharded } = await listRepoGgufs(repo)
   if (!jsonOut) console.error(paint(`  ${t('x.repoCount', { repo, n: urls.length })}`, 'dim'))
 
@@ -735,7 +744,7 @@ async function runRepo(repo, { jsonOut = false, kvType = 'f16', hw = makeHardwar
       const meta = await readGguf(url)
       // 分片模型按「第 1 片 × 片数」估算整体权重，否则一个 20 GB 的模型会被当成 4 GB
       const totalWeights = totalWeightsBytes(meta)
-      const result = assess(meta, hw, { kvType, weightsBytes: totalWeights })
+      const result = assess(meta, hw, { kvType, weightsBytes: totalWeights, budget })
       const tpl = analyzeTemplate(meta.chatTemplate)
       const q = quantTier(quant)
       return {
@@ -811,7 +820,7 @@ async function visionExtra(mmproj, { jsonOut = false } = {}) {
 }
 
 /** 逐个文件出报告；返回每一项（含失败项），便于上层决定退出码 */
-async function runChecks(files, { jsonOut = false, kvType = 'f16', hw = makeHardware(), mmproj = null } = {}) {
+async function runChecks(files, { jsonOut = false, kvType = 'f16', hw = makeHardware(), mmproj = null, budget = 'auto' } = {}) {
   const results = []
   const extra = await visionExtra(mmproj, { jsonOut })
   for (const f of files) {
@@ -836,9 +845,9 @@ async function runChecks(files, { jsonOut = false, kvType = 'f16', hw = makeHard
        * 以前是把额外开销直接并进主报告 —— 结果是视觉模型一律被判「装不下任何档」，
        * 用户以为模型不行，其实只是少了「发图才付的这笔钱」这一层区分。
        */
-      const result = assess(meta, hw, { kvType, weightsBytes })
+      const result = assess(meta, hw, { kvType, weightsBytes, budget })
       const visionFit = extra.bytes > 0
-        ? assess(meta, hw, { kvType, weightsBytes, extraBytes: extra.bytes })
+        ? assess(meta, hw, { kvType, weightsBytes, extraBytes: extra.bytes, budget })
         : null
       results.push({ meta, result, extra, visionFit })
       if (!jsonOut) console.log(render(meta, hw, result, { kvType, extra, visionFit }))
@@ -1072,6 +1081,8 @@ async function interactive(opts = {}) {
   const gpuIndex = opts.gpuIndex ?? 0
   /** 只看文字就够，但带上投影器算出来的才是「发图片时」的真实预算 */
   const mmproj = opts.mmproj ?? null
+  /** 预算口径要一路带到每次检查：交互模式下同一句话可能查好几次，口径不能中间掉回 auto */
+  const budget = opts.budget ?? 'auto'
 
   const mode = inputMode({ isTTY: process.stdin.isTTY, platform: process.platform })
   const cooked = mode.cooked
@@ -1175,7 +1186,7 @@ async function interactive(opts = {}) {
         let name = cleanPasted(repoCmd[1])
         const hf = parseHfInput(name)
         if (hf?.kind === 'repo') name = hf.repo
-        await runRepo(name, { kvType, hw })
+        await runRepo(name, { kvType, hw, budget })
         continue
       }
 
@@ -1188,8 +1199,8 @@ async function interactive(opts = {}) {
         console.log(paint(`  ${t('x.unrec3')}`, 'dim'))
         continue
       }
-      for (const r of repos) await runRepo(r, { kvType, hw })
-      if (files.length) await runChecks(files, { kvType, hw, mmproj })
+      for (const r of repos) await runRepo(r, { kvType, hw, budget })
+      if (files.length) await runChecks(files, { kvType, hw, mmproj, budget })
     } catch (err) {
       console.log(paint(`\n  ✗ ${err.message}`, 'red'))
     }
@@ -1237,7 +1248,7 @@ async function main() {
   if (argv.includes('--about')) { about(); return }
 
   const jsonOut = argv.includes('--json')
-  const { kvType, manualVram, gpuIndex, repo, mirror, mmproj, problems } = parseOptions(argv)
+  const { kvType, manualVram, gpuIndex, repo, mirror, mmproj, budget, problems } = parseOptions(argv)
   if (problems.length) {
     for (const p of problems) console.error(paint(`  ✗ ${p}`, 'red'))
     console.error(paint(`  ${t('x.helpHint')}`, 'dim'))
@@ -1268,7 +1279,7 @@ async function main() {
     if (raw.length) {
       console.error(paint(`  ${t('x.repoIgnore', { n: raw.length })}`, 'yellow'))
     }
-    const rows = await runRepo(repo, { jsonOut, kvType, hw }) ?? []
+    const rows = await runRepo(repo, { jsonOut, kvType, hw, budget }) ?? []
     // 整个仓库一个都读不到 → 网络问题，CI 里应当失败；只是部分变体失败不算
     if (rows.length && rows.every((r) => r?.error)) process.exitCode = 1
     return
@@ -1278,18 +1289,18 @@ async function main() {
   //    从管道喂链接，三种情况都走这里，粘贴链接永远可用。
   if (!raw.length) {
     if (jsonOut) { usage(); process.exitCode = 1; return }
-    await interactive({ kvType, manualVram, gpuIndex, mmproj })
+    await interactive({ kvType, manualVram, gpuIndex, mmproj, budget })
     return
   }
 
   const { files, repos } = await expandTargets(raw, { jsonOut, guessRepo: true })
   for (const r of repos) {
-    const rows = await runRepo(r, { jsonOut, kvType, hw }) ?? []
+    const rows = await runRepo(r, { jsonOut, kvType, hw, budget }) ?? []
     if (rows.length && rows.every((x) => x?.error)) process.exitCode = 1
   }
   if (!files.length) return
 
-  const results = await runChecks(files, { jsonOut, kvType, hw, mmproj })
+  const results = await runChecks(files, { jsonOut, kvType, hw, mmproj, budget })
   if (jsonOut) console.log(JSON.stringify(toJson(results), null, 2))
   // 有文件读不到时退非 0，JSON 模式才好在 CI 里用
   if (results.some((r) => r?.error)) process.exitCode = 1

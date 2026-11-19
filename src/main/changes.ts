@@ -2,9 +2,13 @@ import { app } from 'electron'
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import crypto from 'node:crypto'
+import { execFile } from 'node:child_process'
+import { promisify } from 'node:util'
 import type { ChangeDetail, FileChange, DiffLine } from '../shared/types'
 import { diffLines, diffStats } from './diff'
 import { buildWithHunks, diffHunks } from '../shared/hunks'
+
+const run = promisify(execFile)
 
 /**
  * 每次 write_file / edit_file 都把「改前」和「改后」存下来。
@@ -17,6 +21,8 @@ interface ChangeRecord extends FileChange {
   before: string
   after: string
   revertable: boolean
+  /** 大文件走 git 兜底：before 来自 HEAD（回滚=回到最近一次提交），而非本次改动前的精确原文 */
+  revertedFromGit?: boolean
   reverted?: boolean
   /** 记录这条改动时的工作区根：撤销时据此确认目标没被改到工作区之外 */
   root?: string
@@ -49,6 +55,32 @@ function newId(): string {
   return `${String(Date.now()).padStart(14, '0')}-${crypto.randomBytes(3).toString('hex')}`
 }
 
+/**
+ * 大文件（超过内存快照上限）的 git 兜底：从 HEAD 取这个文件的提交版本内容。
+ *
+ * 应用级快照为防内存失控，对超过 MAX_SNAPSHOT 的文件不再存 before，导致这类改动
+ * 只能「看得到、撤不回」。git 兜底让撤销至少能回到「最近一次提交」的状态：
+ * 只读 git（`git show HEAD:<path>`），不 stash、不 commit，不污染用户的提交历史。
+ *
+ * 拿不到（不是 git 仓库 / 文件从没提交过）就返回 null，退回到「不可撤销」的旧行为。
+ */
+async function gitHeadContent(root: string, absPath: string): Promise<string | null> {
+  try {
+    const rel = path.relative(root, absPath).split(path.sep).join('/')
+    if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) return null
+    const { stdout } = await run('git', ['show', `HEAD:${rel}`], {
+      cwd: root,
+      timeout: 10_000,
+      windowsHide: true,
+      maxBuffer: 8 * 1024 * 1024,
+      env: { ...process.env, ELECTRON_RUN_AS_NODE: undefined }
+    })
+    return stdout
+  } catch {
+    return null
+  }
+}
+
 export async function recordChange(input: {
   sessionId: string
   root: string
@@ -69,6 +101,19 @@ export async function recordChange(input: {
   const { added, removed } = diffStats(lines)
   const tooBig =
     (before?.length ?? 0) > MAX_SNAPSHOT || (after?.length ?? 0) > MAX_SNAPSHOT
+  // 大文件才可能走 git 兜底：应用快照存不下 before 时，试着从 HEAD 取提交版本。
+  // 取到了就能撤销（回滚到最近一次提交），取不到仍退回「不可撤销」。
+  let savedBefore = tooBig ? '' : before ?? ''
+  let revertable = !tooBig
+  let revertedFromGit = false
+  if (tooBig && existed && before !== null) {
+    const gitBefore = await gitHeadContent(root, absPath)
+    if (gitBefore !== null && gitBefore !== before) {
+      savedBefore = gitBefore
+      revertable = true
+      revertedFromGit = true
+    }
+  }
   const change: FileChange = {
     id: newId(),
     sessionId,
@@ -83,9 +128,10 @@ export async function recordChange(input: {
   }
   const rec: ChangeRecord = {
     ...change,
-    before: tooBig ? '' : before ?? '',
+    before: savedBefore,
     after: tooBig ? '' : after ?? '',
-    revertable: !tooBig,
+    revertable,
+    revertedFromGit,
     root
   }
   try {
@@ -115,10 +161,12 @@ export async function listChanges(sessionId: string): Promise<FileChange[]> {
       if (!name.endsWith('.json')) continue
       const rec = await readRecord(sessionId, name.replace(/\.json$/, ''))
       if (!rec || rec.reverted) continue
-      const { before, after, revertable, reverted, ...change } = rec
+      const { before, after, revertable, reverted, root, revertedFromGit, ...change } = rec
       void before
       void after
       void reverted
+      void root
+      void revertedFromGit
       out.push({ ...change, revertable })
     }
     return out.sort((a, b) => b.at - a.at)
@@ -130,7 +178,10 @@ export async function listChanges(sessionId: string): Promise<FileChange[]> {
 export async function changeDetail(sessionId: string, id: string): Promise<ChangeDetail | null> {
   const rec = await readRecord(sessionId, id)
   if (!rec) return null
-  const { before, after, revertable, reverted, ...change } = rec
+  const { before, after, revertable, reverted, root, revertedFromGit, ...change } = rec
+  // 剥离出来只为不泄漏到变更详情；显式消费掉，避免「解构但未使用」告警
+  void root
+  void revertedFromGit
   const lines: DiffLine[] = revertable
     ? diffLines(before, after)
     : [
@@ -166,7 +217,12 @@ export async function revertChange(
       await fs.writeFile(rec.absPath, rec.before, 'utf8')
     }
     await fs.rm(fileOf(sessionId, id), { force: true })
-    return { ok: true, message: `已还原 ${rec.path}` }
+    return {
+      ok: true,
+      message: rec.revertedFromGit
+        ? `已还原 ${rec.path}（大文件走 git 兜底，回滚到最近一次提交的版本）`
+        : `已还原 ${rec.path}`
+    }
   } catch (err) {
     return { ok: false, message: `还原失败：${(err as Error).message}` }
   }

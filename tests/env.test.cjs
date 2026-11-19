@@ -18,3 +18,11 @@ test('子进程环境只带白名单，密钥类变量不下传', () => {
   assert.strictEqual(env.GIT_PAGER, 'cat')
   assert.ok(filteredSecretCount() >= 3)
 })
+
+test('Python 子进程强制 UTF-8 输出（cmd 下中文不再变成 ??）', () => {
+  const { safeEnv } = require('../dist/main/tools/env.js')
+  const env = safeEnv()
+  assert.strictEqual(env.PYTHONIOENCODING, 'utf-8')
+  // 这条只是编码设置，不该顺手把密钥类变量也放进来
+  assert.strictEqual(env.OPENAI_API_KEY, undefined)
+})

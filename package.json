@@ -2,7 +2,7 @@
   "name": "roroto-code",
   "version": "0.1.3",
   "private": true,
-  "description": "A minimal Windows coding agent with local and online model support",
+  "description": "A cross-platform coding agent with local (llama.cpp/GGUF) and online model support",
   "license": "MIT",
   "author": "RoRoToCode",
   "main": "dist/main/main.js",
@@ -14,7 +14,7 @@
     "build:renderer": "vite build",
     "icon": "node scripts/make-icon.mjs",
     "build": "npm run icon && npm run build:main && npm run build:renderer",
-    "test": "npm run build:main && node --test tests/approval.test.cjs tests/risk.test.cjs tests/env.test.cjs tests/redact.test.cjs tests/pricing.test.cjs tests/turns.test.cjs tests/instructions.test.cjs tests/permissions.test.cjs tests/permissions-merge.test.cjs tests/applypatch.test.cjs tests/checkpoint.test.cjs tests/eventbuf.test.cjs tests/cron.test.cjs tests/handoff.test.cjs tests/runqueue.test.cjs tests/roster.test.cjs tests/board.test.cjs tests/quota.test.cjs tests/abort.test.cjs tests/distill.test.cjs tests/toolargs.test.cjs tests/diagnostics.test.cjs tests/streamerror.test.cjs tests/degenerate.test.cjs tests/lspnav.test.cjs tests/newtools.test.cjs tests/p1.test.cjs tests/gpuplan.test.cjs tests/gpuprofile.test.cjs tests/resume.test.cjs tests/p2.test.cjs tests/promptcache.test.cjs tests/mdblocks.test.cjs tests/resultfiles.test.cjs tests/artifacts.test.cjs tests/skilldeps.test.cjs tests/sessionprune.test.cjs tests/msgwindow.test.cjs tests/toolguard.test.cjs tests/sessionhit.test.cjs tests/diagnosegap.test.cjs tests/fixes.test.cjs tests/ctxtune.test.cjs tests/ctxprobe.test.cjs tests/offload.test.cjs tests/idleunload.test.cjs tests/localmodels.test.cjs tests/ollamadir.test.cjs tests/datadir.test.cjs",
+    "test": "npm run build:main && node --test tests/approval.test.cjs tests/risk.test.cjs tests/env.test.cjs tests/shellquote.test.cjs tests/grepsingle.test.cjs tests/streamprogress.test.cjs tests/redact.test.cjs tests/pricing.test.cjs tests/turns.test.cjs tests/ctxshrink.test.cjs tests/instructions.test.cjs tests/permissions.test.cjs tests/permissions-merge.test.cjs tests/applypatch.test.cjs tests/editmatch.test.cjs tests/toolfiles.test.cjs tests/parallelread.test.cjs tests/checkpoint.test.cjs tests/eventbuf.test.cjs tests/cron.test.cjs tests/handoff.test.cjs tests/runqueue.test.cjs tests/roster.test.cjs tests/board.test.cjs tests/quota.test.cjs tests/abort.test.cjs tests/distill.test.cjs tests/toolargs.test.cjs tests/diagnostics.test.cjs tests/streamerror.test.cjs tests/degenerate.test.cjs tests/lspnav.test.cjs tests/newtools.test.cjs tests/p1.test.cjs tests/gpuplan.test.cjs tests/gpuprofile.test.cjs tests/resume.test.cjs tests/p2.test.cjs tests/promptcache.test.cjs tests/mdblocks.test.cjs tests/resultfiles.test.cjs tests/artifacts.test.cjs tests/skilldeps.test.cjs tests/sessionprune.test.cjs tests/msgwindow.test.cjs tests/modelerror.test.cjs tests/toolguard.test.cjs tests/scratchguard.test.cjs tests/truncwrite.test.cjs tests/sessionhit.test.cjs tests/diagnosegap.test.cjs tests/fixes.test.cjs tests/ctxtune.test.cjs tests/ctxprobe.test.cjs tests/offload.test.cjs tests/idleunload.test.cjs tests/agentpool.test.cjs tests/localmodels.test.cjs tests/ollamadir.test.cjs tests/datadir.test.cjs tests/explore.test.cjs tests/lanes.test.cjs tests/startqueue.test.cjs tests/spill.test.cjs tests/configseed.test.cjs tests/writeguard.test.cjs tests/stepgate.test.cjs tests/shellgate.test.cjs tests/webcheck.test.cjs tests/snapshot.test.cjs tests/smoke.test.cjs tests/hygiene.test.cjs tests/quiet.test.cjs tests/jssyntax.test.cjs tests/vision.test.cjs tests/autoresume.test.cjs",
     "typecheck": "npm run typecheck:main && npm run typecheck:renderer",
     "start": "npm run build && electron .",
     "smoke": "npm run build:main && electron dist/main/smoke.js",
@@ -36,12 +36,17 @@
     "dist:raw": "npm run build && electron-builder --win portable",
     "dist:installer": "npm run build && electron-builder --win nsis",
     "dist:dir": "npm run build && electron-builder --win --dir",
+    "dist:mac": "npm run build && electron-builder --mac",
+    "dist:linux": "npm run build && electron-builder --linux",
+    "dist:all": "npm run build && electron-builder --win --mac --linux",
     "typecheck:main": "tsc -p tsconfig.main.json --noEmit",
     "typecheck:renderer": "tsc -p tsconfig.json --noEmit",
     "smoke:toolargs": "npm run build:main && electron dist/main/smoke-toolargs.js",
     "smoke:diagnostics": "npm run build:main && electron dist/main/smoke-diagnostics.js",
     "smoke:diaggap": "npm run build:main && electron dist/main/smoke-diaggap.js",
     "smoke:repeat": "npm run build:main && electron dist/main/smoke-repeat.js",
+    "smoke:delegate": "npm run build:main && node tools/smoke-delegate.cjs",
+    "smoke:lanes": "npm run build:main && node tools/smoke-lanes.cjs",
     "smoke:slots": "npm run build:main && electron dist/main/smoke-slots.js",
     "smoke:realmodel": "npm run build:main && electron dist/main/smoke-realmodel.js",
     "smoke:lspnav": "npm run build:main && electron dist/main/smoke-lspnav.js",
@@ -119,6 +124,34 @@
       "artifactName": "RoRoToCode-${version}-setup.exe",
       "oneClick": false,
       "allowToChangeInstallationDirectory": true
+    },
+    "mac": {
+      "target": [
+        "dmg",
+        "zip"
+      ],
+      "icon": "build/icon.png",
+      "category": "public.app-category.developer-tools",
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false,
+      "darkModeSupport": true,
+      "artifactName": "RoRoToCode-${version}-${arch}.${ext}"
+    },
+    "dmg": {
+      "artifactName": "RoRoToCode-${version}-${arch}.dmg"
+    },
+    "linux": {
+      "target": [
+        "AppImage",
+        "deb"
+      ],
+      "icon": "build/icon.png",
+      "category": "Development",
+      "synopsis": "Local-first coding agent with llama.cpp / GGUF support",
+      "artifactName": "RoRoToCode-${version}-${arch}.${ext}"
+    },
+    "appImage": {
+      "artifactName": "RoRoToCode-${version}-${arch}.AppImage"
     },
     "compression": "maximum"
   }

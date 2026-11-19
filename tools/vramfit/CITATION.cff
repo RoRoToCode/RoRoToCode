@@ -16,7 +16,7 @@ authors:
 repository-code: "https://github.com/RoRoToCode/vramfit"
 url: "https://www.roroto.com/tools/vramfit/"
 license: MIT
-version: "1.0.2"
+version: "1.0.4"
 date-released: "2026-11-10"
 keywords:
   - gguf

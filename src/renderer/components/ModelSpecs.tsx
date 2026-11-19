@@ -644,7 +644,7 @@ export function ModelSpecs({ onClose }: Props) {
               </div>
 
               <p className="guide-note">
-                {tr("下载完成后回到「本地模型」页点顶部")}<b>{tr("「刷新」")}</b>{tr("，再「一键启动」即可使用。")}</p>
+                {tr("下载完成后回到「本地模型」页点顶部")}<b>{tr("「刷新」")}</b>{tr("，点「保存到列表」，再到「④ 模型列表」点「启动」即可使用。")}</p>
             </>
           )}
 

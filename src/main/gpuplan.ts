@@ -1,5 +1,13 @@
-import path from 'node:path'
 import { spawnSync } from 'node:child_process'
+import {
+  archTag,
+  isMac,
+  isWin,
+  knownCudaVersions,
+  llamaAssetName,
+  nvidiaSmiPaths,
+  supportsCuda
+} from './platform'
 
 /**
  * 该往本机装哪个 llama.cpp 包 —— 显卡版优先。
@@ -12,25 +20,30 @@ import { spawnSync } from 'node:child_process'
  *
  * 所以这里分三层探，逐层放宽：
  *  1. nvidia-smi（PATH + 常见绝对路径）—— 拿名字、驱动版本、CUDA 版本、算力、显存
- *  2. WMI / CIM 的显卡名（NVIDIA / AMD / Intel 都能认出来）
+ *  2. 系统显卡名（Windows WMI / macOS system_profiler / Linux lspci）
  *  3. 都没有 → 才落到 CPU 包
+ *
+ * 平台差异：
+ *  - macOS 没有 CUDA 也没有 Vulkan，官方只有一种 macos 包（Metal 编进包内），
+ *    所以直接返回 `metal`，不去探 nvidia-smi。
+ *  - Linux 的官方产物叫 `-bin-ubuntu-*`，扩展名是 `.tar.gz`。
  *
  * 另外留一个 `ROROTO_LLAMA_BACKEND=cuda|vulkan|cpu` 环境变量：自动判定
  * 终究是猜，用户想钉死某个后端时要有出口。
  */
 
-export type GpuPreference = 'cuda' | 'vulkan' | 'cpu'
+export type GpuPreference = 'cuda' | 'vulkan' | 'metal' | 'cpu'
 
 /**
  * 虚拟 / 远程 / 基础显示适配器。
  *
  * 这些不是真显卡：Parsec、向日葵、ToDesk 的虚拟显示器、Hyper-V 的「Microsoft Basic
- * Display Adapter」、RDP 的「Remote Display Adapter」都会出现在 WMI 的显卡列表里。
+ * Display Adapter」、RDP 的「Remote Display Adapter」都会出现在系统显卡列表里。
  * 旧代码只把它们当名字看，于是「只有虚拟显卡的机器」被判成有卡 → 装 Vulkan 包 →
- * 启动后 `--list-devices` 空 → 白忙一场。vramfit 里早就有这份过滤，主进程这边漏了。
+ * 启动后 `--list-devices` 空 → 白忙一场。
  */
 export const VIRTUAL_GPU_RE =
-  /idd|indirect display|basic display|basic render|virtual|mirror|parsec|sunlogin|todesk|oray|remote display|remote desktop|hyper-v|vmware|virtualbox|citrix|displaylink/i
+  /idd|indirect display|basic display|basic render|virtual|mirror|parsec|sunlogin|todesk|oray|remote display|remote desktop|hyper-v|vmware|virtualbox|citrix|displaylink|llvmpipe|swiftshader|softpipe/i
 
 export function isVirtualGpu(name: string): boolean {
   return VIRTUAL_GPU_RE.test(name ?? '')
@@ -73,16 +86,6 @@ export interface PackageHints {
  * 判定
  * ------------------------------------------------------------------ */
 
-/** nvidia-smi 可能在哪：PATH、System32、老版驱动自己的 NVSMI 目录 */
-function nvidiaSmiCandidates(): string[] {
-  const sys = process.env.SystemRoot || process.env.windir || 'C:\\Windows'
-  return [
-    'nvidia-smi',
-    path.join(sys, 'System32', 'nvidia-smi.exe'),
-    'C:\\Program Files\\NVIDIA Corporation\\NVSMI\\nvidia-smi.exe'
-  ]
-}
-
 /** 单个 NVIDIA 卡的探测结果 */
 export interface NvidiaGpu {
   name: string
@@ -101,7 +104,7 @@ export interface NvidiaInfo {
 /**
  * 一次问全：名字、驱动、算力、显存，再从表头取 CUDA 版本。
  *
- * 为什么要读 CUDA 版本：官方 Windows CUDA 包是按运行时版本分的（12.4 / 13.x）。
+ * 为什么要读 CUDA 版本：官方 CUDA 包是按运行时版本分的（12.4 / 12.8 / 13.5）。
  * 旧代码把 12.4 写死排第一，于是 RTX 50（sm_120）装上也跑不起来 ——
  * 1204 的运行时里没有 sm_120 的设备代码，只能退回 CPU，用户完全看不出原因。
  *
@@ -112,7 +115,11 @@ let nvidiaCache: NvidiaInfo | null = null
 export function nvidiaGpuInfo(refresh = false): NvidiaInfo {
   if (!refresh && nvidiaCache) return nvidiaCache
   const empty: NvidiaInfo = { gpus: [], cudaVersion: null }
-  for (const bin of nvidiaSmiCandidates()) {
+  if (!supportsCuda()) {
+    nvidiaCache = empty
+    return empty
+  }
+  for (const bin of nvidiaSmiPaths()) {
     for (const fields of ['name,driver_version,compute_cap,memory.total', 'name,driver_version,memory.total']) {
       try {
         const r = spawnSync(bin, [`--query-gpu=${fields}`, '--format=csv,noheader,nounits'], {
@@ -169,15 +176,26 @@ export function cudaCodeOf(ver: string | null | undefined): number | null {
   return Number(m[1]) * 100 + Number(m[2])
 }
 
+/** 所有平台产物名里取 CUDA 版本：`...-bin-win-cuda-12.4-x64.zip` → "12.4" */
+function cudaVersionOf(name: string): string | null {
+  const m = /-bin-(?:win|ubuntu|linux|macos)-cuda-([\d.]+)-/i.exec(name)
+  return m ? m[1] : null
+}
+
 /** 从 llama.cpp 产物名里取 CUDA 版本：`...-bin-win-cuda-12.4-x64.zip` → 1204 */
 export function packageCudaCode(name: string): number | null {
-  const m = /-bin-win-cuda-([\d.]+)-x64\.zip$/i.exec(name)
-  return m ? cudaCodeOf(m[1]) : null
+  return cudaCodeOf(cudaVersionOf(name))
+}
+
+/** cudart 包名里的 CUDA 版本（Windows 不含 tag，Linux 含 tag） */
+function cudartCudaVersion(name: string): string | null {
+  const m = /^cudart-llama-(?:b\d+-)?bin-(?:win|ubuntu|linux)-cuda-([\d.]+)-/i.exec(name)
+  return m ? m[1] : null
 }
 
 /** 跑 nvidia-smi -L，拿到显卡名；拿不到返回空串 */
 export function nvidiaSmiList(): string {
-  for (const bin of nvidiaSmiCandidates()) {
+  for (const bin of nvidiaSmiPaths()) {
     try {
       const r = spawnSync(bin, ['-L'], { windowsHide: true, timeout: 5000, encoding: 'utf8' })
       if (r.status !== 0) continue
@@ -190,9 +208,8 @@ export function nvidiaSmiList(): string {
   return ''
 }
 
-/** 显卡名清单：WMI 优先，老系统退回 wmic。虚拟显卡在这里就滤掉 */
-export function videoControllerNames(): string[] {
-  if (process.platform !== 'win32') return []
+/** Windows：WMI 优先，老系统退回 wmic */
+function windowsVideoControllers(): string[] {
   const queries: Array<[string, string[]]> = [
     [
       'powershell.exe',
@@ -227,6 +244,64 @@ export function videoControllerNames(): string[] {
   return []
 }
 
+/** macOS：system_profiler 的显卡型号 */
+function macGpuNames(): string[] {
+  try {
+    const r = spawnSync('system_profiler', ['SPDisplaysDataType', '-json'], {
+      encoding: 'utf8',
+      timeout: 20000
+    })
+    if (r.status === 0 && r.stdout) {
+      const j = JSON.parse(r.stdout) as {
+        SPDisplaysDataType?: Array<Record<string, string>>
+      }
+      const names = (j.SPDisplaysDataType ?? [])
+        .map((d) => d.sppci_model || d._name || '')
+        .filter(Boolean)
+      if (names.length) return names.filter((n) => !isVirtualGpu(n))
+    }
+  } catch {
+    // 退回文本解析
+  }
+  try {
+    const r = spawnSync('system_profiler', ['SPDisplaysDataType'], {
+      encoding: 'utf8',
+      timeout: 20000
+    })
+    const names: string[] = []
+    for (const line of `${r.stdout ?? ''}`.split(/\r?\n/)) {
+      const m = /Chipset Model:\s*(.+)$/i.exec(line)
+      if (m) names.push(m[1].trim())
+    }
+    return names.filter((n) => !isVirtualGpu(n))
+  } catch {
+    return []
+  }
+}
+
+/** Linux：lspci 的显卡条目（NVIDIA / AMD / Intel 都能认出来） */
+function linuxGpuNames(): string[] {
+  try {
+    const r = spawnSync('lspci', [], { encoding: 'utf8', timeout: 8000 })
+    if (r.status !== 0 || !r.stdout) return []
+    const names: string[] = []
+    for (const line of r.stdout.split(/\r?\n/)) {
+      const m = /(VGA compatible controller|3D controller|Display controller):\s*(.+)$/i.exec(line)
+      if (m) names.push(m[2].replace(/\s*\(rev [^)]*\)\s*$/i, '').trim())
+    }
+    return names.filter((n) => !isVirtualGpu(n))
+  } catch {
+    return []
+  }
+}
+
+/** 显卡名清单（按平台选择探测方式），虚拟显卡在这里就滤掉 */
+export function videoControllerNames(): string[] {
+  if (isWin) return windowsVideoControllers()
+  if (isMac) return macGpuNames()
+  return linuxGpuNames()
+}
+
 /**
  * 按显卡名判后端。
  *
@@ -238,7 +313,7 @@ export function preferFromNames(names: string[]): GpuProbe {
   const nv = real.find((n) => /nvidia|geforce|quadro|tesla|rtx|gtx/i.test(n))
   if (nv) return { preference: 'cuda', reason: `检测到 NVIDIA 显卡：${nv}` }
   // 非 N 卡走 Vulkan：AMD / Intel 核显都是这条路，比 CPU 包快一个数量级
-  const other = real.find((n) => /amd|radeon|intel|arc|iris|uhd|vega/i.test(n))
+  const other = real.find((n) => /amd|radeon|intel|arc|iris|uhd|vega|apple m\d/i.test(n))
   if (other) return { preference: 'vulkan', reason: `检测到显卡：${other}（装 Vulkan 版）` }
   return { preference: 'cpu', reason: '没检测到可用显卡，装 CPU 版' }
 }
@@ -257,6 +332,17 @@ const MIN_CUDA_FOR_CUDA_BUILD = 1108
 
 /** 本机该装哪个后端。结果缓存：一次安装里会问好几遍，别反复 spawn */
 export function detectGpuPreference(opts: DetectOptions = {}): GpuProbe {
+  if (!opts.refresh && cached) return cached
+
+  // macOS：官方只有一种包，Metal 编在包内，没有独立后端可选
+  if (isMac) {
+    cached = {
+      preference: 'metal',
+      reason: 'macOS 使用系统内置 Metal（官方 macos 包已包含，无需单独显卡后端）'
+    }
+    return cached
+  }
+
   const forced =
     opts.force ??
     (() => {
@@ -264,8 +350,6 @@ export function detectGpuPreference(opts: DetectOptions = {}): GpuProbe {
       return env === 'cuda' || env === 'vulkan' || env === 'cpu' ? (env as GpuPreference) : null
     })()
   if (forced) return { preference: forced, reason: `按指定强制使用 ${forced.toUpperCase()} 版` }
-
-  if (!opts.refresh && cached) return cached
 
   /**
    * 先问 nvidia-smi 要结构化信息：名字 + 驱动 + 算力 + CUDA 版本。
@@ -279,7 +363,7 @@ export function detectGpuPreference(opts: DetectOptions = {}): GpuProbe {
     const cudaCode = cudaCodeOf(info.cudaVersion)
     if (cudaCode !== null && cudaCode < MIN_CUDA_FOR_CUDA_BUILD) {
       warnings.push(
-        `NVIDIA 驱动 ${g.driver} 只支持到 CUDA ${info.cudaVersion}，官方 CUDA 12 构建加载不了：` +
+        `NVIDIA 驱动 ${g.driver} 只支持到 CUDA ${info.cudaVersion}，官方 CUDA 构建加载不了：` +
           '本次会装 Vulkan 版（比 CPU 快一个数量级，比 CUDA 略慢）；想用满速请更新显卡驱动'
       )
     }
@@ -326,21 +410,9 @@ export function hintsOf(probe: GpuProbe): PackageHints {
  * 选包
  * ------------------------------------------------------------------ */
 
-/** 只有 `llama-*` 开头的是主程序包（cudart 包名也以 -bin-win-cuda-… 结尾，必须排掉） */
+/** 只有 `llama-*` 开头的是主程序包（cudart 包名也以 -bin-…-cuda-… 结尾，必须排掉） */
 export function isMainPackage(name: string): boolean {
-  return /^llama-[^/]+-bin-win-/i.test(name) && !/^cudart-/i.test(name)
-}
-
-/** 各后端的候选顺序：先精确、再降级，最后才是能跑的兜底 */
-const ORDERS: Record<GpuPreference, RegExp[]> = {
-  cuda: [
-    /-bin-win-cuda-12\.\d+-x64\.zip$/i,
-    /-bin-win-cuda-[^/]+-x64\.zip$/i,
-    /-bin-win-vulkan-x64\.zip$/i,
-    /-bin-win-cpu-x64\.zip$/i
-  ],
-  vulkan: [/-bin-win-vulkan-x64\.zip$/i, /-bin-win-cpu-x64\.zip$/i],
-  cpu: [/-bin-win-cpu-x64\.zip$/i, /-bin-win-vulkan-x64\.zip$/i]
+  return /^llama-[^/]+-bin-(?:win|ubuntu|linux|macos)-/i.test(name) && !/^cudart-/i.test(name)
 }
 
 /**
@@ -348,7 +420,7 @@ const ORDERS: Record<GpuPreference, RegExp[]> = {
  *
  * 三条规则叠在一起：
  * 1. 驱动装不了的版本排到最后（`cudaCode > 驱动支持` 就扣 10000）。这是硬约束：
- *    运行时比驱动新，DLL 直接加载失败，装完等于白装。
+ *    运行时比驱动新，动态库直接加载失败，装完等于白装。
  * 2. Blackwell（算力 ≥ 12）必须 CUDA 12.8+：sm_120 的设备代码只在 12.8 之后才有；
  *    驱动又够新时，版本越高越好。
  * 3. 驱动版本未知时保守回到 12.x：13.x 要求的驱动更高，未知就当它不够。
@@ -365,7 +437,7 @@ function rankCuda(code: number, hints: PackageHints): number {
   return score
 }
 
-/** 官方 Windows 产物里出现过的 CUDA 运行时版本（镜像兜底时按这个顺序试） */
+/** 官方产物里出现过的 CUDA 运行时版本（镜像兜底时按这个顺序试；保持 Windows 行为不变） */
 const KNOWN_CUDA_VERSIONS = ['12.4', '13.4']
 
 /**
@@ -373,7 +445,10 @@ const KNOWN_CUDA_VERSIONS = ['12.4', '13.4']
  * 驱动装不了的版本直接剔掉：留在这里只会让镜像兜底白探一遍、
  * 让 `planFromAssets` 得出一个必然加载失败的结论。
  */
-export function orderedCudaVersions(hints: PackageHints = {}, versions: string[] = KNOWN_CUDA_VERSIONS): string[] {
+export function orderedCudaVersions(
+  hints: PackageHints = {},
+  versions: string[] = KNOWN_CUDA_VERSIONS
+): string[] {
   return [...versions]
     .filter((v) => {
       const code = cudaCodeOf(v)
@@ -386,6 +461,29 @@ export function orderedCudaVersions(hints: PackageHints = {}, versions: string[]
     })
 }
 
+/** 各后端的候选顺序（按平台 + 架构生成，先精确、再降级，最后是能跑的兜底） */
+function ordersFor(prefer: GpuPreference): RegExp[] {
+  const a = archTag()
+  if (isMac) {
+    return [
+      new RegExp(`-bin-macos-${a}\\.tar\\.gz$`, 'i'),
+      /-bin-macos-(x64|arm64)\.tar\.gz$/i
+    ]
+  }
+  const osTag = isWin ? 'win' : 'ubuntu'
+  const ext = isWin ? 'zip' : 'tar\\.gz'
+  const cuda12 = new RegExp(`-bin-${osTag}-cuda-12\\.\\d+-${a}\\.${ext}$`, 'i')
+  const cudaAny = new RegExp(`-bin-${osTag}-cuda-[^/]+-${a}\\.${ext}$`, 'i')
+  const vulkan = new RegExp(`-bin-${osTag}-vulkan-${a}\\.${ext}$`, 'i')
+  const cpu = isWin
+    ? new RegExp(`-bin-win-cpu-${a}\\.zip$`, 'i')
+    : new RegExp(`-bin-ubuntu-${a}\\.tar\\.gz$`, 'i')
+
+  if (prefer === 'cuda') return [cuda12, cudaAny, vulkan, cpu]
+  if (prefer === 'vulkan') return [vulkan, cpu]
+  return [cpu, vulkan]
+}
+
 /** 按优先级挑一个主包 + 版本匹配的 cudart */
 export function planFromAssets(
   assets: ReleaseAsset[],
@@ -393,6 +491,15 @@ export function planFromAssets(
   hints: PackageHints = {}
 ): InstallPlan | null {
   const pool = assets.filter((a) => isMainPackage(a.name))
+
+  // macOS：只有一种包，不存在后端选择
+  if (isMac) {
+    const main =
+      pool.find((a) => new RegExp(`-bin-macos-${archTag()}\\.tar\\.gz$`, 'i').test(a.name)) ??
+      pool.find((a) => /-bin-macos-(x64|arm64)\.tar\.gz$/i.test(a.name))
+    return main ? { main, extras: [] } : null
+  }
+
   let main: ReleaseAsset | undefined
   if (prefer === 'cuda') {
     // 先把所有 CUDA 包按本机情况排序，取第一个装得上的
@@ -401,22 +508,22 @@ export function planFromAssets(
       .filter((x): x is { a: ReleaseAsset; code: number } => x.code !== null)
       .sort((x, y) => rankCuda(y.code, hints) - rankCuda(x.code, hints))
     /**
-     * 分数为负 = 没有任何一个 CUDA 包能被这个驱动加载（运行时比驱动新，DLL 直接失败）。
-     * 这时硬装 CUDA 等于让用户白下载 300 MB 再看到「显存一动不动」，
+     * 分数为负 = 没有任何一个 CUDA 包能被这个驱动加载（运行时比驱动新，动态库直接失败）。
+     * 这时硬装 CUDA 等于让用户白下载几百 MB 再看到「显存一动不动」，
      * 不如落到 Vulkan 兜底：比 CPU 快一个数量级，只是比 CUDA 略慢。
-     * 注意这里要直接跳到 vulkan/cpu，不能落回下面的 ORDERS ——
-     * ORDERS.cuda 第一条就是 cuda-12.x，会把刚排除掉的包又捡回来。
      */
     if (cudas.length && rankCuda(cudas[0].code, hints) > 0) {
       main = cudas[0].a
     } else {
-      main =
-        pool.find((a) => /-bin-win-vulkan-x64\.zip$/i.test(a.name)) ??
-        pool.find((a) => /-bin-win-cpu-x64\.zip$/i.test(a.name))
+      const vulkan = new RegExp(`-bin-${isWin ? 'win' : 'ubuntu'}-vulkan-${archTag()}\\.${isWin ? 'zip' : 'tar\\.gz'}$`, 'i')
+      const cpu = isWin
+        ? new RegExp(`-bin-win-cpu-${archTag()}\\.zip$`, 'i')
+        : new RegExp(`-bin-ubuntu-${archTag()}\\.tar\\.gz$`, 'i')
+      main = pool.find((a) => vulkan.test(a.name)) ?? pool.find((a) => cpu.test(a.name))
     }
   }
   if (!main && prefer !== 'cuda') {
-    for (const re of ORDERS[prefer]) {
+    for (const re of ordersFor(prefer)) {
       main = pool.find((a) => re.test(a.name))
       if (main) break
     }
@@ -424,12 +531,9 @@ export function planFromAssets(
   if (!main) return null
 
   const extras: ReleaseAsset[] = []
-  const cudaVer = main.name.match(/-bin-win-cuda-([\d.]+)-x64\.zip$/i)?.[1]
-  if (cudaVer) {
-    const cudart = assets.find((a) => {
-      const m = a.name.match(/^cudart-llama-bin-win-cuda-([\d.]+)-x64\.zip$/i)
-      return m && m[1] === cudaVer
-    })
+  const cudaVer = cudaVersionOf(main.name)
+  if (cudaVer && supportsCuda()) {
+    const cudart = assets.find((a) => cudartCudaVersion(a.name) === cudaVer)
     if (cudart) extras.push(cudart)
   }
   return { main, extras }
@@ -437,15 +541,26 @@ export function planFromAssets(
 
 /** 镜像兜底路径要拼的候选文件名（按优先级） */
 export function candidateNames(tag: string, prefer: GpuPreference, hints: PackageHints = {}): string[] {
-  if (prefer === 'cuda') {
+  // macOS：按本机架构优先，另一种架构兜底（Intel / Apple Silicon 都可能）
+  if (isMac) {
+    const self = archTag()
+    const other = self === 'arm64' ? 'x64' : 'arm64'
     return [
-      ...orderedCudaVersions(hints).map((v) => `llama-${tag}-bin-win-cuda-${v}-x64.zip`),
-      `llama-${tag}-bin-win-vulkan-x64.zip`,
-      `llama-${tag}-bin-win-cpu-x64.zip`
+      llamaAssetName(tag, 'metal', { arch: self }),
+      llamaAssetName(tag, 'metal', { arch: other })
+    ]
+  }
+  if (prefer === 'cuda') {
+    // Windows 保持历史上的 12.4/13.4 兜底；Linux 用官方 ubuntu 产物里的 12.8/13.5
+    const versions = isWin ? undefined : knownCudaVersions()
+    return [
+      ...orderedCudaVersions(hints, versions).map((v) => llamaAssetName(tag, 'cuda', { cudaVer: v })),
+      llamaAssetName(tag, 'vulkan'),
+      llamaAssetName(tag, 'cpu')
     ]
   }
   if (prefer === 'vulkan') {
-    return [`llama-${tag}-bin-win-vulkan-x64.zip`, `llama-${tag}-bin-win-cpu-x64.zip`]
+    return [llamaAssetName(tag, 'vulkan'), llamaAssetName(tag, 'cpu')]
   }
-  return [`llama-${tag}-bin-win-cpu-x64.zip`, `llama-${tag}-bin-win-vulkan-x64.zip`]
+  return [llamaAssetName(tag, 'cpu'), llamaAssetName(tag, 'vulkan')]
 }

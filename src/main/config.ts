@@ -12,7 +12,7 @@ const FILE = 'config.json'
  * 首次启动只带三个「本地运行时」入口（Ollama / LM Studio / llama.cpp）。
  *
  * 云端接口不再预置：没填 Key 的 OpenAI / Anthropic 条目既用不了又占列表，
- * 用户想接哪家，到「模型设置 → 模型 API」点「添加」自己填地址和 Key 即可。
+ * 用户想接哪家，到「模型设置 → 线上模型」点「添加」自己填地址和 Key 即可。
  * 这三个本地条目是「本地模型」页的探测与启动入口，不是预设 API，必须保留。
  */
 export function defaultProviders(): ProviderConfig[] {
@@ -80,6 +80,12 @@ export function defaultConfig(): AppConfig {
     autoFallback: true,
     // 默认开：任务没做完（计划里还有未完成项 / 模型过早收工）时自己接着跑，不用手点「继续」
     autoContinue: true,
+    /**
+     * 默认开：用户在会话里反复反馈「有员工却从不派活」—— 光靠系统提示里的规则，
+     * 模型自己想起要派的概率太低。改由程序在当轮提醒一句，仍由模型决定怎么派。
+     * 只提醒只读探查，不替它开工，详见 shared/types 里 autoDelegate 的说明。
+     */
+    autoDelegate: true,
     // 用量闸门默认不限：不配置的人行为完全不变，想限流的人在设置里填数字
     tokenLimitPerRun: 0,
     tokenLimitPerDay: 0,
@@ -190,18 +196,26 @@ export async function loadConfig(): Promise<AppConfig> {
       await saveConfig(cache)
       if (bad.length) cache.undecryptable = bad
     }
-    if (!Array.isArray(cache.providers) || cache.providers.length === 0) {
-      // 配置被清空过：回填默认条目并落盘，否则每次启动都会重新生成一份临时列表
-      cache.providers = defaultProviders()
-      if (!cache.activeId) cache.activeId = 'llamacpp'
-      await saveConfig(cache)
-    } else if (!cache.providers.some((p) => p.id === 'llamacpp')) {
-      // 老配置升级：补上 llama.cpp 本地端点，不影响已有条目
-      const llamacpp = defaultProviders().find((p) => p.id === 'llamacpp')
-      if (llamacpp) {
-        cache.providers = [...cache.providers, llamacpp]
-        await saveConfig(cache)
+    /**
+     * 条目回填只在「配置文件里根本没有 providers 字段」时发生（首次启动 / 文件损坏）。
+     *
+     * 以前还有一条「列表里没有 llama.cpp 本地就补一条」的老配置升级逻辑，但它的判据
+     * 在用户主动删掉这条之后同样成立 —— 于是每次启动都补回来，删多少遍都白删。
+     * 本地实例现在由「② 本地模型」页按需创建（`locals.configureLocal` / `startLlama`
+     * 在没有实例时会自己建一条），单方面回填没有任何收益，删掉。
+     */
+    const cur = cache
+    const hadProviders = Array.isArray(parsed.providers)
+    if (!hadProviders) {
+      cur.providers = defaultProviders()
+      if (!cur.providers.some((p) => p.id === cur.activeId)) {
+        cur.activeId = cur.providers[0]?.id ?? null
       }
+      await saveConfig(cur)
+    } else if (cur.providers.length === 0 && cur.activeId) {
+      // 用户把条目全删光了：尊重这个结果，只把 activeId 清干净
+      cur.activeId = null
+      await saveConfig(cur)
     }
     /**
      * 老版本预置过两条没填 Key 的云端供应商（OpenAI 兼容 / Anthropic）。
@@ -214,10 +228,17 @@ export async function loadConfig(): Promise<AppConfig> {
       (p) => !(blankPresets.has(p.id) && !(p.apiKey ?? '').trim())
     )
     if (kept.length !== cfg.providers.length) {
-      cfg.providers = kept.length ? kept : defaultProviders()
+      // 全被清掉就留空：那是用户删的结果，不能再拿默认条目顶上
+      cfg.providers = kept
       if (cfg.activeId && !cfg.providers.some((p) => p.id === cfg.activeId)) {
         cfg.activeId = cfg.providers[0]?.id ?? null
       }
+      await saveConfig(cfg)
+    }
+
+    // activeId 指着一个已不存在的条目时对话会一直打到空处：跟着删掉的一起挪走
+    if (cfg.activeId && !cfg.providers.some((p) => p.id === cfg.activeId)) {
+      cfg.activeId = cfg.providers[0]?.id ?? null
       await saveConfig(cfg)
     }
 
@@ -234,6 +255,7 @@ export async function loadConfig(): Promise<AppConfig> {
       await saveConfig(cfg)
     }
   } catch {
+    // 没有配置文件 / 文件读坏了：按首次启动处理
     cache = defaultConfig()
     await saveConfig(cache)
   }
@@ -265,7 +287,16 @@ async function writeConfigNow(next: AppConfig): Promise<AppConfig> {
        */
       topP: inRange(p.topP, 0.01, 1),
       repeatPenalty: inRange(p.repeatPenalty, 0.5, 2),
-      jsonMode: p.jsonMode === true ? true : undefined
+      jsonMode: p.jsonMode === true ? true : undefined,
+      /**
+       * 主 / 子 只能是其中一种：主模型就是 `activeId` 那条。
+       *
+       * 顶栏的模型选择器、会话模型绑定都能改 activeId，它们不经过设置页，
+       * 如果不在这里归位，就会出现「同一条既显示主又显示子」的配置 ——
+       * 运行时 subAgentProviders 会按 id 把它排除，界面却两边都亮着。
+       * 统一在落盘这一层收口，任何入口改完 activeId 都自动清掉它身上的子标记。
+       */
+      role: p.id === (next.activeId ?? null) || p.role !== 'worker' ? undefined : 'worker'
     })),
     activeId: next.activeId ?? null,
     workspace: next.workspace ?? null,
@@ -286,6 +317,8 @@ async function writeConfigNow(next: AppConfig): Promise<AppConfig> {
     // 老配置没有这一项：默认开启（只有显式 false 才关）
     autoFallback: next.autoFallback !== false,
     autoContinue: next.autoContinue !== false,
+    // 老配置没有这一项：默认开（只有显式 false 才关），和 autoContinue 同一口径
+    autoDelegate: next.autoDelegate !== false,
     // 用量上限：0 表示不限。用 parseLimit 归一化，负数 / NaN 都落到 0，
     // 避免一次手滑保存就把所有会话卡死（0 是「不限」而不是「立刻停」）
     tokenLimitPerRun: parseLimit(next.tokenLimitPerRun),

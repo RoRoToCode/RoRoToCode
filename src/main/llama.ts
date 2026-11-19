@@ -3,15 +3,26 @@ import fsSync, { promises as fs } from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
-import type { LlamaErrorCode, LlamaStatus, LlamaUpdateInfo, ProviderConfig, SetupProgress } from '../shared/types'
-import { LLAMA_PORT, LLAMA_PORTS, deviceIndex, isLlamaProvider, llamaPortOf } from '../shared/providers'
+import type { LlamaErrorCode, LlamaDevicesInfo, LlamaStatus, LlamaUpdateInfo, ProviderConfig, SetupProgress } from '../shared/types'
+import {
+  LLAMA_PORT,
+  LLAMA_PORTS,
+  deviceClash,
+  deviceIndex,
+  deviceIndexes,
+  deviceJoin,
+  deviceList,
+  isLlamaProvider,
+  isMultiDevice,
+  llamaPortOf
+} from '../shared/providers'
+import { subAgentKeepAliveIds } from '../shared/agentpool'
 import { ggufLooksVision } from '../shared/vision'
-import { isInsideAnyRoot, isModelFileName } from '../shared/modelpath'
 import { resolveDataRoot } from '../shared/datadir'
 import { findFreePort, waitPortFree } from './portprobe'
 import { CONTEXT_RANGE, loadConfig, saveConfig } from './config'
 import { fitForLaunch, type VramfitKv } from './vramfit'
-import { gpuUsedMiB, sampleUsedMiB } from './vramprobe'
+import { sampleUsedMiB } from './vramprobe'
 import {
   bestTier,
   classifyLoadFailure,
@@ -27,6 +38,7 @@ import {
 } from '../shared/ctxtune'
 import { probeBudget, runProbeChain, type ProbeProgress, type ProbeVerify } from './ctxprobe'
 import { createIdleWatcher } from './idleunload'
+import { createSerialQueue } from './startqueue'
 import { readGgufMeta } from './gguf'
 import { isLoopbackUrl } from './providers/base'
 import { MIRRORS, downloadFromGithub } from './ghdl'
@@ -43,6 +55,20 @@ import {
   type PackageHints,
   type ReleaseAsset
 } from './gpuplan'
+import {
+  backendLibs,
+  cudartAssetName,
+  cudaRuntimeRegexes,
+  expandArchive,
+  isMac,
+  isPidNamed,
+  isWin,
+  killTreeSync,
+  listPidsNamed,
+  looksLikeArchive,
+  nvidiaSmiPaths,
+  serverFileName
+} from './platform'
 
 const RELEASE_API = 'https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=10'
 const RELEASES_LATEST = 'https://github.com/ggml-org/llama.cpp/releases/latest'
@@ -399,6 +425,24 @@ let probeGen = 0
 /** 探测串行链：同一条配置上不允许两条探测同时起停 */
 let probeSerial: Promise<unknown> = Promise.resolve()
 
+/**
+ * 启动串行队列 —— 修「同时起两个 llama-server 抢同一个端口」的根因。
+ *
+ * 竞态是怎么发生的：一次启动从入口到真正 spawn 之间全是 `await`
+ * （体检、显存采样、端口探测、卡组清理），窗口能有好几秒。两个启动同时进来时，
+ * 都会在那一刻读到「实例表里还没有这个 key」，于是各自 pickPort → spawn，
+ * 两个进程落到同一个端口上 —— 日志里就是两个 PID 同毫秒抢 8081。
+ *
+ * 只在 UI 层收敛入口治不住它：自动拉起、空闲唤醒、探测链调档、崩溃自愈都会起进程，
+ * 用户点得快一点就能撞上。所以把队排在这一层，所有起进程的动作共用一条队列：
+ * 后来者等前一个跑完再看实例表 —— 那时要么直接复用（同模型），要么按正常流程重启
+ * （换了配置），不会再出现两个进程并行抢资源。
+ *
+ * 代价只是「后一个启动晚一两秒开始」（启动在 spawn 后就返回，不等模型加载完），
+ * 双卡各起一个模型的场景依然能并存，只是先后落地。
+ */
+const enqueueStart = createSerialQueue()
+
 /** 用户主动启动 / 手选档位时调用：叫停正在跑的自动探测 */
 export function cancelContextProbe(): void {
   probeGen++
@@ -480,23 +524,34 @@ function handleExit(inst: LlamaInstance, code: number | null, signal: string | n
   if (prev) clearTimeout(prev)
   const timer = setTimeout(() => {
     restartTimers.delete(key)
-    // 用户可能已经手动重启、或者切了模型，这时别再插一脚
-    if (instances.has(key)) return
     /**
-     * 端口必须重新确认。崩溃后实例已经从表里删掉，别的供应商可能刚好把这个端口
-     * 挑走（pickPort 只遍历 instances）；照旧端口盲起就是两个 llama-server 抢一个
-     * 端口，抢输的再崩一次，三次之后这个模型就永久停在 error。
+     * 自愈重启也要排队 —— 它是全程序唯一绕过 `startLlama` 直接 `launch` 的地方。
+     *
+     * 不排的话：崩溃后 2 秒定时器唤起，此时若正好有个启动在跑（用户手点、
+     * 或探测链重启），两边都会读到「实例表里没有这个 key」，各 spawn 一个进程。
+     * 排进同一条队列，`instances.has` 那次判断才是准的。
      */
-    const portTaken = [...instances.values()].some((i) => i.port === inst.port)
-    launch({
-      key,
-      exe: inst.exe,
-      args: inst.args,
-      port: portTaken ? pickPort() : inst.port,
-      model: inst.model,
-      mmproj: inst.mmproj,
-      device: inst.device,
-      ctx: inst.ctx
+    void enqueueStart(async () => {
+      // 用户可能已经手动重启、或者切了模型，这时别再插一脚
+      if (instances.has(key)) return
+      /**
+       * 端口必须重新确认。崩溃后实例已经从表里删掉，别的供应商可能刚好把这个端口
+       * 挑走（pickPort 只遍历 instances）；照旧端口盲起就是两个 llama-server 抢一个
+       * 端口，抢输的再崩一次，三次之后这个模型就永久停在 error。
+       */
+      const portTaken = [...instances.values()].some((i) => i.port === inst.port)
+      launch({
+        key,
+        exe: inst.exe,
+        args: inst.args,
+        port: portTaken ? pickPort() : inst.port,
+        model: inst.model,
+        mmproj: inst.mmproj,
+        device: inst.device,
+        ctx: inst.ctx
+      })
+    }).catch(() => {
+      // 起进程失败：实例表里本来就没有这条记录，下一次请求会重新走完整启动流程
     })
   }, RESTART_DELAYS_MS[attempt - 1])
   timer.unref?.()
@@ -527,49 +582,16 @@ function pickPort(preferred?: number, busy?: Set<number>): number {
  * 另外 spawnSync 没有超时，进程挂起时会把主进程一起冻住。
  */
 function killPidSync(pid: number): boolean {
-  try {
-    const r = spawnSync('taskkill', ['/pid', String(pid), '/t', '/f'], {
-      windowsHide: true,
-      timeout: 8000,
-      encoding: 'utf8'
-    })
-    if (r.status === 0) return true
-    // 非 0 常见于「进程已经不在了」：那也算成功，用 tasklist 复核一次
-    return !isLlamaPid(pid)
-  } catch {
-    return !isLlamaPid(pid)
-  }
+  // taskkill /T（Windows）与 ps+kill 递归（POSIX）都收在 platform 里
+  return killTreeSync(pid)
 }
 
 function isLlamaPid(pid: number): boolean {
-  try {
-    const out =
-      spawnSync('tasklist', ['/fi', `PID eq ${pid}`, '/fo', 'csv', '/nh'], {
-        encoding: 'utf8',
-        windowsHide: true
-      }).stdout ?? ''
-    return /llama-server\.exe/i.test(out)
-  } catch {
-    return false
-  }
+  return isPidNamed(pid, 'llama-server')
 }
 
 function listLlamaPids(): number[] {
-  try {
-    const out =
-      spawnSync('tasklist', ['/fi', 'IMAGENAME eq llama-server.exe', '/fo', 'csv', '/nh'], {
-        encoding: 'utf8',
-        windowsHide: true
-      }).stdout ?? ''
-    const pids: number[] = []
-    for (const line of out.split(/\r?\n/)) {
-      const m = line.match(/"llama-server\.exe","(\d+)"/i)
-      if (m) pids.push(Number(m[1]))
-    }
-    return pids
-  } catch {
-    return []
-  }
+  return listPidsNamed('llama-server')
 }
 
 /** 程序所在根目录：便携版为 exe 所在目录，开发态为仓库根目录 */
@@ -599,14 +621,97 @@ function dataRoot(): string {
   })
 }
 
-/** llama.cpp 可执行文件目录 */
-export function llamaRoot(): string {
-  return path.join(dataRoot(), 'llama.cpp')
+/**
+ * 数据根目录「还可能是哪」—— 当 dataRoot() 下面没有运行库时的备选项。
+ *
+ * 为什么需要：resolveDataRoot 只靠「exe 同目录有没有 llama.cpp/models/core」判断
+ * 老便携版的位置。而安装版被解压到临时目录运行时（实测 F:\Temp\3M5…\RoRoTo Code.exe），
+ * exe 同目录只有 resources/，于是判定落到 userData —— 一个从来没有放过运行库的目录。
+ * 结果就是：机器上明明有两张卡，设置里「绑定显卡」只剩「自动」和「CPU」，
+ * 界面上完全看不出「找不到 llama.cpp」这件事，用户只能猜。
+ *
+ * 顺序按「用户最可能有货的地方」排：便携版 exe 同目录 → 工作目录 → 打包资源目录
+ * → userData（dataRoot 可能选了 exe 侧，反过来再兜一次）。
+ */
+function fallbackDataBases(): string[] {
+  const out: string[] = []
+  const push = (p?: string | null): void => {
+    const v = (p ?? '').trim()
+    if (v && !out.includes(v)) out.push(v)
+  }
+  push(appBase())
+  // 开发态 / 本仓库直接运行：运行库和模型都在 release/ 下（npm run dev 时 appBase 是仓库根，
+  // dataRoot 会判到 userData —— 那里没有运行库，于是设置里连 CUDA0 都列不出来）
+  push(path.join(appBase(), 'release'))
+  // 兄弟目录：release/ 与 win-unpacked/ 常常并排，运行库放在哪一侧都可能
+  push(path.dirname(appBase()))
+  push(process.cwd())
+  push(path.join(process.cwd(), 'release'))
+  if (app.isPackaged) push(process.resourcesPath)
+  // 开发态：app.getAppPath() 是 dist/main，往上两级才是仓库根
+  push(path.resolve(app.getAppPath(), '..', '..'))
+  push(app.getPath('userData'))
+  return out
 }
 
-/** 模型目录 */
+/** 这个目录里是不是直接躺着 llama-server（只看一层，解压后就是这个结构） */
+function hasServerExe(dir: string): boolean {
+  try {
+    const want = serverFileName().toLowerCase()
+    return fsSync.readdirSync(dir).some((n) => n.toLowerCase() === want)
+  } catch {
+    return false
+  }
+}
+
+export interface LlamaRootInfo {
+  /** 实际使用的 llama.cpp 目录 */
+  root: string
+  /** dataRoot() 按配置算出来的目录（可能不存在运行库） */
+  primary: string
+  /** true = 用的是备选位置，说明数据目录判定和真实存放错位了 */
+  fallback: boolean
+}
+
+let rootGate: LlamaRootInfo | null = null
+
+/**
+ * llama.cpp 到底在哪。
+ *
+ * 先认配置算出来的位置（权威、也是安装的目标）；那里没有运行库时，
+ * 才去备选位置找一份已经在的 —— 「装过但目录判定错位」比「没装」常见得多，
+ * 而这两者在界面上必须能区分开，所以这里同时把 primary 一起返回。
+ */
+export function llamaRootInfo(): LlamaRootInfo {
+  if (rootGate) return rootGate
+  const primary = path.join(dataRoot(), 'llama.cpp')
+  if (hasServerExe(primary)) return (rootGate = { root: primary, primary, fallback: false })
+  for (const base of fallbackDataBases()) {
+    const cand = path.join(base, 'llama.cpp')
+    if (cand === primary) continue
+    if (hasServerExe(cand)) return (rootGate = { root: cand, primary, fallback: true })
+  }
+  return (rootGate = { root: primary, primary, fallback: false })
+}
+
+/** llama.cpp 可执行文件目录 */
+export function llamaRoot(): string {
+  return llamaRootInfo().root
+}
+
+/**
+ * 模型目录。
+ *
+ * 跟着运行库走：如果运行库是从备选位置找到的，模型大概率也在那旁边 ——
+ * 只回退一半会出现「能列出显卡、模型列表却空着」的割裂状态。
+ * 但备选位置没有 models/ 时仍回到配置目录，不制造一个新的空目录。
+ */
 export function modelsRoot(): string {
-  return path.join(dataRoot(), 'models')
+  const info = llamaRootInfo()
+  const primary = path.join(dataRoot(), 'models')
+  if (!info.fallback) return primary
+  const alt = path.join(path.dirname(info.root), 'models')
+  return fsSync.existsSync(alt) ? alt : primary
 }
 
 /**
@@ -625,12 +730,9 @@ let ccGate: Promise<Array<number | null>> | null = null
 function gpuComputeCaps(): Promise<Array<number | null>> {
   if (!ccGate) {
     ccGate = Promise.resolve().then(() => {
-      const candidates = ['nvidia-smi']
-      // 打包后的主进程 PATH 里不一定有 nvidia-smi：它常年待在 System32
-      if (process.platform === 'win32' && process.env.SystemRoot) {
-        candidates.push(path.join(process.env.SystemRoot, 'System32', 'nvidia-smi.exe'))
-      }
-      for (const exe of candidates) {
+      // 打包后的主进程 PATH 里不一定有 nvidia-smi：Windows 常年待在 System32，
+      // Linux 在 /usr/bin 或 /usr/lib/wsl/lib，macOS 默认没有（Metal 不需要）
+      for (const exe of nvidiaSmiPaths()) {
         try {
           const r = spawnSync(exe, ['--query-gpu=compute_cap', '--format=csv,noheader'], {
             encoding: 'utf8',
@@ -664,6 +766,29 @@ async function gpuComputeCap(index = 0): Promise<number | null> {
   if (!caps.length) return null
   const picked = caps[Number.isFinite(index) && index >= 0 ? index : 0]
   return picked ?? caps.find((c): c is number => c !== null) ?? null
+}
+
+/**
+ * 合并多卡时，性能分档按**最弱**那张卡算。
+ *
+ * 合并模式里所有卡跑的是同一套内核参数，一张卡没有 Tensor Core（Pascal）、
+ * 另一张有（Turing），按强的那张开 `-fa on` 会让弱卡直接跑不起来或悄悄退回慢路径。
+ * FA、KV 量化、`-ub` 三处都吃这个结论，所以统一收敛到最低算力那张。
+ */
+async function weakestGpuIndex(indexes: number[]): Promise<number> {
+  if (indexes.length <= 1) return indexes[0] ?? 0
+  const caps = await gpuComputeCaps()
+  let best = indexes[0]
+  let bestCc = Number.POSITIVE_INFINITY
+  for (const i of indexes) {
+    const cc = caps[i]
+    if (typeof cc !== 'number' || !Number.isFinite(cc)) continue
+    if (cc < bestCc) {
+      bestCc = cc
+      best = i
+    }
+  }
+  return best
 }
 
 /**
@@ -735,6 +860,10 @@ function gpuProfile(index = 0): Promise<GpuProfile> {
 export function clearGpuProbeCache(): void {
   ccGate = null
   profileGates.clear()
+  // 运行库位置与设备清单也必须跟着失效：换卡、装完新包之后旧结论不再成立，
+  // 而「装完了设置里还是只有自动/CPU」正是这两处缓存没清造成的
+  rootGate = null
+  devGate = null
   detectGpuPreference({ refresh: true })
 }
 
@@ -877,7 +1006,7 @@ async function fetchWithTimeout(url: string, ms: number, init?: RequestInit): Pr
   }
 }
 
-type Backend = 'cuda' | 'vulkan' | 'hip' | 'cpu'
+type Backend = 'cuda' | 'vulkan' | 'hip' | 'metal' | 'cpu'
 
 export interface BackendInfo {
   backend: Backend
@@ -906,14 +1035,20 @@ export async function detectBackend(): Promise<BackendInfo> {
   if (!installed) return { backend: 'cpu', gpuReady: false, installed: false }
   const files = await fs.readdir(llamaRoot()).catch(() => [] as string[])
   const has = (re: RegExp) => files.some((f) => re.test(f))
+  // Windows 是 ggml-cuda.dll，Linux 是 libggml-cuda.so，macOS 是 libggml-metal.dylib
+  const lib = backendLibs()
 
-  if (has(/^ggml-cuda.*\.dll$/i)) {
+  if (has(lib.cuda)) {
     // 版本号不写死：按目录里实际有什么认，缺哪几个就报哪几个
+    const [cudart, cublas, cublasLt] = cudaRuntimeRegexes()
     const missing: string[] = []
-    if (!has(/^cudart64_\d+\.dll$/i)) missing.push('cudart64_12.dll')
-    if (!has(/^cublas64_\d+\.dll$/i)) missing.push('cublas64_12.dll')
-    if (!has(/^cublasLt64_\d+\.dll$/i)) missing.push('cublasLt64_12.dll')
+    if (!has(cudart)) missing.push(isWin ? 'cudart64_12.dll' : 'libcudart.so')
+    if (!has(cublas)) missing.push(isWin ? 'cublas64_12.dll' : 'libcublas.so')
+    if (!has(cublasLt)) missing.push(isWin ? 'cublasLt64_12.dll' : 'libcublasLt.so')
     if (missing.length) {
+      const pkg = isWin
+        ? 'cudart-llama-bin-win-cuda-*.zip'
+        : 'cudart-llama-<build>-bin-ubuntu-cuda-*.tar.gz'
       return {
         backend: 'cpu',
         gpuReady: false,
@@ -922,13 +1057,16 @@ export async function detectBackend(): Promise<BackendInfo> {
         note:
           `CUDA 版缺运行库（${missing.join('、')}），llama.cpp 会退回 CPU 跑：` +
           '不占显存、速度只有显卡的 1/5～1/10。点「一键安装」补齐（会单独下载 cudart 包），' +
-          '或手动把 cudart-llama-bin-win-cuda-*.zip 解压到 llama.cpp/ 目录。'
+          `或手动把 ${pkg} 解压到 llama.cpp/ 目录。`
       }
     }
     return { backend: 'cuda', gpuReady: true, installed: true }
   }
-  if (has(/^ggml-vulkan\.dll$/i)) return { backend: 'vulkan', gpuReady: true, installed: true }
-  if (has(/^ggml-hip.*\.dll$/i)) return { backend: 'hip', gpuReady: true, installed: true }
+  if (has(lib.vulkan)) return { backend: 'vulkan', gpuReady: true, installed: true }
+  if (has(lib.rocm)) return { backend: 'hip', gpuReady: true, installed: true }
+  if (has(lib.metal)) return { backend: 'metal', gpuReady: true, installed: true }
+  // macOS 官方 macos 包把 Metal 编进主程序，不一定有独立 dylib：装了就算 GPU 可用
+  if (isMac) return { backend: 'metal', gpuReady: true, installed: true }
   return { backend: 'cpu', gpuReady: false, installed: true }
 }
 
@@ -1100,9 +1238,10 @@ async function planViaMirror(): Promise<InstallPlan | null> {
     const url = await probeAsset(tag, name)
     if (!url) continue
     const assets: ReleaseAsset[] = [{ name, browser_download_url: url }]
-    const cudaVer = name.match(/-bin-win-cuda-([\d.]+)-x64\.zip$/i)?.[1]
+    const cudaVer = /-bin-(?:win|ubuntu|linux)-cuda-([\d.]+)-/i.exec(name)?.[1]
     if (cudaVer) {
-      const cname = `cudart-llama-bin-win-cuda-${cudaVer}-x64.zip`
+      // Windows 的 cudart 包名不含 tag，Linux 的含 tag —— 交给 platform 生成
+      const cname = cudartAssetName(tag, cudaVer)
       const curl = await probeAsset(tag, cname)
       if (curl) assets.push({ name: cname, browser_download_url: curl })
     }
@@ -1116,45 +1255,10 @@ async function latestAsset(): Promise<InstallPlan> {
   const plan = (await planViaApi()) ?? (await planViaMirror())
   if (!plan) {
     throw new Error(
-      '取不到 llama.cpp 版本信息（GitHub API 和镜像都不通）。请展开「下载地址」用浏览器手动下载 zip，解压到 llama.cpp/ 目录后再点「自动配置」。'
+      '取不到 llama.cpp 版本信息（GitHub API 和镜像都不通）。请展开「下载地址」用浏览器手动下载对应平台的压缩包，解压到 llama.cpp/ 目录后再点「自动配置」。'
     )
   }
   return plan
-}
-
-/** 校验下载到的是不是 zip：前两个字节应为 `PK`，防止把镜像的错误页当安装包解压 */
-async function looksLikeZip(file: string): Promise<boolean> {
-  try {
-    const fh = await fs.open(file, 'r')
-    try {
-      const buf = Buffer.alloc(4)
-      const { bytesRead } = await fh.read(buf, 0, 4, 0)
-      return bytesRead >= 2 && buf[0] === 0x50 && buf[1] === 0x4b
-    } finally {
-      await fh.close()
-    }
-  } catch {
-    return false
-  }
-}
-
-function expandArchive(zip: string, dest: string): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const q = (s: string) => s.replace(/'/g, "''")
-    const ps = `Expand-Archive -LiteralPath '${q(zip)}' -DestinationPath '${q(dest)}' -Force`
-    const child = spawn(
-      'powershell.exe',
-      ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', ps],
-      { windowsHide: true }
-    )
-    let err = ''
-    child.stderr.on('data', (d: Buffer) => (err += d.toString('utf8')))
-    child.on('error', reject)
-    child.on('close', (code) => {
-      if (code === 0) resolve()
-      else reject(new Error(`解压失败（退出码 ${code}）：${err.trim()}`))
-    })
-  })
 }
 
 async function findServer(dir: string, depth = 0): Promise<string | null> {
@@ -1165,8 +1269,9 @@ async function findServer(dir: string, depth = 0): Promise<string | null> {
   } catch {
     return null
   }
+  const want = serverFileName().toLowerCase()
   for (const e of entries) {
-    if (e.isFile() && /^llama-server\.exe$/i.test(e.name)) return path.join(dir, e.name)
+    if (e.isFile() && e.name.toLowerCase() === want) return path.join(dir, e.name)
   }
   for (const e of entries) {
     if (e.isDirectory()) {
@@ -1375,7 +1480,16 @@ async function hasCudart(dir: string, ver: string): Promise<boolean> {
   const major = ver.split('.')[0]
   const files = await fs.readdir(dir).catch(() => [] as string[])
   const has = (re: RegExp) => files.some((f) => re.test(f))
-  return has(new RegExp(`^cudart64_${major}\\.dll$`, 'i')) && has(new RegExp(`^cublas64_${major}\\.dll$`, 'i'))
+  if (isWin) {
+    return (
+      has(new RegExp(`^cudart64_${major}\\.dll$`, 'i')) &&
+      has(new RegExp(`^cublas64_${major}\\.dll$`, 'i'))
+    )
+  }
+  return (
+    has(new RegExp(`^libcudart\\.so(\\.${major})?$`, 'i')) &&
+    has(new RegExp(`^libcublas\\.so(\\.${major})?$`, 'i'))
+  )
 }
 
 export async function installLlama(
@@ -1431,8 +1545,9 @@ export async function installLlama(
     await fs.mkdir(dlDir, { recursive: true }).catch(() => undefined)
     for (const asset of all) {
       if (signal.signal.aborted) throw new Error('已取消下载')
-      // CUDA 运行库体积比主包还大，目录里已经有了就跳过
-      const cudartVer = asset.name.match(/^cudart-llama-bin-win-cuda-([\d.]+)-x64\.zip$/i)?.[1]
+      // CUDA 运行库体积比主包还大，目录里已经有了就跳过。
+      // Windows 包名不含 tag，Linux 包名含 tag，两种都要认。
+      const cudartVer = /^cudart-llama-(?:b\d+-)?bin-(?:win|ubuntu|linux)-cuda-([\d.]+)-/i.exec(asset.name)?.[1]
       if (cudartVer && (await hasCudart(dir, cudartVer))) {
         emit({
           kind: 'llama',
@@ -1461,8 +1576,8 @@ export async function installLlama(
           })
       })
       used.push(`${asset.name}（${source}）`)
-      // 有些镜像会把错误页当成 200 返回，解压前先确认确实是个 zip
-      if (!(await looksLikeZip(zip))) {
+      // 有些镜像会把错误页当成 200 返回，解压前先确认确实是个压缩包（zip / gzip）
+      if (!(await looksLikeArchive(zip))) {
         await fs.unlink(zip).catch(() => undefined)
         throw new Error(`${asset.name} 下载内容不是有效的压缩包（源：${source}），已丢弃，请重试`)
       }
@@ -1481,12 +1596,14 @@ export async function installLlama(
     const exe = await findServer(dir)
     if (!exe) {
       const files = await fs.readdir(dir).catch(() => [] as string[])
+      const server = serverFileName()
       // 只解出 cublas/cudart 这类运行库，说明拿到的不是主程序包
       const onlyRuntime =
-        files.some((f) => /^cublas/i.test(f)) && !files.some((f) => /^llama-.*\.exe$/i.test(f))
+        files.some((f) => /^cublas|^libcublas/i.test(f)) &&
+        !files.some((f) => f.toLowerCase() === server.toLowerCase())
       const msg = onlyRuntime
-        ? `解压后只有 CUDA 运行库、没有 llama-server.exe。请重试；若仍失败，展开「下载地址」手动下载主程序包解压到 ${dir}`
-        : `解压完成，但未找到 llama-server.exe（${dir} 下共 ${files.length} 个文件）`
+        ? `解压后只有 CUDA 运行库、没有 ${server}。请重试；若仍失败，展开「下载地址」手动下载主程序包解压到 ${dir}`
+        : `解压完成，但未找到 ${server}（${dir} 下共 ${files.length} 个文件）`
       emit({ kind: 'llama', receivedBytes: 0, totalBytes: 0, state: 'error', message: msg })
       return { ok: false, message: msg, dir }
     }
@@ -1504,7 +1621,9 @@ export async function installLlama(
           ? 'Vulkan 版（会使用显卡）'
           : info.backend === 'hip'
             ? 'ROCm 版（会使用显卡）'
-            : 'CPU 版（不使用显卡）'
+            : info.backend === 'metal'
+              ? 'Metal 版（会使用显卡）'
+              : 'CPU 版（不使用显卡）'
     /**
      * 装完自证：确认 llama.cpp 真的能列出显卡。
      *
@@ -1512,13 +1631,17 @@ export async function installLlama(
      * 界面写着 CUDA 版，一跑却全在 CPU 上。这里用 --list-devices 实测一次，
      * 不合格就当场说清楚，别让用户过几天自己发现显存没动。
      */
-    const gpuPkg = /-cuda-|-vulkan-|-hip-/i.test(plan.main.name)
+    // macOS 的 macos 包本身就是 Metal 版；CUDA / Vulkan / ROCm / SYCL 包同理
+    const gpuPkg =
+      isMac || /-cuda-|-vulkan-|-hip-|-rocm-|-sycl-|-openvino-/i.test(plan.main.name)
     const devices = gpuPkg ? await llamaDeviceIds() : []
     let warn = ''
     if (info.missing?.length) {
       warn =
         `\n⚠ ${info.note}\n` +
-        '如果点「一键安装」仍然缺，说明该版本没有配套的 cudart 包：手动下载 cudart-llama-bin-win-cuda-*.zip 解压到本目录即可。'
+        `如果点「一键安装」仍然缺，说明该版本没有配套的 cudart 包：手动下载 ${
+          isWin ? 'cudart-llama-bin-win-cuda-*.zip' : 'cudart-llama-<build>-bin-ubuntu-cuda-*.tar.gz'
+        } 解压到本目录即可。`
     } else if (gpuPkg && !devices.length) {
       warn =
         '\n⚠ 装的是显卡版，但 llama.cpp 现在列不出任何 GPU：多半是显卡驱动太旧，或运行库没解压到同一目录。' +
@@ -1867,73 +1990,6 @@ export async function listLocalModels(): Promise<{
 }
 
 /**
- * 删掉一个本地模型文件。
- *
- * 三道闸，缺一不可：
- * - 只能删 `.gguf`，且必须落在本程序自己的模型目录里（llama.cpp / models / core）。
- *   界面传来的路径是不可信输入，`../` 之类必须在这里挡掉，不能靠前端自觉。
- * - 正在跑的实例不管：Windows 会锁住文件，删出来只有半个残骸，还可能把进程搞崩。
- * - 配套投影器一起删。它不出现在模型列表里（扫描时就被过滤了），单独留下
- *   就是永远不会被发现的垃圾 —— 用户以为清理干净了，其实还占着几百 MB。
- */
-export async function deleteLocalModel(
-  rel: string
-): Promise<{ ok: boolean; message: string; freedBytes?: number }> {
-  const wanted = (rel || '').trim()
-  if (!wanted) return { ok: false, message: '没指定要删哪个模型' }
-
-  const abs = await resolveModelPath(wanted, true)
-  if (!abs) return { ok: false, message: `找不到这个模型：${wanted}` }
-  if (!isModelFileName(abs)) return { ok: false, message: '只允许删除 .gguf 文件' }
-
-  if (!isInsideAnyRoot([llamaRoot(), modelsRoot(), coreRoot()], abs)) {
-    return { ok: false, message: '这个文件不在本地模型目录里，程序不碰目录外的文件' }
-  }
-
-  const target = path.resolve(abs).toLowerCase()
-  const busy = [...instances.values()].find((i) => path.resolve(i.model).toLowerCase() === target)
-  if (busy) {
-    return { ok: false, message: `「${path.basename(abs)}」正在运行，先点「停止服务」再删` }
-  }
-
-  const targets = [abs]
-  const mm = await findMmprojFor(abs, undefined, { ignoreConfig: true }).catch(() => null)
-  if (mm) targets.push(mm)
-
-  let freed = 0
-  for (const t of targets) {
-    // .part 是下载中断留下的半截文件，一并清掉
-    for (const f of [t, `${t}.part`]) {
-      try {
-        const st = await fs.stat(f)
-        await fs.rm(f, { force: true })
-        if (f === t) freed += st.size
-      } catch {
-        // 不存在就跳过；删不掉（被别的程序占用）留给下面统一判断
-      }
-    }
-  }
-
-  let still = false
-  try {
-    await fs.access(abs)
-    still = true
-  } catch {
-    still = false
-  }
-  if (still) {
-    return { ok: false, message: `删除失败：${path.basename(abs)} 可能正被别的程序占用` }
-  }
-
-  const mmNote = mm ? `，同时删掉配套投影器 ${path.basename(mm)}` : ''
-  return {
-    ok: true,
-    message: `已删除 ${path.basename(abs)}（释放 ${(freed / 1024 ** 3).toFixed(1)} GB）${mmNote}`,
-    freedBytes: freed
-  }
-}
-
-/**
  * 把界面传来的模型名/路径解析成绝对路径。
  *
  * `strict` 决定「点名要 A、A 却不在」时怎么办：
@@ -1972,8 +2028,12 @@ async function resolveModelPath(wantedModel?: string, strict = false): Promise<s
 /**
  * 设备参数。
  *
- * 关键就是 `-dev`：只把层放到指定那一张卡上，llama.cpp 就不会去做跨卡切分，
- * 两张卡各跑一个模型才能真正并行（这是「双卡双模型」而不是「一个模型切两半」）。
+ * 单卡：`-dev CUDA1` —— 只把层放到那一张卡上，llama.cpp 不做跨卡切分，
+ * 两张卡各跑一个模型才能真正并行（「双卡双模型」）。
+ *
+ * 多卡：`-dev CUDA0,CUDA1 -sm layer` —— 一个模型按层切开摊到这几张卡上，
+ * 显存池是各卡之和（「双卡一模型」）。两种用法互斥：同一张卡不能既单独跑一个
+ * 模型、又参与合并。
  *
  * `-ngl` 分两种口径：
  * - `all`（默认）：写死 999。不写的话不同版本默认值不一样，可能出现「只放了一半层」。
@@ -1981,15 +2041,23 @@ async function resolveModelPath(wantedModel?: string, strict = false): Promise<s
  *   逐层试装，装到放不下为止，剩下的层留在 CPU。我们自己的静态估算做不到这么细
  *   （输出层、token_embd 往往单独成 buffer），所以这一档不自己算层数。
  *
+ * `-sm layer` 在合并时显式写出来：默认值在版本之间变过，而合并的显存账是按
+ * layer 口径算的（KV 跟着层走）。**不传 `-ts`**：让 llama.cpp 按各卡空闲显存
+ * 自动分比例 —— 我们手上的显存是探测时的快照，写死了反而更容易算错。
+ *
  * 没绑卡（设置里选「自动」）时不能直接 return []：那样既没有 `-dev` 也没有 `-ngl auto`，
  * 项目自己的分层分支就永远不生效，只能靠 llama.cpp 内置的 `--fit` 兜着。
  * 这时只给 `-ngl auto`（不带 `-dev`），多卡机器仍会按所有卡逐层分配。
  */
 function deviceArgs(device: string, ngl: 'all' | 'auto' = 'all'): string[] {
-  const d = device.trim()
-  if (!d) return ngl === 'auto' ? ['-ngl', 'auto'] : []
-  if (/^cpu$/i.test(d)) return ['-ngl', '0']
-  return ['-dev', d, '-ngl', ngl === 'auto' ? 'auto' : '999']
+  const list = deviceList(device)
+  if (!list.length) return ngl === 'auto' ? ['-ngl', 'auto'] : []
+  const gpus = list.filter((d) => !/^cpu$/i.test(d))
+  // 只有 CPU：-dev CPU 在某些构建里不认，直接关掉 offload 最稳
+  if (!gpus.length) return ['-ngl', '0']
+  const layers = ngl === 'auto' ? 'auto' : '999'
+  if (gpus.length === 1) return ['-dev', gpus[0], '-ngl', layers]
+  return ['-dev', gpus.join(','), '-sm', 'layer', '-ngl', layers]
 }
 
 export interface LlamaStartOptions {
@@ -2060,15 +2128,43 @@ export interface LlamaStartOptions {
  * 为什么不直接用显卡信息拼：`-dev` 认的是 llama.cpp 自己的设备名（CUDA0 / Vulkan1），
  * 而系统里显卡的排列顺序不一定和它一致。界面让用户从这份清单里选，就不会选错卡。
  */
-export async function listLlamaDevices(): Promise<
-  Array<{ id: string; name: string; vramMiB?: number; freeMiB?: number }>
-> {
+/**
+ * 设备清单 + 「为什么是这个结果」。
+ *
+ * 单独把诊断信息露出来，是因为空清单有两种完全不同的原因：
+ * 运行库没找到（路径问题）和后端没加载起来（驱动 / 运行库问题）。
+ * 界面过去都只显示一个空下拉，用户没法区分，只能来问「为什么看不到第二张卡」。
+ */
+
+/**
+ * 缓存 5 秒：设置页和本地模型面板会各问一次，而每次 spawn 都要初始化 CUDA（1~2 秒）。
+ * 装完运行库会走 clearGpuProbeCache 清掉，所以不会拿到装之前的旧结论。
+ */
+let devGate: { at: number; info: LlamaDevicesInfo } | null = null
+const DEVICES_TTL_MS = 5000
+
+export async function llamaDevicesInfo(refresh = false): Promise<LlamaDevicesInfo> {
+  if (!refresh && devGate && Date.now() - devGate.at < DEVICES_TTL_MS) return devGate.info
+
+  const info = llamaRootInfo()
+  const base: LlamaDevicesInfo = {
+    devices: [],
+    exe: null,
+    root: info.root,
+    primaryRoot: info.primary,
+    fallback: info.fallback,
+    raw: ''
+  }
   const exe = await findServer(llamaRoot())
-  if (!exe) return []
+  if (!exe) {
+    const out = { ...base, error: '未找到 llama-server（运行库没装，或装在别的目录）' }
+    devGate = { at: Date.now(), info: out }
+    return out
+  }
   try {
     const r = spawnSync(exe, ['--list-devices'], { encoding: 'utf8', windowsHide: true, timeout: 20000 })
     const out = `${r.stdout ?? ''}\n${r.stderr ?? ''}`
-    const rows: Array<{ id: string; name: string; vramMiB?: number; freeMiB?: number }> = []
+    const rows: LlamaDevicesInfo['devices'] = []
     for (const line of out.split(/\r?\n/)) {
       // 形如：  CUDA0: NVIDIA GeForce RTX 2080 (8191 MiB, 7113 MiB free)
       const m = line.match(/^\s*([A-Za-z]+\d+):\s*(.+?)\s*(?:\((\d+)\s*MiB,\s*(\d+)\s*MiB free\))?\s*$/)
@@ -2080,10 +2176,31 @@ export async function listLlamaDevices(): Promise<
         freeMiB: m[4] ? Number(m[4]) : undefined
       })
     }
-    return rows
-  } catch {
-    return []
+    const result: LlamaDevicesInfo = {
+      ...base,
+      devices: rows,
+      exe,
+      raw: out.trim(),
+      // 进程能跑但没有一行设备：后端没加载起来（缺 cudart / 驱动太旧 / 装的是 CPU 版）
+      error: rows.length
+        ? undefined
+        : `llama-server 没有报告任何设备（退出码 ${r.status ?? '未知'}）：后端可能没加载起来`
+    }
+    devGate = { at: Date.now(), info: result }
+    return result
+  } catch (err) {
+    const out = { ...base, exe, error: `执行 --list-devices 失败：${String((err as Error).message ?? err)}` }
+    devGate = { at: Date.now(), info: out }
+    return out
   }
+}
+
+/**
+ * `refresh=true` 绕过设备清单的 5 秒缓存。
+ * 设置页顶部「刷新」会顺带重扫显卡，多卡机器刚插卡 / 刚装完运行库时要用它。
+ */
+export async function listLlamaDevices(refresh = false): Promise<LlamaDevicesInfo['devices']> {
+  return (await llamaDevicesInfo(refresh)).devices
 }
 
 /** 当前所有实例（界面展示与「释放显存」逻辑都读它） */
@@ -2108,18 +2225,7 @@ export function llamaInstances(): Array<{
   }))
 }
 
-/**
- * 启动一个 llama.cpp 实例。
- *
- * 和以前的差别：不再「换模型就先杀进程」。判断依据是显卡绑定：
- * - 两个实例都绑了卡、且绑的不是同一张 → 允许并存（双卡双模型）
- * - 其余情况（尤其是都没绑卡）→ 先停掉别的实例，老的单卡行为不变
- */
-export async function startLlama(
-  model?: string,
-  ctxOverride?: number,
-  opts?: LlamaStartOptions
-): Promise<{
+type LlamaStartResult = {
   ok: boolean
   message: string
   model?: string
@@ -2127,7 +2233,38 @@ export async function startLlama(
   port?: number
   device?: string
   code?: LlamaErrorCode
-}> {
+}
+
+/**
+ * 启动一个 llama.cpp 实例（对外入口：串行排队，见 `enqueueStart`）。
+ *
+ * 和以前的差别：不再「换模型就先杀进程」。判断依据是显卡绑定：
+ * - 两个实例都绑了卡、且绑的不是同一张 → 允许并存（双卡双模型）
+ * - 其余情况（尤其是都没绑卡）→ 先停掉别的实例，老的单卡行为不变
+ */
+export function startLlama(
+  model?: string,
+  ctxOverride?: number,
+  opts?: LlamaStartOptions
+): Promise<LlamaStartResult> {
+  const queuedAt = Date.now()
+  return enqueueStart(async () => {
+    const waited = Date.now() - queuedAt
+    const r = await startLlamaInner(model, ctxOverride, opts)
+    // 真的排过队就要说一声：否则界面几秒没动静，看起来像「点了没反应」
+    if (waited < 700) return r
+    return {
+      ...r,
+      message: `${r.message}\n（前一次启动还没结束，排队 ${(waited / 1000).toFixed(1)} 秒后才开始）`
+    }
+  })
+}
+
+async function startLlamaInner(
+  model?: string,
+  ctxOverride?: number,
+  opts?: LlamaStartOptions
+): Promise<LlamaStartResult> {
   /**
    * 用户主动启动 / 手点档位 → 立刻叫停正在跑的自动探测。
    *
@@ -2139,7 +2276,7 @@ export async function startLlama(
 
   const dir = llamaRoot()
   const exe = await findServer(dir)
-  if (!exe) return { ok: false, code: 'BINARY_MISSING', message: '未找到 llama-server.exe，请先点「一键安装」' }
+  if (!exe) return { ok: false, code: 'BINARY_MISSING', message: `未找到 ${serverFileName()}，请先点「一键安装」` }
 
   const cfg = await loadConfig()
   const provider = opts?.providerId
@@ -2174,12 +2311,19 @@ export async function startLlama(
    * 所以「不传」不再是选项，永远显式告诉服务端要几个槽。
    */
   if (parallel <= 1) parallel = 1
-  const device = (opts?.device !== undefined ? opts.device ?? '' : provider?.device ?? '').trim()
+  /**
+   * 设备串规范化：`CUDA0, CUDA1` 和 `cuda0,cuda1` 都当成同一个卡组。
+   * 不规范化的话「合并双卡」在配置里能存出七八种写法，实例并存判定、缓存的
+   * `sameShape` 比较全都会把它们当成不同的东西。
+   */
+  const device = deviceJoin([
+    opts?.device !== undefined ? opts.device ?? '' : provider?.device ?? ''
+  ])
   const wantPort = opts?.port ?? (provider ? llamaPortOf(provider) : LLAMA_PORT)
   /**
-   * 「手动指定端口」只有两种来源：IPC 点名，或用户在设置页「实例端口」里填了值。
-   * 程序自动选中的端口只写 baseUrl、不写 provider.port，所以这里判得准 —— 留空
-   * 就一直是自动模式，重启应用也不会因为上次自动选过一次就变成「手动」。
+   * 「手动指定端口」只有两种来源：IPC 点名，或历史配置里残留的 provider.port
+   * （设置页已不再提供端口输入）。程序自动选中的端口只写 baseUrl、不写 provider.port，
+   * 所以这里判得准 —— 留空就一直是自动模式，重启应用也不会变成「手动」。
    */
   const manualPort =
     opts?.port !== undefined ||
@@ -2273,12 +2417,21 @@ export async function startLlama(
     await new Promise((r) => setTimeout(r, 400))
   }
 
-  // 再清别的实例：绑了不同显卡的留着，其余停掉。
+  // 再清别的实例：卡组完全不重叠的留着，其余停掉。
   // keepSiblings 用于「只是为了一张图重启」——那时把工人模型一起杀掉太粗暴。
   for (const other of [...instances.values()]) {
     if (other.key === key) continue
     if (opts?.keepSiblings) continue
-    if (device && other.device && other.device.toLowerCase() !== device.toLowerCase()) continue
+    /**
+     * 判据从「设备名不相等」改成「卡组不重叠」。
+     *
+     * 字符串比较在合并模式下会放过真正冲突的组合：`CUDA0,CUDA1` 和 `CUDA0`
+     * 文字上不相等，实际却抢同一张卡 —— 两个进程都往 2080 上放，后起的那个
+     * 直接 OOM，而且旧的还活着，用户看到的是「换个模型就崩」。
+     * 反向也一样：`CUDA0, CUDA1` 和 `CUDA0,CUDA1` 写法差一个空格，
+     * 文字比较判成不同卡，实际是同一组。
+     */
+    if (device && other.device && !deviceClash(device, other.device)) continue
     await stopLlama(other.key)
     // 给端口释放留一点时间
     await new Promise((r) => setTimeout(r, 400))
@@ -2352,9 +2505,10 @@ export async function startLlama(
   let autoPortNote = ''
   if (!(await waitPortFree(port))) {
     if (manualPort) {
+      // 历史配置锁死了端口：外部工具可能就按这个端口接进来，不能悄悄换掉
       return {
         ok: false,
-        message: `端口 ${port} 已被其它程序占用，无法启动。请把「实例端口」留空（自动选择空闲端口），或改填一个空闲端口。`
+        message: `端口 ${port} 已被其它程序占用，而这条实例沿用了旧配置里锁定的端口，无法自动避让。请关闭占用程序，或删除本实例重建一条（新实例会自动选空闲端口）。`
       }
     }
     const usedPorts = new Set([...instances.values()].map((i) => i.port))
@@ -2362,7 +2516,7 @@ export async function startLlama(
     if (alt === null) {
       return {
         ok: false,
-        message: `从端口 ${port} 起连续 64 个端口都被占用，找不到可用端口。请关掉占用程序，或在设置里手动指定端口。`
+        message: `从端口 ${port} 起连续 64 个端口都被占用，找不到可用端口。请关掉占用端口的程序后重试。`
       }
     }
     autoPortNote = `\n端口 ${port} 已被占用，已自动改用 ${alt}`
@@ -2378,11 +2532,17 @@ export async function startLlama(
    */
   const devices = await llamaDeviceIds()
   /**
-   * 这次要算哪张卡：绑了就用绑的，没绑（「自动」）就是第一张。
-   * 体检、KV 精度、性能分档三处都按这个号取，才不会出现
-   * 「按 0 号卡算显存、按 1 号卡定 FA」这种自相矛盾的组合。
+   * 这次的卡组：单卡是 `[CUDA1]`，合并模式是 `[CUDA0, CUDA1]`。
+   *
+   * 单卡口径（`gpuIdx`）继续用于体检的选卡与展示；性能分档（`profileIdx`）在合并时
+   * 必须取最弱那张 —— 所有卡共用一套内核参数，按强卡定 FA 会直接崩。
    */
+  const myGpus = deviceIndexes(device)
   const gpuIdx = deviceIndex(device)
+  const profileIdx = isMultiDevice(device) ? await weakestGpuIndex(myGpus) : gpuIdx
+  const multiNote = isMultiDevice(device)
+    ? `\n合并模式：${deviceList(device).join(' + ')} 一起跑同一个模型（按层切分，显存池为各卡之和）。`
+    : ''
   let gpuNote = ''
   if (!devices.length) {
     const info = await detectBackend()
@@ -2402,16 +2562,24 @@ export async function startLlama(
       }
     }
     gpuNote = `\n⚠ 这台机器上 llama.cpp 没有可用 GPU（${why}），本次是纯 CPU 运行：不占显存，速度慢 5～10 倍。`
-  } else if (device && !devices.some((d) => d.toLowerCase() === device.toLowerCase())) {
-    return {
-      ok: false,
-      code: 'GPU_UNAVAILABLE',
-      message: `llama.cpp 只认到 ${devices.join('、')}，没有 ${device}。请在设置里重新选一张卡，或改成自动。`
-    }
   } else {
+    /**
+     * 合并模式必须每张卡都在清单里：少一张就退化成单卡静默跑，
+     * 用户看到的是「开了合并还是只有 8G」，比直接报错难查得多。
+     */
+    const missing = deviceList(device).filter(
+      (d) => !/^cpu$/i.test(d) && !devices.some((x) => x.toLowerCase() === d.toLowerCase())
+    )
+    if (missing.length) {
+      return {
+        ok: false,
+        code: 'GPU_UNAVAILABLE',
+        message: `llama.cpp 只认到 ${devices.join('、')}，没有 ${missing.join('、')}。请在设置里重新选卡，或改成自动。`
+      }
+    }
     // 有 GPU：把按显卡分档的策略说明写进日志，让「为什么这卡没开 FA」这类问题有据可查
-    const note = await gpuProfileNote(gpuIdx)
-    if (note) gpuNote = `\n性能档位：${note}`
+    const note = await gpuProfileNote(profileIdx)
+    if (note) gpuNote = `\n性能档位：${note}${multiNote}`
     /**
      * 驱动 / 包不匹配这类问题要在**装之前**说，而不是等 `--list-devices` 空掉再猜。
      * 典型两种：驱动只支持到 CUDA 11.x 却装了 CUDA 12 包；RTX 50 配了 12.4 的运行时。
@@ -2419,6 +2587,28 @@ export async function startLlama(
     const probe = detectGpuPreference()
     if (probe.warnings?.length) gpuNote += `\n⚠ ${probe.warnings.join('\n⚠ ')}`
   }
+
+  /**
+   * 合并模式的显存池（GB）= 这几张卡**容量**之和。
+   *
+   * 体检（vramfit）只认单卡，所以用它的 `--vram` 假设题入口把总容量喂进去。
+   * 口径必须和单卡一致：单卡按物理容量算，多卡却按「当前空闲」求和的话，
+   * 同一个模型会变成「卡越多、结论越悲观」—— 开个游戏就能让第二张卡凭空消失。
+   * 拿不到设备清单时返回 null，体检就退回单卡口径 —— 不要凭空编一个 16G。
+   */
+  const poolGb = isMultiDevice(device)
+    ? await (async (): Promise<number | null> => {
+        const info = await llamaDevicesInfo().catch(() => null)
+        if (!info?.devices?.length) return null
+        let sum = 0
+        for (const d of deviceList(device)) {
+          const hit = info.devices.find((x) => x.id.toLowerCase() === d.toLowerCase())
+          if (!hit) continue
+          sum += hit.vramMiB ?? hit.freeMiB ?? 0
+        }
+        return sum > 0 ? sum / 1024 : null
+      })()
+    : null
 
   try {
     // 上下文长度定夺，优先级：调用方点名 > 实测过的档位 > 体检建议 > 配置上限。
@@ -2456,16 +2646,16 @@ export async function startLlama(
        * 无条件生效 —— 用户点一个装不下的档，进程直接 OOM 退出，界面上只看到
        * 「启动后立刻退出」，看不出是显存问题。多花这 200 毫秒换来一句准确的原因。
        */
-      fitInfo = await fitForLaunch(full, gpuIdx, await launchKvType(gpuIdx), availableMmproj).catch(() => null)
+      fitInfo = await fitForLaunch(full, gpuIdx, await launchKvType(profileIdx), availableMmproj, poolGb).catch(() => null)
     } else {
       ctx = await serverCtx(provider?.id)
       // KV 精度必须和真正要启动的参数一致，否则体检会低估一档（详见 launchKvType）
-      const kvType = await launchKvType(gpuIdx)
+      const kvType = await launchKvType(profileIdx)
       /**
        * 体检带上投影器：默认是纯文本启动，但用户随时可能发一张图，
        * 那时会自动重启挂上 mmproj，多出来的 300~700 MiB 会把「32K 装得下」变成 OOM。
        */
-      const fit = await fitForLaunch(full, gpuIdx, kvType, availableMmproj).catch(() => null)
+      const fit = await fitForLaunch(full, gpuIdx, kvType, availableMmproj, poolGb).catch(() => null)
       fitInfo = fit
 
       /**
@@ -2644,20 +2834,25 @@ export async function startLlama(
      *
      * vramfit 缺失 / 元数据读不懂时 `fitInfo.limitMiB` 是 null，于是
      * 「文件比预算大就分层」这条硬判据会静默失效 —— 8.38 GB 的 14B 在 8 GB 卡上
-     * 直接按 `-ngl all` 起，OOM。这里用 nvidia-smi 按体检同一套系数
-     * （(总量 − 已用) × 0.92，拿不到已用就按总量 × 0.8）补一个，判据就不会空转。
+     * 直接按 `-ngl all` 起，OOM。这里按体检的静态口径（总量 × 0.94）补一个，
+     * 判据就不会空转。
+     *
+     * 曾经按「(总量 − 已用) × 0.92」算：同一台机器上开一局游戏，预算就从 7.5 GB
+     * 掉到 0.2 GB，一个本来能跑的模型被判成「装不下」（于是强制分层、跑成个位数 tok/s）。
+     * 而游戏退出、显存记回空闲之后，那块显存其实已被换页打散，速度并不会回来 ——
+     * 读数涨落的方向和真实快慢并不一致，所以不拿它当判据。
      */
     let devBudgetMiB: number | null = null
     if (!fitInfo?.limitMiB && devices.length) {
       const nv = nvidiaGpuInfo()
-      const card = nv.gpus[gpuIdx] ?? nv.gpus[0] ?? null
-      const totalMiB = card?.vramMB ?? null
-      if (totalMiB) {
-        const used = await sampleUsedMiB(gpuIdx).catch(() => null)
-        devBudgetMiB = used?.usedMiB != null
-          ? Math.round((totalMiB - used.usedMiB) * 0.92)
-          : Math.round(totalMiB * 0.8)
-      }
+      /**
+       * 合并模式按卡组求和：只看第一张卡会把「16G 装得下」判成「8G 装不下」，
+       * 结果是明明能全量上卡，却被强制分层跑成 3 tok/s。
+       */
+      const cards = myGpus.map((i) => nv.gpus[i]).filter(Boolean)
+      const pool = cards.length ? cards : [nv.gpus[gpuIdx] ?? nv.gpus[0]].filter(Boolean)
+      const totalMiB = pool.reduce((s, c) => s + (c?.vramMB ?? 0), 0) || null
+      if (totalMiB) devBudgetMiB = Math.round(totalMiB * 0.94)
     }
     /**
      * `fits` 只回答「权重能不能全进显存」，不回答「这一档上下文装不装得下」。
@@ -2668,9 +2863,21 @@ export async function startLlama(
      * 这次的 ctx 超过体检给的「最大可装档」，同样要分层。
      */
     const ctxOverBudget = Boolean(fitInfo?.recommendedCtx && ctx > fitInfo.recommendedCtx)
+    /**
+     * 静态预算说的是「这张卡最多能开到哪」，不回答「现在腾不腾得出这些」。
+     * 全量上卡还有一条硬门槛：模型文件本身得先放得进**此刻**空出来的显存。
+     * 桌上压着游戏时静态口径仍报 fits=true，照它 `-ngl all` 起就是一次必定的失败
+     * （cudaMalloc 直接退出），或者被 WDDM 换页拖成 1.x tok/s。
+     *
+     * 这道闸只认现实、且只在「确实腾不出来」时生效 —— 它不改报告里的静态结论，
+     * 也不会因为别的程序开开关关就把档位改来改去。
+     */
+    const freeNowMiB = fitInfo?.freeMiB ?? null
+    const fileMiB = modelStat?.size ? modelStat.size / 1024 ** 2 : null
+    const cannotFitNow = freeNowMiB !== null && fileMiB !== null && fileMiB > freeNowMiB * 0.98
     const partialOffload = shouldPartialOffload({
       mode: layerMode,
-      fits: fitInfo ? fitInfo.fits && !ctxOverBudget : undefined,
+      fits: fitInfo ? fitInfo.fits && !ctxOverBudget && !cannotFitNow : undefined,
       device,
       probing: !!probeSeed,
       gpuAvailable: devices.length > 0,
@@ -2683,10 +2890,14 @@ export async function startLlama(
         ? `\n部分卸载：${Math.round(ctx / 1024)}K 这一档的上下文超出可用显存` +
           `（体检建议最大 ${Math.round((fitInfo?.recommendedCtx ?? ctx) / 1024)}K），已改为按显存逐层分配。` +
           '\n想全部放显存（最快）就点小一档；点了大档又不想慢，只能换小一点的模型或量化。'
-        : `\n部分卸载：${fitInfo?.gpuName ?? (device || devices[0] || '显卡')} 放不下这个模型的全部权重，已改为按显存逐层分配` +
-          `（约占 ${Math.round((fitInfo?.limitMiB ?? 0) / 1024)} GB 显存，其余层留在内存/CPU）。` +
-          '\n速度取决于有多少层落到 CPU：留得越多越慢。实测 9B 只放 2.5 GB 上卡时约 3 tok/s，' +
-          '放得多会明显好转；想稳定快就换更小的量化或模型。'
+        : cannotFitNow
+          ? `\n部分卸载：当前只剩 ${Math.round((freeNowMiB ?? 0) / 1024)} GB 空闲显存` +
+            `（这张卡共 ${Math.round((fitInfo?.totalMiB ?? 0) / 1024)} GB，其余被别的程序占着），` +
+            `这个模型全量上卡放不下，已改为按显存逐层分配。关掉那些程序再重启模型可以全量上卡。`
+          : `\n部分卸载：${fitInfo?.gpuName ?? (device || devices[0] || '显卡')} 放不下这个模型的全部权重，已改为按显存逐层分配` +
+            `（约占 ${Math.round((fitInfo?.limitMiB ?? 0) / 1024)} GB 显存，其余层留在内存/CPU）。` +
+            '\n速度取决于有多少层落到 CPU：留得越多越慢。实测 9B 只放 2.5 GB 上卡时约 3 tok/s，' +
+            '放得多会明显好转；想稳定快就换更小的量化或模型。'
     }
     const args = [
       '-m',
@@ -2752,8 +2963,8 @@ export async function startLlama(
        *   这三项（以及 -ub）现在统一由 `gpuProfile()` 按显卡分档：cc≥8 全开 + ub 1024；
        *   Turing（cc<8）只保留 -ctk；Vulkan/CPU 全不加。环境变量仍可覆盖。
        */
-      ...(await perfArgs(gpuIdx)),
-      ...(await ubArgs(gpuIdx)),
+      ...(await perfArgs(profileIdx)),
+      ...(await ubArgs(profileIdx)),
       ...(await draftArgs(full)),
       ...cacheReuseArgs(),
       /**
@@ -2789,7 +3000,7 @@ export async function startLlama(
      * 就绪后再量一次，两次的差值就是这个模型真实吃掉的那部分 —— 比任何估算都准。
      * 采样要在旧实例已经停掉之后：否则量到的是新旧两份模型的叠加大头。
      */
-    const baseUse = devices.length ? await sampleUsedMiB(gpuIdx).catch(() => null) : null
+    const baseUse = devices.length ? await sampleUsedAny(myGpus).catch(() => null) : null
 
     const inst = launch({ key, exe, args, port, model: full, mmproj, device, ctx, parallel, partial: partialOffload })
     // 手动启动，说明「已空闲卸载」这条记录过期了
@@ -3014,7 +3225,7 @@ async function tuneAfterReady(a: {
   try {
     // 分配有先后：权重、KV、计算缓冲不是同一刻申请的，等服务应答后稍等一下再量才准
     await new Promise((r) => setTimeout(r, 1500))
-    const after = await sampleUsedMiB(deviceIndex(a.inst.device)).catch(() => null)
+    const after = await sampleUsedAny(deviceIndexes(a.inst.device)).catch(() => null)
     if (!after || instances.get(a.key) !== a.inst) return
     const footMiB = after.usedMiB - a.baseUsedMiB
     // 差值必须显著大于噪声：别的进程刚好退出会让差值变小甚至为负
@@ -3034,19 +3245,33 @@ async function tuneAfterReady(a: {
       return
     }
 
+    /**
+     * 调档用的「可用上限」不能直接拿体检的预算。
+     *
+     * 体检现在按物理容量算（口径稳定，不随别的程序开合跳），但真跑起来能占多少，
+     * 还取决于启动那一刻桌上压着什么：`baseUsedMiB`（启动前已用）就是别人的份额，
+     * 总量扣掉它才是这个模型真正能拿到的。静态预算只回答「物理上最多到哪」，
+     * 真实余量比它小时往上升档就是主动去撞换页 —— 表现是速度掉到个位数、进程却不报错。
+     * 取两者的小值：不超过静态预算（稳定），也不超过实际空出来的（安全）。
+     */
+    const realRoomMiB = after.totalMiB > 0 && a.baseUsedMiB !== null
+      ? Math.max(0, after.totalMiB - a.baseUsedMiB)
+      : null
+    const budgetMiB = realRoomMiB === null ? a.fit.limitMiB : Math.min(a.fit.limitMiB, realRoomMiB)
+
     const pick = bestTier({
       probe: { ctx: a.ctx, footMiB },
       kvMiBPerK: a.fit.kvMiBPerKToken,
-      limitMiB: a.fit.limitMiB,
+      limitMiB: budgetMiB,
       reserveMiB: RESERVE_MIB,
       nativeCtx: a.fit.nativeCtx
     })
     if (pick.ctx === a.ctx) {
-      const room = a.fit.limitMiB - footMiB - RESERVE_MIB
+      const room = budgetMiB - footMiB - RESERVE_MIB
       /**
        * 体检的「预算」和真实剩余显存要分开看。
        *
-       * `limitMiB` 是启动前的 free×0.92；模型跑起来之后桌面合成器还会继续涨，
+       * `limitMiB` 是按总容量算的静态预算，模型跑起来之后桌面合成器还会继续涨；
        * 实测 8 GB 卡分层加载后只剩 124 MiB —— 这时 WDDM 不会崩，而是悄悄换页，
        * 表现为速度从 5 tok/s 掉到 1.x。所以这里量一次真实空闲，低于 384 MiB 就明说。
        */
@@ -3069,7 +3294,7 @@ async function tuneAfterReady(a: {
       a.providerId,
       `${up ? '升档' : '降档'}：实测 ${Math.round(a.ctx / 1024)}K 占用 ${footMiB} MiB，` +
         `按每 1K tokens ${a.fit.kvMiBPerKToken.toFixed(0)} MiB 算，` +
-        `${Math.round(pick.ctx / 1024)}K 预计 ${Math.round(pick.footMiB)} MiB / 上限 ${a.fit.limitMiB} MiB，正在重启…`
+        `${Math.round(pick.ctx / 1024)}K 预计 ${Math.round(pick.footMiB)} MiB / 上限 ${budgetMiB} MiB，正在重启…`
     )
     // 重启这条路必须自己先停：同一个端口上不能有两个 server
     await stopLlama(a.providerId)
@@ -3095,7 +3320,7 @@ async function tuneAfterReady(a: {
     tuneNotes.set(
       a.providerId,
       `实测：${Math.round(a.ctx / 1024)}K 占用 ${footMiB} MiB → 已${up ? '升' : '降'}到 ${Math.round(pick.ctx / 1024)}K` +
-        `（预计 ${Math.round(pick.footMiB)} MiB / 上限 ${a.fit.limitMiB} MiB）`
+        `（预计 ${Math.round(pick.footMiB)} MiB / 上限 ${budgetMiB} MiB）`
     )
   } catch {
     // 调档是锦上添花：任何一步失败都不能影响已经跑起来的服务
@@ -3165,18 +3390,47 @@ async function probeInfer(port: number): Promise<{ ok: boolean; tokPerSec: numbe
 }
 
 /**
+ * 一组卡的合计显存占用。
+ *
+ * 合并模式下「这个模型吃了多少显存」必须把几张卡加起来：只看第一张，
+ * 算出来的占用只有真实值的一半，调档会一路往高抬，最后 OOM。
+ * 单卡时直接透传，省掉求和与额外采样。
+ */
+async function sampleUsedAny(
+  indexes: number[]
+): Promise<{ usedMiB: number; totalMiB: number } | null> {
+  const list = indexes.length ? indexes : [0]
+  if (list.length === 1) return await sampleUsedMiB(list[0]).catch(() => null)
+  let usedMiB = 0
+  let totalMiB = 0
+  let got = false
+  for (const i of list) {
+    const s = await sampleUsedMiB(i).catch(() => null)
+    if (!s) continue
+    got = true
+    usedMiB += s.usedMiB
+    totalMiB += s.totalMiB
+  }
+  return got ? { usedMiB, totalMiB } : null
+}
+
+/**
  * 等显存回落到安静状态。
  *
  * OOM 退出后显存不会立刻回收。紧接着量基线，会量到上一轮的残留，
  * 于是 `footMiB` 偏小 → 误判「还能再高一档」→ 再崩一次。连续两次采样
  * 变化小于 200 MiB 才认为稳定。
+ *
+ * 传数组时等的是「卡组里每一张都安静」：合并模式只等主卡，副卡还在回收时
+ * 量出来的差值是假的。
  */
-async function waitGpuQuiet(gpuIdx: number, timeoutMs = 5000): Promise<void> {
+async function waitGpuQuiet(gpuIdx: number | number[], timeoutMs = 5000): Promise<void> {
+  const indexes = Array.isArray(gpuIdx) ? gpuIdx : [gpuIdx]
   const deadline = Date.now() + timeoutMs
   let prev: number | null = null
   let stable = 0
   while (Date.now() < deadline) {
-    const s = await sampleUsedMiB(gpuIdx).catch(() => null)
+    const s = await sampleUsedAny(indexes).catch(() => null)
     if (s) {
       if (prev !== null && Math.abs(s.usedMiB - prev) < 200) stable++
       else stable = 0
@@ -3328,7 +3582,8 @@ async function startProbeChain(a: {
   probeRunning.add(a.key)
   probingKeys.add(a.key)
   const gen = ++probeGen
-  const gpuIdx = deviceIndex(a.inst.device)
+  // 合并模式下这里是一组卡：基线、占用、安静判定都得按整组算（见 sampleUsedAny）
+  const gpuIdx = deviceIndexes(a.inst.device)
   const noteKey = a.providerId ?? a.key
   /** 探测链当前请求的档位：verify 要用它和 /props 的真实值比对 */
   let wantCtx = a.firstCtx
@@ -3360,7 +3615,7 @@ async function startProbeChain(a: {
       // 那样等于没重启，判据还会对着旧进程算
       await stopLlama(a.key)
       await waitGpuQuiet(gpuIdx)
-      const sample = await sampleUsedMiB(gpuIdx).catch(() => null)
+      const sample = await sampleUsedAny(gpuIdx).catch(() => null)
       baseUsed = sample?.usedMiB ?? null
       const r = await startLlama(a.model, nextCtx, {
         providerId: a.providerId,
@@ -3374,7 +3629,7 @@ async function startProbeChain(a: {
     verify: (port: number) =>
       verifyLlamaReady(port, wantCtx, () => instances.has(a.key), () => gen !== probeGen),
     measure: async () => {
-      const sample = await sampleUsedMiB(gpuIdx).catch(() => null)
+      const sample = await sampleUsedAny(gpuIdx).catch(() => null)
       if (!sample || baseUsed === null) return null
       const foot = sample.usedMiB - baseUsed
       // 差值太小说明量到的是噪声（别的进程刚好退出），这份数据不能用来外推
@@ -3614,9 +3869,11 @@ function explainCrashTail(tail: string): string | null {
     )
   }
   const dll = tail.match(/\b(cublasLt64_\d+|cublas64_\d+|cudart64_\d+)\.dll/i)
-  if (dll) {
+  const so = tail.match(/\b(libcublasLt\.so[\d.]*|libcublas\.so[\d.]*|libcudart\.so[\d.]*)/i)
+  if (dll || so) {
+    const lib = dll ? `${dll[1]}.dll` : so![1]
     return (
-      `缺 CUDA 运行库 ${dll[1]}.dll：只有 ggml-cuda.dll 是不够的。\n` +
+      `缺 CUDA 运行库 ${lib}：只有 ggml-cuda 后端是不够的。\n` +
       '点「一键安装」会单独下载 cudart 包补齐；也可以手动解压到 llama.cpp/ 目录。'
     )
   }
@@ -3624,7 +3881,7 @@ function explainCrashTail(tail: string): string | null {
     return '模型文件读不出来：多半是下载不完整或文件损坏，重新下载这个模型。'
   }
   if (/address already in use|port .*in use/i.test(tail)) {
-    return '实例端口被别的程序占用了：到设置里换个端口，或把「实例端口」留空让程序自动选。'
+    return '实例端口被别的程序占用了：程序会自动改用空闲端口；若仍失败，请关掉占用端口的程序后重试。'
   }
   return null
 }
@@ -3870,6 +4127,23 @@ const idleWatcher = createIdleWatcher({
     // 0 = 关闭；其它值按分钟换算。读到配置失败时按「不卸载」处理，避免误杀
     const min = cfg ? Number(cfg.llamaIdleMin ?? 10) : 0
     return Number.isFinite(min) && min > 0 ? min * 60_000 : 0
+  },
+  /**
+   * 整池保活：子智能体 + 当前主模型归到同一组，池内任一在忙就整池不卸、全闲一起卸。
+   * 判据和 workerPool 同源（shared/agentpool.subAgentKeepAliveIds）。
+   * 主模型必须算进来：只聊主模型时子闲着会被卸、子跑长任务时主闲着也会被卸。
+   *
+   * 旧逻辑不认绑卡也不认角色，闲置到点逐个停 —— 双卡并行会在用户毫无察觉时
+   * 静默失效（workerPlan 查到「没运行」就回落主模型），而 warmWorker 只在切模型
+   * 时跑一次，不会自动补。配置每轮现读，改设置立刻生效，不用维护额外状态。
+   */
+  groupOf: async () => {
+    const cfg = await loadConfig().catch(() => null)
+    const map: Record<string, string> = {}
+    for (const id of subAgentKeepAliveIds(cfg?.providers ?? [], cfg?.activeId ?? null)) {
+      map[id] = 'agents'
+    }
+    return map
   }
 })
 
@@ -3880,6 +4154,16 @@ export function startIdleUnload(): void {
 
 export function stopIdleUnload(): void {
   idleWatcher.stop()
+}
+
+/**
+ * 任务在等用户（审批 / 提问）时没有在途请求，`/slots` 也是空闲的。
+ *
+ * 不显式打点的话，一个 10 分钟的审批弹窗就足以让空闲卸载把模型停掉：
+ * 用户点完「允许」，下一句就是「llama.cpp 的进程不在了」。
+ */
+export function touchIdle(key: string): void {
+  idleWatcher.touch(key)
 }
 
 /** 被空闲回收的实例（界面显示「已卸载，下次发消息自动加载」用） */
@@ -4063,8 +4347,8 @@ async function liveVramOf(key: string, device: string): Promise<LlamaStatus['vra
   // 只有 CUDA 后端才问 nvidia-smi；Vulkan/CPU/自动选卡都拿不到准确数字，别硬报
   const d = device.trim().toLowerCase()
   if (d && !d.startsWith('cuda')) return undefined
-  const idx = deviceIndex(device)
-  const s = await gpuUsedMiB(idx).catch(() => null)
+  // 合并模式报卡组合计：只报第一张卡会把 16G 的池显示成 8G，用户以为没合并成功
+  const s = await sampleUsedAny(deviceIndexes(device)).catch(() => null)
   if (!s) return undefined
   const out = { usedMiB: s.usedMiB, totalMiB: s.totalMiB, at: Date.now() }
   vramGate.set(key, out)

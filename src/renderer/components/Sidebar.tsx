@@ -1,6 +1,7 @@
 import { t as tr } from '../i18n'
 import { useCallback, useEffect, useRef, useState } from 'react'
-import type { CSSProperties } from 'react'
+import type { CSSProperties, ReactNode } from 'react'
+import { createPortal } from 'react-dom'
 import type { SessionHit, SessionMeta } from '../../shared/types'
 
 interface Props {
@@ -21,6 +22,10 @@ interface Props {
    * 传这个值就能让机器人图标「立刻」亮起来，不必等轮询。
    */
   runningId?: string | null
+  /** 侧栏底部版本号右侧的自定义操作区（语言切换、软件设置等） */
+  footActions?: ReactNode
+  /** 通知（打开工作区文件夹失败时用） */
+  onNotify?: (message: string, kind?: 'info' | 'warn' | 'error') => void
 }
 
 interface Group {
@@ -188,7 +193,9 @@ export function Sidebar({
   onNewIn,
   onNewWorkspace,
   onOpenSkills,
-  runningId = null
+  runningId = null,
+  footActions,
+  onNotify
 }: Props) {
   const groups = groupSessions(sessions, currentWorkspace)
   /** 左侧整条侧栏是否展开；收起后只留一条竖排文件夹的窄边 */
@@ -202,7 +209,55 @@ export function Sidebar({
   const [version, setVersion] = useState('')
   /** 哪条会话在跑（key 是 sessionId）：列表里给那条加个机器人，一眼看出谁在干活 */
   const [liveSessions, setLiveSessions] = useState<Map<string, 'running' | 'queued'>>(new Map())
+  /** 哪些会话此刻有子 agent 在跑：这些会话在绿色主机器人旁再挂一枚紫色机器人 */
+  const [subAgentSessions, setSubAgentSessions] = useState<Set<string>>(new Set())
   const timer = useRef<number | null>(null)
+  /** 工作区右键菜单：记录点的是哪个分组 + 鼠标屏幕坐标 */
+  const [wsMenu, setWsMenu] = useState<{
+    group: Group
+    x: number
+    y: number
+  } | null>(null)
+  const wsMenuRef = useRef<HTMLDivElement | null>(null)
+
+  // 右键菜单：点菜单外、按 Esc、滚动或窗口变化时关掉
+  useEffect(() => {
+    if (!wsMenu) return
+    const onDown = (e: MouseEvent) => {
+      if (wsMenuRef.current?.contains(e.target as Node)) return
+      setWsMenu(null)
+    }
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setWsMenu(null)
+    }
+    const close = () => setWsMenu(null)
+    window.addEventListener('mousedown', onDown, true)
+    window.addEventListener('contextmenu', onDown, true)
+    window.addEventListener('keydown', onKey)
+    window.addEventListener('resize', close)
+    window.addEventListener('blur', close)
+    return () => {
+      window.removeEventListener('mousedown', onDown, true)
+      window.removeEventListener('contextmenu', onDown, true)
+      window.removeEventListener('keydown', onKey)
+      window.removeEventListener('resize', close)
+      window.removeEventListener('blur', close)
+    }
+  }, [wsMenu])
+
+  /** 打开工作区文件夹：用系统文件管理器打开这个工作区目录 */
+  const openWorkspaceFolder = useCallback(
+    async (ws: string | null) => {
+      if (!ws) return
+      try {
+        const r = await window.pico.shell.openPath(ws)
+        if (!r.ok) onNotify?.(tr("打不开文件夹 {0}：{1}", { "0": baseName(ws), "1": r.message ?? tr("路径可能已不存在") }), 'error')
+      } catch (err) {
+        onNotify?.(tr("打不开文件夹 {0}：{1}", { "0": baseName(ws), "1": (err as Error).message }), 'error')
+      }
+    },
+    [onNotify]
+  )
 
   useEffect(() => {
     let alive = true
@@ -212,14 +267,16 @@ export function Sidebar({
         if (alive) setVersion(i.version)
       })
       .catch(() => undefined)
-    // 轮询而不是订阅：引擎里就是一个 Map，5 秒问一次比铺一条事件通道划算，
-    // 而且定时任务是后台跑的，界面没收到事件也必须能亮灯
+    // 状态以轮询为准：引擎里就是一个 Map，5 秒问一次比铺一条事件通道划算，
+    // 而且定时任务是后台跑的，界面没收到事件也必须能亮灯。
+    // 只有「子 agent 启停」额外借事件触发一次即时复查（见下面的 off）。
     const tick = (): void => {
       void window.pico.agents
         .running()
         .then((runs) => {
           if (!alive) return
           const nextSessions = new Map<string, 'running' | 'queued'>()
+          const nextSub = new Set<string>()
           for (const r of runs) {
             // 会话维度：不看 agentId，用户自己发的对话也要亮机器人
             if (!r.sessionId) continue
@@ -228,16 +285,25 @@ export function Sidebar({
             if (!(st === 'queued' && nextSessions.get(r.sessionId) === 'running')) {
               nextSessions.set(r.sessionId, st)
             }
+            // 子 agent 借父会话的锁跑，引擎把它记在同一条 run 上
+            if ((r.subagents ?? 0) > 0) nextSub.add(r.sessionId)
           }
           setLiveSessions(nextSessions)
+          setSubAgentSessions(nextSub)
         })
         .catch(() => undefined)
     }
     tick()
     const poll = window.setInterval(tick, 5000)
+    // 子 agent 常常只跑几秒，干等下一次轮询会看不见。启停事件一到就补一次查询：
+    // 引擎那边是先改计数再发事件，所以查到的肯定是最新状态。
+    const off = window.pico.onEvent(({ event }) => {
+      if (event.type === 'subagent_start' || event.type === 'subagent_end') tick()
+    })
     return () => {
       alive = false
       window.clearInterval(poll)
+      off()
     }
   }, [])
 
@@ -290,6 +356,9 @@ export function Sidebar({
     }
     return queued ? 'queued' : undefined
   }
+
+  /** 组里有没有子 agent 在跑：分组折叠 / 侧栏收起时也要把第二枚机器人带出来 */
+  const subOfGroup = (g: Group): boolean => g.sessions.some((s) => subAgentSessions.has(s.id))
 
   /** 窄条放不下所有工作区时，优先摆「有会话在跑」的组，别把闪烁机器人挤没了 */
   const railGroups = groups.length <= 6
@@ -386,6 +455,19 @@ export function Sidebar({
                 className={`ws-group-head ${active ? 'active' : ''}`}
                 title={tr("{full}\n点击{1}", { full: g.full, "1": isCollapsed ? tr("展开") : tr("折叠") })}
                 onClick={() => toggle(g.key)}
+                onContextMenu={(e) => {
+                  e.preventDefault()
+                  e.stopPropagation()
+                  // 菜单 portal 到 body：按视窗边界收一下，靠右/靠下时不会被裁出屏幕
+                  const PAD = 8
+                  const EST_W = 168
+                  const EST_H = 158
+                  setWsMenu({
+                    group: g,
+                    x: Math.max(PAD, Math.min(e.clientX, window.innerWidth - EST_W - PAD)),
+                    y: Math.max(PAD, Math.min(e.clientY, window.innerHeight - EST_H - PAD))
+                  })
+                }}
                 role="button"
                 tabIndex={0}
                 onKeyDown={(e) => {
@@ -410,9 +492,18 @@ export function Sidebar({
                   <FolderIcon />
                   {groupLive && (
                     <span
-                      className={`ws-live-badge ${groupLive}`}
+                      className={`ws-live-badge ${groupLive} ${subOfGroup(g) ? 'has-sub' : ''}`}
                       title={groupLive === 'running' ? tr("这个工作区有会话正在工作") : tr("这个工作区有会话在排队")}
                       aria-label={groupLive === 'running' ? tr("正在工作") : tr("排队中")}
+                    >
+                      <RobotIcon />
+                    </span>
+                  )}
+                  {groupLive && subOfGroup(g) && (
+                    <span
+                      className="ws-sub-badge"
+                      title={tr("这个工作区有子 agent 在工作")}
+                      aria-label={tr("子 agent 正在工作")}
                     >
                       <RobotIcon />
                     </span>
@@ -476,6 +567,17 @@ export function Sidebar({
                             <RobotIcon />
                           </span>
                         )}
+                        {/* 主 agent 的绿色机器人照旧，子 agent 在旁边再挂一枚紫色的。
+                            类名别用 subagent：那会撞上聊天区子 agent 卡片的样式，给图标套个大框 */}
+                        {live && subAgentSessions.has(s.id) && (
+                          <span
+                            className="session-live is-sub"
+                            title={tr("这条会话有子 agent 在独立工作")}
+                            aria-label={tr("子 agent 正在工作")}
+                          >
+                            <RobotIcon />
+                          </span>
+                        )}
                         {s.forkedFrom && (
                           <span
                             className="session-fork"
@@ -510,18 +612,41 @@ export function Sidebar({
       </div>
 
       <div className="sidebar-foot">
-        <button
-          className="new-btn"
-          onClick={() => onNewIn(currentWorkspace)}
-          title={tr("在当前工作区下新建会话")}
-        >
-          {tr("+ 新建对话")}</button>
-        <button className="new-ws-btn" onClick={onNewWorkspace} title={tr("选择一个新目录，并在其中开始会话")}>
-          {tr("+ 新的工作区")}</button>
+        <div className="sidebar-new-row">
+          <button
+            className="new-btn"
+            onClick={() => onNewIn(currentWorkspace)}
+            title={tr("在当前工作区下新建会话")}
+            aria-label={tr("在当前工作区下新建会话")}
+          >
+            <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+              <path d="M8 3v10M3 8h10" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+            </svg>
+          </button>
+          <button
+            className="new-ws-btn"
+            onClick={onNewWorkspace}
+            title={tr("选择一个新目录，并在其中开始会话")}
+            aria-label={tr("选择一个新目录，并在其中开始会话")}
+          >
+            <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+              <path
+                d="M1.6 4.3c0-.6.5-1.1 1.1-1.1h3l1.3 1.6h6.3c.6 0 1.1.5 1.1 1.1v5.8c0 .6-.5 1.1-1.1 1.1H2.7c-.6 0-1.1-.5-1.1-1.1V4.3Z"
+                stroke="currentColor"
+                strokeWidth="1.2"
+                strokeLinejoin="round"
+              />
+              <path d="M8 7v3.2M6.4 8.6h3.2" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" />
+            </svg>
+          </button>
+        </div>
 
         <div className="foot-meta">
           <span>{tr("本地模型 · 线上 API")}</span>
-          <span>{version ? `v${version}` : ''}</span>
+          <span className="foot-meta-right">
+            <span>{version ? `v${version}` : ''}</span>
+            {footActions}
+          </span>
         </div>
       </div>
 
@@ -582,7 +707,10 @@ export function Sidebar({
                 title={`${g.full}${live === 'running' ? `\n${tr("这个工作区有会话正在工作")}` : live === 'queued' ? `\n${tr("这个工作区有会话在排队")}` : ''}`}
               >
                 <FolderIcon size={16} />
-                {live && <span className={`rail-robot ${live}`}><RobotIcon /></span>}
+                {live && <span className={`rail-robot ${live} ${subOfGroup(g) ? 'has-sub' : ''}`}><RobotIcon /></span>}
+                {live && subOfGroup(g) && (
+                  <span className="rail-sub" aria-label={tr("子 agent 正在工作")}><RobotIcon /></span>
+                )}
               </span>
             )
           })}
@@ -590,6 +718,64 @@ export function Sidebar({
         </span>
         <span className="rail-title-v">{tr("会话列表")}</span>
       </button>
+
+      {wsMenu &&
+        createPortal(
+          <div
+            className="ws-ctx-menu"
+            ref={wsMenuRef}
+            style={{ left: wsMenu.x, top: wsMenu.y }}
+            role="menu"
+            onContextMenu={(e) => e.preventDefault()}
+          >
+            <div className="ws-ctx-title" title={wsMenu.group.full}>{wsMenu.group.label}</div>
+            <button
+              type="button"
+              role="menuitem"
+              className="ws-ctx-item"
+              disabled={!wsMenu.group.workspace}
+              onClick={() => {
+                void openWorkspaceFolder(wsMenu.group.workspace)
+                setWsMenu(null)
+              }}
+            >
+              <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                <path d="M2 4.2h4l1.3 1.6H14v6.2H2z" stroke="currentColor" strokeWidth="1.2" strokeLinejoin="round" />
+              </svg>
+              <span>{tr("打开文件夹")}</span>
+            </button>
+            <button
+              type="button"
+              role="menuitem"
+              className="ws-ctx-item"
+              onClick={() => {
+                onNewIn(wsMenu.group.workspace)
+                setWsMenu(null)
+              }}
+            >
+              <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                <path d="M8 3v10M3 8h10" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
+              </svg>
+              <span>{tr("新建对话")}</span>
+            </button>
+            <div className="ws-ctx-sep" />
+            <button
+              type="button"
+              role="menuitem"
+              className="ws-ctx-item danger"
+              onClick={() => {
+                onDeleteWorkspace(wsMenu.group.workspace)
+                setWsMenu(null)
+              }}
+            >
+              <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                <path d="M3.5 5h9M6 5V3.5h4V5M4.5 5l.6 8h5.8l.6-8" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+              <span>{tr("删除工作区")}</span>
+            </button>
+          </div>,
+          document.body
+        )}
     </aside>
   )
 }

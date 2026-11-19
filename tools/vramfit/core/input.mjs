@@ -194,7 +194,10 @@ export function stripControl(s) {
 export const KV_TYPES = new Set(['f16', 'q8_0', 'q4_0', 'k8v16'])
 
 /** 只有这几个选项带值，其余（--json / --no-color）是开关 */
-export const VALUE_FLAGS = new Set(['--kv', '--vram', '--gpu', '--repo', '--mirror', '--lang', '--mmproj'])
+export const VALUE_FLAGS = new Set(['--kv', '--vram', '--gpu', '--repo', '--mirror', '--lang', '--mmproj', '--budget'])
+
+/** 预算口径：auto = 按当前空闲显存；static = 按物理容量（不看当前占用） */
+export const BUDGET_MODES = new Set(['auto', 'static'])
 
 /**
  * 把 --kv=q8_0 / --vram=8 / --repo=a/b 拆成两个参数。
@@ -292,5 +295,20 @@ export function parseOptions(argv) {
     else mmproj = cleanPasted(v)
   }
 
-  return { kvType, manualVram, gpuIndex, repo, mirror, mmproj, problems }
+  /**
+   * 预算口径。默认 auto（按当前空闲显存），`static` 按物理容量算。
+   *
+   * 非法值必须报错而不是静默回落到 auto：这直接决定结论是高是低，
+   * 用户写了 `--budget statik` 却拿到一份动态口径的报告，只会更难发现。
+   */
+  const bgIdx = argv.indexOf('--budget')
+  let budget = 'auto'
+  if (bgIdx >= 0) {
+    const v = argv[bgIdx + 1]
+    if (!v || v.startsWith('--')) problems.push(t('in.p.budgetNeeds'))
+    else if (!BUDGET_MODES.has(v.toLowerCase())) problems.push(t('in.p.budgetBad', { v }))
+    else budget = v.toLowerCase()
+  }
+
+  return { kvType, manualVram, gpuIndex, repo, mirror, mmproj, budget, problems }
 }

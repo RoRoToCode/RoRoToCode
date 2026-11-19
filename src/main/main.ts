@@ -42,6 +42,7 @@ import { clearGrants, listGrants, revokeGrant } from './grants'
 import { clearScratch } from './scratch'
 import { listModels } from './providers'
 import { setLocalWaker } from './providers/base'
+import { AUTO_RESUME_SECONDS, isSilentStall, stallReason } from '../shared/autoresume'
 import {
   cancelLlamaInstall,
   cleanupStaleLlama,
@@ -52,8 +53,8 @@ import {
   installLlama,
   launchKvType,
   listLlamaDevices,
+  llamaDevicesInfo,
   listLocalModels,
-  deleteLocalModel,
   llamaInstances,
   llamaSetupSnapshot,
   modelsRoot,
@@ -91,6 +92,7 @@ import {
   secureGpuForActive,
   setFreedHook,
   startLocal,
+  stopLocal,
 } from './locals'
 import { installRemoteSkills, listSkills, removeSkill, saveSkill, setSkillEnabled } from './skills'
 import { distillSkill } from './learn'
@@ -211,8 +213,17 @@ setChatHandler({
     const s = await store.createSession(workspace ?? null, agentId ?? null)
     return s.id
   },
-  send: (sessionId, text, options) =>
-    engine.send(sessionId, text, undefined, { nonInteractive: true, approvalPolicy: options?.approvalPolicy ?? 'deny' }),
+  send: async (sessionId, text, options) => {
+    // 无头通道也必须尊重会话创建时钉死的工作区：/chat/session 传了 workspace，
+    // 工具（写文件/跑命令）就必须落在那里，而不是回落到全局 config 工作区。
+    // 否则daemon 客户端建了隔离会话，产物却写进用户当前工作区——既难验收又会污染。
+    const session = await store.loadSession(sessionId).catch(() => null)
+    await engine.send(sessionId, text, undefined, {
+      nonInteractive: true,
+      approvalPolicy: options?.approvalPolicy ?? 'deny',
+      workspace: session?.workspace ?? undefined
+    })
+  },
   abort: (sessionId) => engine.abort(sessionId),
   subscribe: (sessionId, cb) => subscribeChat(sessionId, cb),
   isRunning: (sessionId) => engine.isRunning(sessionId),
@@ -815,6 +826,19 @@ function registerIpc(): void {
     } catch (err) {
       log('error', 'chat', `send 失败（${sessionId}）`, err)
       emit(sessionId, { type: 'error', message: (err as Error).message })
+      /**
+       * 静默中断（吐字前超时 / 生成到一半断流）不是「这条消息错了」，而是这次流没送达。
+       * 给界面发一个倒计时事件：60 秒内用户能看清原因或点取消，到期自动从断点续跑。
+       * 判定与引擎的 quietTimeout 共用 shared/autoresume，避免两边正则漂移。
+       * 注意只对 send 生效：regenerate / resume 这类重跑入口失败时不能再自动续跑，否则会无限循环。
+       */
+      if (isSilentStall(err)) {
+        emit(sessionId, {
+          type: 'auto_resume',
+          seconds: AUTO_RESUME_SECONDS,
+          reason: stallReason(err)
+        })
+      }
     }
   })
   ipcMain.handle('chat:abort', async (_e, sessionId: string) => engine.abort(sessionId))
@@ -978,7 +1002,7 @@ function registerIpc(): void {
       return {
         ok: false,
         models: [],
-        error: idle ? `${provider.name || '本地服务'}未启动（点「一键启动」）` : (err as Error).message,
+        error: idle ? `${provider.name || '本地服务'}未启动（到「④ 模型列表」点「启动」）` : (err as Error).message,
         idle
       }
     } finally {
@@ -1014,7 +1038,7 @@ function registerIpc(): void {
         return {
           ok: false,
           models: st.models ?? [],
-          error: canStart ? '本地服务未启动（点「一键启动」）' : st.message,
+          error: canStart ? '本地服务未启动（到「④ 模型列表」点「启动」）' : st.message,
           idle: canStart
         }
       }
@@ -1138,8 +1162,6 @@ function registerIpc(): void {
   ipcMain.handle('llama:cancelInstall', async () => cancelLlamaInstall())
   ipcMain.handle('llama:configure', async () => await configureLlama())
   ipcMain.handle('llama:models', async () => await listLocalModels())
-  // 删除本地模型文件：路径校验、占用检查、配套投影器清理都在主进程里做
-  ipcMain.handle('llama:deleteModel', async (_e, rel: string) => await deleteLocalModel(rel))
   ipcMain.handle(
     'llama:start',
     async (
@@ -1159,7 +1181,12 @@ function registerIpc(): void {
   // 当前有几个本地实例在跑：双卡双模型时界面要显示「两个都在跑」
   ipcMain.handle('llama:instances', async () => llamaInstances())
   // 可绑定的设备清单：直接问 llama-server，名字和 -dev 参数完全一致
-  ipcMain.handle('llama:devices', async () => await listLlamaDevices())
+  ipcMain.handle('llama:devices', async (_e, refresh?: boolean) => await listLlamaDevices(Boolean(refresh)))
+  /**
+   * 设备清单 + 诊断。界面要能区分「没找到运行库」和「后端没加载起来」——
+   * 这两种情况在旧实现里都只表现为一个空下拉，用户只能猜为什么没有第二张卡。
+   */
+  ipcMain.handle('llama:devicesInfo', async (_e, refresh?: boolean) => await llamaDevicesInfo(Boolean(refresh)))
   /**
    * 实测多槽并发。要真打服务端，所以用当前（或指定）供应商的真实配置，
    * 不走全局闸门 —— 那道闸门会按槽位排队，把要测的并发变成串行。
@@ -1225,22 +1252,25 @@ function registerIpc(): void {
     // 体检要按「真正会用的 KV 精度」算，否则界面上的建议上下文会比实际能力小一档。
     // KV 精度本身也跟卡走：双卡机器上 2080 只有 -ctk，4090 是 -ctk+-ctv，
     // 拿第一张卡的精度去体检第二张，结论必然偏。
-    async (_e, file: string, gpuIndex?: number) => {
+    async (_e, file: string, gpuIndex?: number, poolGb?: number | null) => {
       /**
        * 带上这个模型自己的投影器：界面上的报告必须和启动时的口径一致。
        * 否则会出现「面板说 32K 装得下 → 点启动也给你 32K → 发张图直接 OOM」。
        */
       const mm = await findMmprojFor(file).catch(() => null)
-      return await checkModel(file, gpuIndex ?? 0, await launchKvType(gpuIndex ?? 0), mm)
+      // poolGb：合并多卡时按「这几张卡合计」体检，否则面板永远报单卡的 8G
+      return await checkModel(file, gpuIndex ?? 0, await launchKvType(gpuIndex ?? 0), mm, poolGb ?? null)
     }
   )
   ipcMain.handle('local:status', async (_e, kind: LocalRuntimeKind) => await localStatus(kind))
   ipcMain.handle('local:start', async (_e, kind: LocalRuntimeKind) => await startLocal(kind))
+  // 和 local:start 成对：模型列表里那个按钮跑到「停止」时走这条
+  ipcMain.handle('local:stop', async (_e, kind: LocalRuntimeKind) => await stopLocal(kind))
   ipcMain.handle(
     'local:configure',
     async (_e, kind: LocalRuntimeKind, model?: string, opts?: { activate?: boolean }) => {
       const r = await configureLocal(kind, model, opts)
-      // 一键启动 Ollama / LM Studio 也是「切过去用」：llama.cpp 那边该让出显存
+      // 保存并设为当前 Ollama / LM Studio 也是「切过去用」：llama.cpp 那边该让出显存
       if (r.ok && opts?.activate) await secureGpuForActive()
       return r
     }
@@ -1361,6 +1391,12 @@ if (!gotLock) {
     }
     // 收进托盘时窗口是隐藏的，只 focus 叫不回来
     showWindow()
+  })
+
+  // macOS：点 Dock 图标时窗口可能收在托盘里 / 还没建，重新打开
+  app.on('activate', () => {
+    if (!win) createWindow()
+    else showWindow()
   })
 
   void app.whenReady().then(async () => {

@@ -22,6 +22,15 @@ export interface FileNode {
   symbols: string[]
   /** 一句话说明：优先取文件头注释，其次取第一条有意义的代码 */
   summary: string
+  /**
+   * 符号块：符号名 + 它在文件里的行号（1 起）。
+   *
+   * 用于「大文件按符号切块」的语义检索：一个几千行、塞满几十个互不相关函数的
+   * utils.ts，整文件向量几乎等于没命中 —— 模型还得在文件里自己翻。把每个符号
+   * 当成独立检索单元之后，「登录怎么校验的」能直接命中到具体函数那一行。
+   * 只在文件较大（超过阈值）时才被 embed 层使用，小文件保持整文件向量。
+   */
+  blocks?: Array<{ name: string; line: number }>
 }
 
 export interface RepoIndex {
@@ -137,9 +146,25 @@ async function walk(root: string): Promise<string[]> {
   return out
 }
 
-/** 从 TS/JS 源码里挑出顶层导出名 */
-function tsSymbols(src: string): string[] {
-  const out = new Set<string>()
+/** 一个符号及其所在行号（1 起） */
+interface SymbolHit {
+  name: string
+  line: number
+}
+
+/** 把 match 在 src 里的字符偏移换算成行号（1 起） */
+function lineOf(src: string, offset: number): number {
+  let line = 1
+  for (let i = 0; i < offset && i < src.length; i++) {
+    if (src.charCodeAt(i) === 10) line++
+  }
+  return line
+}
+
+/** 从 TS/JS 源码里挑出顶层导出名（带行号） */
+function tsSymbols(src: string): SymbolHit[] {
+  const out: SymbolHit[] = []
+  const seen = new Set<string>()
   const res: RegExp[] = [
     /export\s+(?:default\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)/g,
     /export\s+(?:default\s+)?(?:abstract\s+)?class\s+([A-Za-z_$][\w$]*)/g,
@@ -157,15 +182,19 @@ function tsSymbols(src: string): string[] {
           .replace(/\btype\b\s*/g, '')
           .split(/\s+as\s+/)[0]
           .trim()
-        if (/^[A-Za-z_$][\w$]*$/.test(name) && !out.has(name)) out.add(name)
+        if (/^[A-Za-z_$][\w$]*$/.test(name) && !seen.has(name)) {
+          seen.add(name)
+          out.push({ name, line: lineOf(src, m.index) })
+        }
       }
     }
   }
-  return [...out]
+  return out
 }
 
-function genericSymbols(src: string, lang: string): string[] {
-  const out = new Set<string>()
+function genericSymbols(src: string, lang: string): SymbolHit[] {
+  const out: SymbolHit[] = []
+  const seen = new Set<string>()
   const patterns: RegExp[] =
     lang === 'py'
       ? [/^\s{0,4}(?:async\s+)?def\s+([A-Za-z_]\w*)/gm, /^\s{0,4}class\s+([A-Za-z_]\w*)/gm]
@@ -181,10 +210,13 @@ function genericSymbols(src: string, lang: string): string[] {
     let m: RegExpExecArray | null
     while ((m = re.exec(src))) {
       const name = m[1]
-      if (name && !out.has(name)) out.add(name)
+      if (name && !seen.has(name)) {
+        seen.add(name)
+        out.push({ name, line: lineOf(src, m.index) })
+      }
     }
   }
-  return [...out]
+  return out
 }
 
 /** 文件头注释 → 一句话说明；没有注释就退回第一条有意义的代码 */
@@ -226,11 +258,19 @@ function summarize(src: string, lang: string): string {
   return text.length > MAX_SUMMARY ? `${text.slice(0, MAX_SUMMARY)}…` : text
 }
 
-export function extractSymbols(src: string, file: string): { symbols: string[]; summary: string } {
+export function extractSymbols(src: string, file: string): {
+  symbols: string[]
+  summary: string
+  blocks: Array<{ name: string; line: number }>
+} {
   const lang = langOf(file)
-  if (!lang || lang === 'other') return { symbols: [], summary: '' }
-  const symbols = (lang === 'ts' ? tsSymbols(src) : genericSymbols(src, lang)).slice(0, MAX_SYMBOLS)
-  return { symbols, summary: summarize(src, lang) }
+  if (!lang || lang === 'other') return { symbols: [], summary: '', blocks: [] }
+  const hits = (lang === 'ts' ? tsSymbols(src) : genericSymbols(src, lang)).slice(0, MAX_SYMBOLS)
+  return {
+    symbols: hits.map((h) => h.name),
+    summary: summarize(src, lang),
+    blocks: hits
+  }
 }
 
 function toRel(root: string, full: string): string {
@@ -284,8 +324,8 @@ export async function buildIndex(root: string, opts: { force?: boolean } = {}): 
 
     try {
       const src = await fs.readFile(full, 'utf8')
-      const { symbols, summary } = extractSymbols(src, rel)
-      files.push({ path: rel, size: st.size, mtime: st.mtimeMs, symbols, summary })
+      const { symbols, summary, blocks } = extractSymbols(src, rel)
+      files.push({ path: rel, size: st.size, mtime: st.mtimeMs, symbols, summary, blocks })
     } catch {
       files.push({ path: rel, size: st.size, mtime: st.mtimeMs, symbols: [], summary: '' })
     }

@@ -33,7 +33,13 @@ const VISION_HINTS = [
   'claude-opus',
   'gemini',
   'grok-2-vision',
-  'grok-4'
+  'grok-4',
+  // NVIDIA 的 bolt/lightning 系列是基于 Gemma 4 E4B 的视觉模型（官方文档确认支持
+  // text + image + audio 输入）。名字里没有 vl/vision 等常见标记，必须显式列出来。
+  'nemotron-3.5-bolt',
+  'nemotron-3.5-lightning',
+  'nemotron-bolt',
+  'nemotron-lightning'
 ]
 
 /** 名字里带这些的多半是纯文本模型，即使命中上面的片段也排除 */

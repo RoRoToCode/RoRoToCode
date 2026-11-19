@@ -137,6 +137,10 @@ async function main(): Promise<void> {
     const hints = events.filter((e) => e.type === 'hint') as Array<{ message: string }>
     check('界面收到「在重复同一个动作」的提示', hints.some((h) => h.message.includes('重复')))
     check('没有继续发 step_limit（不是跑到步数上限才停）', !events.some((e) => e.type === 'step_limit'))
+    // 护栏叫停必须带一条 done.note，否则界面只复位「正在运行」，用户看到的就是「执行莫名断了」
+    const done = events.find((e) => e.type === 'done') as { note?: string; ok?: boolean } | undefined
+    check('护栏收工时 done 带收工说明', Boolean(done?.note && done.note.includes('停止')), done?.note ?? '没有 note')
+    check('护栏收工标记为未完成', done?.ok === false)
 
     /**
      * 关键：请求数必须明显小于步数上限。只靠 maxSteps 拦住的话请求数会是 20。

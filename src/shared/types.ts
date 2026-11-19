@@ -40,6 +40,12 @@ export interface ProviderConfig {
   apiKey?: string
   model: string
   contextWindow: number
+  /**
+   * 单次回复最多生成多少 token。留空自动：
+   * 本地模型 16384、云端 8192（撞到上限后自动升一档，云端可到 32768）。
+   * 填了就以此为上限，引擎不再升档。
+   */
+  maxOutputTokens?: number
   temperature?: number
   /**
    * 核采样阈值（top_p）。留空用服务端默认（多数是 1.0 = 不截断）。
@@ -81,19 +87,26 @@ export interface ProviderConfig {
   runtime?: 'llama' | LocalRuntimeKind
   /**
    * llama.cpp 实例端口（仅 runtime='llama' 有意义）。
-   * 留空 = 自动：启动时真实探测端口是否可监听，从 8080 起找第一个空闲的并写进 baseUrl。
-   * 填了值 = 用户手动锁定该端口，被占用时直接报错，不自动改。
+   * 设置页不再提供此项：新建实例留空，启动时真实探测可监听的端口并写进 baseUrl。
+   * 只有历史配置会带值（锁定该端口，被占用时直接报错，不自动改）—— 保留兼容。
    */
   port?: number
   /**
    * 绑定到哪张显卡（仅 runtime='llama' 有意义）。
    * 取值来自 `llama-server --list-devices`：CUDA0 / CUDA1 / Vulkan0 …；填 CPU 表示只用处理器。
    * 留空交给 llama.cpp 自己分配（单卡机器上的老行为）。
+   *
+   * 写多张卡（逗号分隔，如 `CUDA0,CUDA1`）= 合并模式：一个模型切开摊到这几张卡上，
+   * 显存池是各卡之和（`-dev CUDA0,CUDA1 -sm layer`）。与「一卡一模型」互斥 ——
+   * 同一张卡不能既给单卡实例用、又参与合并。
    */
   device?: string
   /**
-   * 角色。worker 表示「给子代理干活用」：主对话走一个模型，子代理派到另一个，
-   * 两张卡各跑一个才真正并行。留空按主模型处理。
+   * 角色。和「④ 模型列表」里的主 / 子一一对应：
+   * - 留空 / 'main'：不是子智能体（当前对话用的那条由 `activeId` 决定，不靠这个字段）；
+   * - 'worker'：子智能体，进子智能体池，主 agent 派 task 时按忙闲分给它。
+   *
+   * 本地和线上同一套规则：想要「一个模型聊天、另一个模型干活」，就把后者设为子。
    */
   role?: 'main' | 'worker'
   /**
@@ -195,6 +208,14 @@ export interface AppConfig {
    * 或者它自己说「接下来 / 下一步」却没调工具，就不再等用户手点「继续」，自己再推一轮。
    */
   autoContinue?: boolean
+  /**
+   * 自动派发：任务看起来「要翻很多文件才看得清」或「要的是检查不是改」时，
+   * 程序在当轮环境信息里主动提醒模型先派一个只读子 agent，而不是等它自己想起来。
+   *
+   * 只负责「提醒」，不代替模型决定派几个、派什么；也只建议 mode=explore（只读），
+   * 不给会写文件的子任务开自动口子 —— 那边并行的写冲突和审批没人兜底。
+   */
+  autoDelegate?: boolean
   /** 单次运行 token 上限；0 / 不填 = 不限。撞上了先问一句，不硬断 */
   tokenLimitPerRun?: number
   /** 每日累计 token 上限；0 / 不填 = 不限。跨天自动清零 */
@@ -348,6 +369,14 @@ export interface ToolCall {
    * 只在「修过 / 没救回来」时写，合法调用不带这个字段，不占空间。
    */
   argRepair?: ArgRepair
+  /**
+   * 续写救回来了、但拼完结构仍然不完整 —— 这条**不能执行**。
+   *
+   * 存的是直接给模型看的整段说明（为什么拦、内容在哪、下一步怎么做），
+   * 之所以存文本而不是枚举：拦截文案要带上保底文件路径和字符数，这些只有
+   * heal 那边算得出来，主循环再拼一次只会拼错。
+   */
+  truncRejected?: string
 }
 
 export interface ChatMessage {
@@ -426,6 +455,11 @@ export interface RunningRun {
   /** 排队位置，1 表示下一个轮到它；在跑时为 0 */
   position: number
   startedAt: number
+  /**
+   * 这条会话此刻有几个子 agent（task 工具）在跑，0 表示只有主 agent。
+   * 只供界面多挂一枚机器人，不参与并发调度：子 agent 借的是父会话的槽位。
+   */
+  subagents: number
 }
 
 /**
@@ -831,6 +865,39 @@ export interface LlamaProbeProgress {
   message: string
 }
 
+/** 一个可绑定设备（id 就是 `-dev` 认的名字：CUDA0 / Vulkan1 / CPU） */
+export interface LlamaDevice {
+  id: string
+  name: string
+  /** 显存总量（MiB）；llama.cpp 报不出来时为 undefined */
+  vramMiB?: number
+  /** 当前空闲显存（MiB） */
+  freeMiB?: number
+}
+
+/**
+ * 设备清单 + 为什么是这个结果。
+ *
+ * 空数组有两种完全不同的原因，过去的接口只有数组，界面无法区分：
+ *  - 运行库没找到（`error` 里写明目录，`fallback` 说明是不是走了备选位置）
+ *  - 找到了但后端没加载起来（缺 cudart / 驱动太旧 / 装的是 CPU 版）
+ * 没有这份信息时，用户看到的只是一个只有「自动」和「CPU」的下拉。
+ */
+export interface LlamaDevicesInfo {
+  devices: LlamaDevice[]
+  /** 实际执行的 llama-server；没找到时为 null */
+  exe: string | null
+  /** 实际使用的 llama.cpp 目录 */
+  root: string
+  /** 配置算出来的目录（和 root 不同说明走了备选位置） */
+  primaryRoot: string
+  /** 运行库是从备选目录找到的（数据目录判定与真实存放错位） */
+  fallback: boolean
+  /** 原始输出，排查格式变化时直接看 */
+  raw: string
+  error?: string
+}
+
 export interface LlamaStatus {
   ok: boolean
   state: LlamaState
@@ -965,7 +1032,7 @@ export interface GpuInfo {
   /** 显存字节数；0 表示没读到（如集显或驱动未提供） */
   vramBytes: number
   driver?: string
-  source?: 'nvidia-smi' | 'wmi'
+  source?: 'nvidia-smi' | 'wmi' | 'system_profiler' | 'lspci'
 }
 
 /** 本机硬件参数（用于推荐可运行的本地模型规模） */export interface SystemSpecs {
@@ -1391,18 +1458,18 @@ export interface SubAgentTask {
   endedAt?: number
   /** 回传给主 agent 的总结（也是工具结果） */
   summary: string
-  /** 这个子 agent 实际用的模型（配了「工作模型」时和主模型不同） */
+  /** 这个子 agent 实际用的模型（配了子智能体时和主模型不同） */
   model?: string
-  /** 为什么用/没用工作模型：并行是否生效、回落原因，直接显示给用户 */
+  /** 为什么用/没用子智能体：并行是否生效、回落原因，直接显示给用户 */
   note?: string
   error?: string
   /** 子 agent 做过的工具调用，界面展开可看 */
   tools: Array<{ tool: string; ok: boolean; durationMs: number; note: string }>
 }
 
-/** 工人模型与主模型在显存/算力上的隔离方式 */
+/** 子智能体与主模型在显存/算力上的隔离方式 */
 export type WorkerIsolation =
-  /** 工人模型在远端 API，完全不抢本地显存 */
+  /** 子智能体在远端 API，完全不抢本地显存 */
   | 'remote'
   /** 两边各占一块不同的卡 */
   | 'gpu'
@@ -1411,11 +1478,28 @@ export type WorkerIsolation =
   /** 分不开：同一块卡，或有一方没绑卡 */
   | 'none'
 
-/** 这次派子代理到底用不用工人模型、能不能真并行 */
+/**
+ * 子智能体池里一个「现在能接请求」的实例。
+ *
+ * 池里有多条时，一批子任务按 load（闸门里活跃 + 排队的请求数）挑最闲的一条，
+ * 不会全挤在配置里的第一条上。
+ */
+export interface WorkerPoolMember {
+  provider: ProviderConfig
+  isolation: WorkerIsolation
+  /** 本地实例必须已经 running 才进池；远端 API 恒为 true */
+  ready: boolean
+  /** 选实例时的忙闲权重：闸门里的 active + queued */
+  load: number
+  /** 这条为什么能并行（写进子代理卡片） */
+  reason: string
+}
+
+/** 这次派子代理到底用不用子智能体、能不能真并行 */
 export interface WorkerPlan {
-  /** 实际该用的供应商；null 表示回落主模型 */
+  /** 实际该用的供应商；组化后是 pool[0]，仅为兼容旧调用方保留，null 表示回落主模型 */
   provider: ProviderConfig | null
-  /** 配置里声明的工人模型（不管这次能不能用） */
+  /** 配置里声明为子智能体的模型（不管这次能不能用）；多条时取第一条 */
   configured: ProviderConfig | null
   isolation: WorkerIsolation
   /** 能不能真并行 */
@@ -1424,6 +1508,17 @@ export interface WorkerPlan {
   ready: boolean
   /** 给人看的一句话结论 */
   reason: string
+  /** 可用实例池：一批子任务按忙闲分派到不同实例；只设了一个子时长度为 1 */
+  pool: WorkerPoolMember[]
+  /**
+   * 标了「子」但这次用不了的（没绑卡 / 卡组重叠 / 还没启动 / 正在加载 / 刚被限流）
+   *
+   * `cooling` 用来区分「还没起来，值得等一会儿预热」和「刚失败，等也白等」：
+   * 后者不该触发那 8 秒的预热等待，否则每次派活都白拖一轮对话。
+   */
+  skipped: Array<{ provider: ProviderConfig; reason: string; cooling?: boolean }>
+  /** 配置里声明了几个子智能体（含被跳过的） */
+  configuredCount: number
 }
 
 export type AgentEvent =
@@ -1452,7 +1547,18 @@ export type AgentEvent =
   | { type: 'subagent_update'; task: SubAgentTask }
   | { type: 'subagent_end'; task: SubAgentTask }
   | { type: 'assistant_start'; messageId: string }
+  /**
+   * 这一条正文要作废重来（升档重试）：界面按 messageId 把已收到的 delta 清空。
+   * 不重用 assistant_start，是因为那边会给同一个 id 再 push 一条消息，界面上会出现两个气泡。
+   */
+  | { type: 'assistant_reset'; messageId: string }
   | { type: 'delta'; messageId: string; text: string }
+  /**
+   * 生成中的实时进度（近似 token 数）。
+   * 模型写大文件时一整次调用可能跑几分钟、期间既没有正文也没有 usage，
+   * 界面靠它显示「正在生成 · 已 N」，否则看起来就是卡死。
+   */
+  | { type: 'gen_progress'; completion: number }
   | { type: 'assistant_end'; messageId: string; content: string; toolCalls: ToolCall[] }
   | { type: 'tool_start'; callId: string; tool: string; args: Record<string, unknown> }
   | { type: 'tool_result'; callId: string; tool: string; result: string; ok: boolean; durationMs: number }
@@ -1473,6 +1579,13 @@ export type AgentEvent =
   /** 全局并发闸门：position=0 表示终于轮到它了，>0 表示前面还有几个在跑 */
   | { type: 'queue'; position: number; active: number; limit: number; priority?: RunPriority }
   | { type: 'error'; message: string }
+  /**
+   * 静默中断（吐字前超时 / 生成到一半断流）后的自动续跑倒计时。
+   * 主进程只发「要续跑、多少秒、为什么」，倒计时与取消都由界面负责 ——
+   * 这样用户点「取消」就能真正拦住，不必在主进程里管理一堆 timer。
+   * seconds<=0 表示立即续跑（用于测试 / 未来配置成 0 秒）。
+   */
+  | { type: 'auto_resume'; seconds: number; reason: string }
   /**
    * 这一轮结束。note 是收工结论（改了几个文件 / 一个字没改 / 已中止），
    * 界面据此给出明确提示——否则正常收工和静默中断看起来完全一样。
@@ -1760,16 +1873,11 @@ export interface PicoAPI {
       sizes?: Record<string, number>
     }>
     /**
-     * 删除本地模型文件。只接受本程序模型目录内的 .gguf；
-     * 运行中的模型、目录外的路径一律拒绝，配套投影器会一起删掉。
-     */
-    deleteModel(rel: string): Promise<{ ok: boolean; message: string; freedBytes?: number }>
-    /**
-     * 一键启动 llama-server：立即返回并写好模型配置，服务在后台加载。ctx 为空时按配置上限。
+     * 启动 llama-server：立即返回并写好模型配置，服务在后台加载。ctx 为空时按配置上限。
      * providerId 指定属于哪个供应商（不同供应商各自一个实例，可同时驻留）；
      * device 覆盖该供应商的显卡绑定（CUDA0 / CUDA1 / CPU…）。
      * activate=true 表示「启动并使用」：顺手把这条设为当前模型；
-     * 后台兜底 / 工人模型拉起的实例不要传，否则会把用户正在聊的模型换掉。
+     * 后台兜底 / 子智能体拉起的实例不要传，否则会把用户正在聊的模型换掉。
      */
     start(
       model?: string,
@@ -1797,8 +1905,18 @@ export interface PicoAPI {
         partial: boolean
       }>
     >
-    /** 可绑定设备清单（值就是 -dev 认的设备名：CUDA0 / Vulkan1 …） */
-    devices(): Promise<Array<{ id: string; name: string; vramMiB?: number; freeMiB?: number }>>
+    /**
+     * 可绑定设备清单（值就是 -dev 认的设备名：CUDA0 / Vulkan1 …）。
+     * refresh=true 绕过 5 秒缓存，用于界面上点「重新扫描」。
+     */
+    devices(refresh?: boolean): Promise<LlamaDevice[]>
+    /**
+     * 设备清单 + 诊断信息。
+     *
+     * 只给 devices() 一个数组是不够的：空数组既可能是「运行库没找到」，
+     * 也可能是「后端没加载起来」，界面无法区分，用户只能看到一个空下拉。
+     */
+    devicesInfo(refresh?: boolean): Promise<LlamaDevicesInfo>
     /**
      * 实测多槽并发：先发一个 0.8 窗口的长请求，再并发两个 0.4 窗口的，
      * 据此判断 -kvu 有没有生效、并发是真并行还是排队。
@@ -1807,7 +1925,7 @@ export interface PicoAPI {
     probeSlots(providerId?: string): Promise<SlotsProbeResult>
     /** 检查已安装的 llama.cpp 是 CPU 还是 GPU 后端（installed=false 表示压根没装） */
     backend(): Promise<{
-      backend: 'cuda' | 'vulkan' | 'hip' | 'cpu'
+      backend: 'cuda' | 'vulkan' | 'hip' | 'metal' | 'cpu'
       gpuReady: boolean
       installed: boolean
       /** 后端在、显卡用不上时的原因（缺运行库等），界面直接显示 */
@@ -1841,14 +1959,18 @@ export interface PicoAPI {
   vramfit: {
     /** vramfit 是否就位（打包时缺失会返回 false，界面据此隐藏入口） */
     available(): Promise<{ ok: boolean; message: string }>
-    /** 体检某个 .gguf；gpuIndex 指按第几块卡算（双卡机器上第二个模型用） */
-    check(file: string, gpuIndex?: number): Promise<VramfitResult>
+    /**
+     * 体检某个 .gguf；gpuIndex 指按第几块卡算（双卡机器上第二个模型用）。
+     * poolGb 是合并多卡的显存池（各卡空闲之和）：传了就按「合计容量」算，
+     * 不传按单卡 —— 「16G 够不够」和「8G 够不够」是两个不同的结论。
+     */
+    check(file: string, gpuIndex?: number, poolGb?: number | null): Promise<VramfitResult>
   }
-  /** 工人模型（子代理专用模型）的可用性判断 */
+  /** 子智能体（子代理专用模型）的可用性判断 */
   worker: {
-    /** 当前对话模型配的工人模型能不能真并行；null 表示找不到当前模型 */
+    /** 当前对话模型配的子智能体能不能真并行；null 表示找不到当前模型 */
     plan(providerId?: string): Promise<WorkerPlan | null>
-    /** 后台拉起工人模型的本地实例（不等待加载完成） */
+    /** 后台拉起子智能体的本地实例（不等待加载完成） */
     warm(providerId?: string): Promise<{ ok: boolean; message: string }>
   }
   /** 软件自身的设置（与模型无关）：界面缩放、数据目录等 */
@@ -1889,6 +2011,8 @@ export interface PicoAPI {
   local: {
     status(kind: LocalRuntimeKind): Promise<LocalRuntimeStatus>
     start(kind: LocalRuntimeKind): Promise<{ ok: boolean; message: string; models?: string[] }>
+    /** 停掉服务（LM Studio 走 `lms server stop`，Ollama 卸模型后结束进程） */
+    stop(kind: LocalRuntimeKind): Promise<{ ok: boolean; freed: string[]; message: string }>
     configure(
       kind: LocalRuntimeKind,
       model?: string,

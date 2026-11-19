@@ -18,6 +18,7 @@ import type {
   ToolCall
 } from '../shared/types'
 import { getAgent, listAgents } from './agents'
+import { defaultShellKind, isWin } from './platform'
 import { combineSignals, type CombinedSignal } from '../shared/abort'
 import { dropOldestTurns } from '../shared/turns'
 import { agentBrief, handoffTargets } from '../shared/roster'
@@ -34,20 +35,33 @@ import {
 import * as store from './store'
 import { chat, effectiveContextWindow } from './providers'
 import type { StreamResult } from './providers/base'
-import { classifyRisk, classifyMcpRisk, executeTool, previewWrite, previewPatch, patchTargets, summarize, toolTargetPath, type RiskInfo } from './tools'
+import { classifyRisk, classifyMcpRisk, executeTool, previewWrite, previewPatch, patchTargets, summarize, toolTargetPath, resolveToolPath, MAX_SINGLE_WRITE_CHARS, type RiskInfo } from './tools'
 import { decideApproval } from './approval'
 import { TOOLBOX_SPEC, toolSpecs, type ToolSpec } from './tools/spec'
-import { settleToolArgs } from '../shared/toolargs'
+import { WRITE_TEXT_KEYS, partialString, settleToolArgs, RAW_ARG_KEY } from '../shared/toolargs'
+import { clipSafe, clipTailSafe, splitHeadTail } from '../shared/text'
+import { estimateTokens, messagesTokens, toolsTokens as toolSpecsTokens } from '../shared/tokens'
 import { createLoopGuard } from '../shared/degenerate'
-import { createToolCallGuard } from '../shared/toolguard'
+import { createToolCallGuard, createScratchGuard, createErrorStreakGuard, isTruncatedWrite } from '../shared/toolguard'
+import { healTruncatedWrites, type HealResult } from './heal'
+import { saveSpill } from './spill'
+import { escalationRoom } from './providers/budget'
+import { isLocalProvider } from './providers/budget'
+import { isSilentStall } from '../shared/autoresume'
 import { extractAttachment, renderAttachmentBody } from './extract'
 import { isImagePath, providerSupportsVision } from '../shared/vision'
-import { isLlamaProvider } from '../shared/providers'
-import { setLlamaVision, llamaVisionLoaded } from './llama'
-import { formatTodos, normalizeTodos } from '../shared/todos'
+import { fallbackCandidates, isLlamaProvider } from '../shared/providers'
+import { createSubAgentDispatcher, laneCount, subAgentProviders } from '../shared/agentpool'
+import { setLlamaVision, llamaVisionLoaded, touchIdle } from './llama'
+import { formatTodos, normalizeTodos, todoGate } from '../shared/todos'
 import { memoryForPrompt } from './memory'
 import { boardForPrompt } from './board'
 import { diagnoseReport } from './lsp'
+import { checkHtmlScripts, formatHtmlIssues } from './htmlcheck'
+import { checkJsSyntax, formatJsIssues } from './jssyntax'
+import { checkWebPages, formatWebCheck, hasBlockingFailure } from './webcheck'
+import { changedSources, formatShellChangeNote, snapshotSources } from './shellguard'
+import { formatSweep, sweepWorkspace } from './hygiene'
 import { formatFiles } from './format'
 import { formatDiagGap, formatDiagnostics } from '../shared/diagnostics'
 import { grantKey, grantTool, loadGrantSet } from './grants'
@@ -55,16 +69,18 @@ import { scratchForPrompt } from './scratch'
 import { runHooks } from './hooks'
 import { findInstructions, instructionsBlock, type InstructionsResult } from './instructions'
 import { loadProjectPermissions } from './permissions'
-import { detectVerifyPlan, runVerify } from './verify'
+import { detectVerifyPlan, runVerify, assertSmoke, resolveTestTarget, stateCoverageGap } from './verify'
 import { asCalls, balancedEnd, parseTextToolCalls, type RawCall } from './parse'
-import { runSubAgent } from './subagent'
+import { runSubAgent, withExploreNav } from './subagent'
 import { recordChange } from './changes'
 import { diffLines, diffStats } from './diff'
 import { callMcpTool, isMcpTool, mcpToolSpecs } from './mcp'
 import { coreFallbackProvider, ensureCoreReady, CORE_PROVIDER_ID } from './core'
 import { enabledSkills } from './skills'
 import { snapshotResults, diffResults, mayProduceFiles } from './artifacts'
-import { workerPlan } from './worker'
+import { snapshotBeforeWrite } from './snapshot'
+import { clearSnapshots } from './snapshot'
+import { warmWorker, parallelLanes, workerPlan } from './worker'
 import { estimateCost } from '../shared/pricing'
 import { MAX_CONCURRENT_RUNS, priorityOf, RunQueue } from '../shared/runqueue'
 import { saveCheckpoint, clearCheckpoint, loadCheckpoint, checkpointBrief, type Checkpoint } from './checkpoint'
@@ -91,6 +107,13 @@ export interface RunOptions {
   workspace?: string | null
   /** 这次运行因何而起。只用于观测（「谁在干活」列表里显示），不影响执行逻辑 */
   reason?: RunningRun['kind']
+  /**
+   * 指定这条用户消息写入会话时的 id。仅给程序注入的续跑消息用：
+   * 传 'continue' 后 lastUserText() 会把它当注入消息跳过，回溯到用户真正说的那句。
+   * 否则 resume 的「继续。上次执行被中断了…」会被当成用户意图，里面没有代码语境词，
+   * delegateHint() 就判不出审查/摸底信号 —— 表现为「断点续跑后再也不派子 agent」。
+   */
+  userMessageId?: string
 }
 
 /**
@@ -140,6 +163,17 @@ export function retryable(err: unknown): boolean {
     return code === 408 || code === 429 || code >= 500
   }
   return /连接失败|fetch failed|ECONNRESET|ECONNREFUSED|ENOTFOUND|ETIMEDOUT|EAI_AGAIN|请求超时|socket hang up|network/i.test(msg)
+}
+
+/**
+ * 「一个字都没拿到」就挂掉的超时。
+ *
+ * 和「生成到一半断了」必须分开处理：前者重发同一份请求，只会让服务端再从头 prefill
+ * 一遍，然后同样超时 —— 现场观察到的「十几分钟一声不响、服务端 decoded 一直停在几十、
+ * 请求反复重启」就是这么来的。这类失败只能靠**缩小这次的提示**来解决，或者干脆停下说清楚。
+ */
+export function quietTimeout(err: unknown): boolean {
+  return isSilentStall(err)
 }
 
 /** 可被 abort 打断的等待：用户点停止时不该还在这儿睡 2 秒 */
@@ -303,6 +337,42 @@ const STEER_CUT_NOTE = '被用户的新消息打断，这一步没做完（环�
 const REPEAT_SKIP_NOTE =
   '这一轮因为多次重复同一个动作已经被叫停，这个调用没有执行。要接着做，请换个明确不同的下一步，别照原样重发。'
 
+/**
+ * 计划门禁连续拒绝几次后强制放行。
+ *
+ * 3 次是个折中：一次是它没看清提示，两次是它理解偏了，三次还没改对基本就是
+ * 9B 能力到顶了 —— 再拒下去只会把预算烧在重发计划上，不如放行并让用户知道。
+ */
+const MAX_PLAN_GATE_STRIKES = 3
+
+/**
+ * 产出比熔断的阈值。
+ *
+ * 同一个文件整份重写 4 次、其中最大的那次还不到 2000 字符 —— 这不可能是「写完了」，
+ * 只可能是在「生成 → 被截断 → 重写」里绕圈。真实账单：77 次消息、6 万 token、
+ * 20 分钟，产出 693 字节残片。继续放任它转，只会把上下文和额度一起烧光。
+ *
+ * 2000 字符这个值不是拍的：一份能跑的小游戏/小页面至少也有几千字符，
+ * 反复停在几百字符就是被切断的铁证。
+ */
+const WRITE_BREAKER_ATTEMPTS = 4
+const WRITE_BREAKER_MAX_SIZE = 2000
+
+/**
+ * 护栏收工（重复动作 / 连续同类错误）时给用户的结论。
+ *
+ * 以前 halt 走 break 跳出 step 循环，既不发 step_limit 也不写 finishNotes，
+ * 于是 end() 只 emit 一条裸 done：界面把「正在运行」复位了，却不说为什么停，
+ * 用户看到的就是「执行不知道什么时候断了」。这里把结论补上，并说清可以「继续」。
+ */
+function guardHaltNote(): { note: string; ok: boolean } {
+  return {
+    note: '已停止：助手反复做同一个动作或连续犯同一类错误，为避免空转提前收工。' +
+      '任务未做完，补一句明确的方向再发消息（或点「继续」接着跑），换更强的模型通常更好。',
+    ok: false
+  }
+}
+
 async function readTextOrNull(abs: string): Promise<string | null> {
   try {
     return await fs.readFile(abs, 'utf8')
@@ -328,6 +398,38 @@ const LITE_TOOLS = new Set([
   'web_fetch',
   'handoff'
 ])
+
+/**
+ * 可以并发的只读工具。
+ *
+ * 只收「纯读本地文件、没有任何副作用」的四个。repo_map 会写索引缓存、
+ * LSP 那对跳转要跟共享的 tsserver 打交道、web_* 走网络（有限流），
+ * 它们看起来也是「读」，但并发起来副作用和限流都不好控，留给串行。
+ */
+const PARALLEL_READ = new Set(['read_file', 'list_dir', 'glob', 'grep'])
+/** 一批最多并发几个：再多对本地磁盘没有收益，出错时也更难定位 */
+const MAX_PARALLEL_READ = 6
+
+/**
+ * 从 from 开始收集「连续、可并发」的只读调用。
+ *
+ * 只收这一段是硬要求：中间夹着一个 write_file 或 run_shell，就必须断开 ——
+ * 后面的读可能依赖前面写入的结果（写完再读回来校验是常见套路），
+ * 抢跑会让它读到旧内容。
+ */
+export function collectParallelReadRun(
+  calls: ToolCall[],
+  from: number,
+  max = MAX_PARALLEL_READ
+): ToolCall[] {
+  const run: ToolCall[] = []
+  for (let j = from; j < calls.length && run.length < max; j++) {
+    const c = calls[j]
+    if (!PARALLEL_READ.has(c.name) || c.truncRejected) break
+    run.push(c)
+  }
+  return run.length >= 2 ? run : []
+}
 
 /**
  * 上下文紧张时的「直接下发」白名单。
@@ -365,6 +467,66 @@ const LEAN_TOOLS = new Set([
 const LEAN_CTX = 24 * 1024
 
 /**
+ * 子代理能开工的最低上下文预算。
+ *
+ * 子代理的请求里必须带整套工具说明（约 4900 tokens）和它自己的系统提示，
+ * 预算低于这个数就连工具表都装不下，发出去必然 400。显存不足时 llama.cpp 会
+ * 自动把 `-c` 降下来（实测 7.4G 卡跑 12B 只拿到 4096），所以这个判断不能只在配置里做。
+ */
+const MIN_SUBAGENT_BUDGET = 6000
+
+/**
+ * 本地 worker 跑「要改文件」的子任务时，最多给多久。
+ *
+ * 现场：本地 9B worker 接了一个「改 ui.py」的子任务，993 秒、27 步、108 次工具调用，
+ * 最后 llama 进程崩了，文件还被改坏 —— 父 agent 只拿到一句「连接已中断」，
+ * 既不知道为什么，也不知道它动过哪些文件。
+ *
+ * 步数上限拦不住这种情况：27 步还没到 30，时间全耗在一次次读写里。
+ * 所以按墙上时钟兜底：到了就中止，并把「它改过哪些文件」一起交回去，
+ * 让父 agent 能立刻核对（写前有快照），而不是等它崩。
+ *
+ * 只对**本地** worker 的**写型**任务生效：只读 explore 没有破坏性，
+ * 云端 worker 有各自的超时与重试策略，不该被这条墙钟卡住。
+ * 10 分钟的依据：本地 9B 在这个时长里通常能完成 20～40 次工具调用，
+ * 超过还没收尾，多半是在原地打转。
+ */
+const LOCAL_WORKER_WRITE_MS = 10 * 60_000
+
+/**
+ * 这个子任务该不该套墙钟护栏，套多久。0 = 不套。
+ *
+ * 单独提出来是为了能直接断言「哪些组合不套」—— 只读 explore 和云端 worker
+ * 一旦被误套，长任务会被无缘无故掐断，而这种错误在界面上表现为「莫名失败」。
+ */
+export function writeCapMs(provider: ProviderConfig | null, explore: boolean): number {
+  return provider && isLlamaProvider(provider) && !explore ? LOCAL_WORKER_WRITE_MS : 0
+}
+
+/**
+ * 墙钟到点后回给父 agent 的那段话。
+ *
+ * 只说「失败了」没用 —— 父 agent 需要知道**还能不能接着干**：跑多久、烧了多少步、
+ * 动过哪些文件。改过文件就不能盲目重派（会把同一处改动做两遍），没改过就可以。
+ */
+export function localCapVerdict(
+  capMs: number,
+  steps: number,
+  toolCalls: number,
+  files: string[]
+): { error: string; summary: string; note: string } {
+  const min = Math.round(capMs / 60_000)
+  const where = files.length
+    ? `它改过的文件：${files.join('、')}。先核对这几处（写前有快照），再决定接着改还是重来。`
+    : '它没有写入任何文件，拆小重派一次是安全的。'
+  return {
+    error: `本地工作模型跑了 ${min} 分钟仍未收尾（${steps} 步 · ${toolCalls} 次工具调用），已中止。${where}`,
+    summary: `（子任务超时中止：本地模型单次任务不宜超过 ${min} 分钟，把任务拆小再派。）`,
+    note: `墙钟上限 ${min} 分钟已到`
+  }
+}
+
+/**
  * 挑本轮要下发的工具。
  *
  * `ctx` 是服务端真实可用的窗口（/props 或 num_ctx），不是配置里那个数字：
@@ -397,35 +559,11 @@ export function unwrapToolbox(call: ToolCall, universe: ToolSpec[]): ToolCall | 
   return { ...call, name: hit.name, args }
 }
 
-function estimateTokens(text: string): number {
-  let cjk = 0
-  let other = 0
-  for (const ch of text) {
-    if (/[\u3000-\u9fff\uff00-\uffef]/.test(ch)) cjk++
-    else other++
-  }
-  return Math.ceil(cjk + other / 3.5)
-}
-
-export function messagesTokens(messages: ChatMessage[]): number {
-  return messages.reduce((sum, m) => {
-    const calls = m.toolCalls ? JSON.stringify(m.toolCalls).length : 0
-    return sum + estimateTokens(m.content) + Math.ceil(calls / 3.5) + 8
-  }, 0)
-}
-
-/** 工具定义（名字 + 说明 + JSON Schema）也要算进请求体，本地小窗口模型上这笔开销不小 */
-function toolSpecsTokens(tools: ToolSpec[]): number {
-  return tools.reduce(
-    (n, t) =>
-      n +
-      estimateTokens(t.name) +
-      estimateTokens(t.description || '') +
-      Math.ceil(JSON.stringify(t.parameters ?? {}).length / 3.5) +
-      12,
-    0
-  )
-}
+/**
+ * token 估算与工具定义开销都搬到了 shared/tokens.ts：供应商那侧也要算同一笔账
+ * （输出预算 = 窗口 - 这次请求实际占了多少），两边各写一份必然会漂。
+ */
+export { messagesTokens } from '../shared/tokens'
 
 /**
  * 服务端「上下文放不下」这一类报错的统一识别。
@@ -517,8 +655,8 @@ function litePrompt(
       ? '1. 联网已关闭，无法搜索网页；需要最新资料时直接说明。'
       : '1. 问「有没有 / 推荐哪些 / 最新版本」这类外部事实（含 GitHub 项目、仓库名、网址）时，先调 web_search 核实再回答。不要只说「我正在搜索」，必须真的调用工具。',
     '2. 只写工具查到或用户给过的名字和网址；没查到就直说不确定，绝不凭记忆编项目名、仓库名或链接。也不要说「请稍等」。',
-    '3. 改代码前用 list_dir / grep / read_file 看清现状，修改用 edit_file。文件读不全时分段读（offset/limit）或 grep，不要写临时脚本去打印文件。',
-    '4. 要改的代码必须写进文件（edit_file / write_file），不要把整段代码贴在回复里；确认不需要了的一次性脚本要删掉，别留在用户目录。',
+    '3. 改代码前用 list_dir / grep / read_file 看清现状，修改用 edit_file。文件读不全时分段读（offset/limit）或 grep，不要写临时脚本去打印文件。read_file 每行前面的「行号→」是位置标记，old_string 里不要带它；没读过的文件不能改。',
+    '4. 要改的代码必须写进文件（edit_file / write_file），不要把整段代码贴在回复里；一次性的校验脚本写到 `.roroto/tmp/` 下，别丢在交付目录里。',
     '5. 需要命令时用 run_shell；工具报错先读错误再换方案。',
     '6. 用户消息里的附件正文直接使用，不要让用户再粘贴。',
     ...(opts.remember === false ? [] : ['7. 值得下次知道的事实用 remember 记一条。']),
@@ -583,12 +721,140 @@ function shrinkArgsForSmall(name: string, args: Record<string, unknown>): Record
   return args
 }
 
-function compact(messages: ChatMessage[], budget: number): ChatMessage[] {
+/**
+ * 工具参数里「一塞就是整份文件」的字段。
+ *
+ * 这些内容留在历史里只为了让模型回忆「我写过什么」，翻全文没有价值 ——
+ * 文件本体就在工作区，真需要细节它会重新 read_file。
+ */
+const BULKY_ARG_KEYS = new Set([
+  'content',
+  'old_string',
+  'new_string',
+  'oldText',
+  'newText',
+  'patch',
+  'diff',
+  'text',
+  'body'
+])
+
+/**
+ * 截断一个工具调用里的大字段。
+ * 没有可截的返回 null —— 调用方据此少建对象，避免无意义地改动历史（前缀缓存会因此失效）。
+ */
+function shrinkArgs(
+  args: Record<string, unknown>,
+  maxChars: number
+): Record<string, unknown> | null {
+  let changed = false
+  const out: Record<string, unknown> = { ...args }
+  for (const [key, value] of Object.entries(out)) {
+    if (!BULKY_ARG_KEYS.has(key) || typeof value !== 'string' || value.length <= maxChars) continue
+    // 二次压缩（shrinkTail 逐级收紧）时别再叠一层标记，直接截短即可
+    if (value.includes('（历史参数已压缩')) {
+      out[key] = value.slice(0, maxChars)
+      changed = true
+      continue
+    }
+    out[key] = `${value.slice(0, maxChars)}\n…（历史参数已压缩：原 ${value.length} 字符，完整内容见工作区文件）`
+    changed = true
+  }
+  return changed ? out : null
+}
+
+/**
+ * 折叠时的可选旁路：把被丢掉的原文存到磁盘，并把路径写进折叠说明。
+ *
+ * 这是「模型永远拿不回中间那段」的解药。以前折叠只留 800 + 320 字符，
+ * 模型想确认自己写过什么只能重新 read_file —— 而重读又占上下文，
+ * 下一轮折得更狠，形成正反馈。
+ *
+ * 没有传 spill（单测、无工作区的纯聊天）时行为完全不变。
+ */
+export interface CompactOptions {
+  /** 返回给模型看的路径；返回 null 表示没存下，折叠说明里就不带路径 */
+  spill?: (text: string, meta: { toolName?: string; index: number }) => string | null
+}
+
+/**
+ * 最后一道闸：整轮丢无可丢时，就地截断超大的工具参数 / 工具输出。
+ *
+ * 以前只靠 dropOldestTurns，而它「保底不切最后一轮」—— 当最后一轮自己就装不下
+ * （典型：一次 write_file 写了整份 HTML），预算砍到 600 也没用：三次重试发出的是
+ * 一模一样的 16431 tokens，服务端每次都回 400。
+ *
+ * 只改内容、不删消息：assistant.toolCalls 与 tool 结果的配对始终完整，
+ * 不会因为「瘦身」造出一份服务端不认的历史。
+ */
+export function shrinkTail(list: ChatMessage[], budget: number, opts?: CompactOptions): ChatMessage[] {
+  let out = list
+  for (const limit of [600, 300, 150, 80, 40]) {
+    out = out.map((m) => {
+      if (m.role === 'tool' && m.content.length > limit) {
+        const where = opts?.spill?.(m.content, { toolName: m.toolName, index: -1 })
+        const tail = where ? `…（历史工具输出已压缩，全文见 ${where}）` : '…（历史工具输出已压缩）'
+        return { ...m, content: `${clipSafe(m.content, limit, '')}\n${tail}` }
+      }
+      if (m.role === 'assistant' && m.toolCalls?.length) {
+        let changed = false
+        const calls = m.toolCalls.map((c) => {
+          const shrunk = shrinkArgs(c.args, limit)
+          if (!shrunk) return c
+          changed = true
+          return { ...c, args: shrunk }
+        })
+        return changed ? { ...m, toolCalls: calls } : m
+      }
+      return m
+    })
+    if (messagesTokens(out) <= budget) break
+  }
+  return out
+}
+
+export function compact(messages: ChatMessage[], budget: number, opts?: CompactOptions): ChatMessage[] {
   if (messagesTokens(messages) <= budget) return messages
   const last = messages.length - 1
+  /**
+   * 最新的这几条不许折叠。
+   *
+   * 它们就是模型这一步正在推理的东西：刚调用的工具、刚读到的文件内容。
+   * 以前无差别地把所有 tool 输出砍到 1200 字符，模型读回自己刚写的 6.5KB 文件时
+   * 只看到前 1200 字符，于是认定「写入被截断了」，接着重写一遍再被砍 —— 真实会话里
+   * 整整 92 次 write_file 就是这么转出来的（模型原话：the tool outputs are being truncated in my view）。
+   * 预算真装不下时还有 shrinkTail 兜底，那里才允许动最新的内容。
+   */
+  const protectFrom = (() => {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].role === 'assistant' && messages[i].toolCalls?.length) return i + 1
+    }
+    return messages.length
+  })()
   const trimmed = messages.map((m, idx) => {
-    if (m.role === 'tool' && m.content.length > 1200) {
-      return { ...m, content: `${m.content.slice(0, 1200)}\n…（历史工具输出已压缩）` }
+    if (m.role === 'tool' && idx < protectFrom && m.content.length > 1200) {
+      // 掐头去尾都留：工具输出的**结尾**往往是结论或文件的收尾，只留开头会让模型误判「内容没了」
+      const { head, tail, omitted } = splitHeadTail(m.content, 800, 320)
+      const where = opts?.spill?.(m.content, { toolName: m.toolName, index: idx })
+      const note = where
+        ? `…（较早的工具输出已折叠，中间 ${omitted} 字符省略；完整原文可用 read_file 读 ${where}）…`
+        : `…（较早的工具输出已折叠，中间 ${omitted} 字符省略）…`
+      return { ...m, content: `${head}\n${note}\n${tail}` }
+    }
+    /**
+     * assistant 的 toolCalls 以前完全没被折叠 —— 写入类工具把整份文件塞在参数里，
+     * 一段 HTML 就上万字符。只压 tool 输出、不压这块，等于把最占地方的部分留到最后。
+     */
+    if (m.role === 'assistant' && m.toolCalls?.length) {
+      let changed = false
+      const calls = m.toolCalls.map((c) => {
+        const shrunk = shrinkArgs(c.args, 800)
+        if (!shrunk) return c
+        changed = true
+        return { ...c, args: shrunk }
+      })
+      if (changed) return { ...m, toolCalls: calls }
+      return m
     }
     // 早期轮次里的附件正文最占地方：留个开头，细节让模型按需重读
     if (m.role === 'user' && idx < last && m.images?.length) {
@@ -608,8 +874,12 @@ function compact(messages: ChatMessage[], budget: number): ChatMessage[] {
   /**
    * 裁掉最早的一段时，必须按「轮」切，不能按条切 —— 具体规则和原因见
    * shared/turns.ts 的 dropOldestTurns（丢掉半条 tool 结果会让之后每次请求都 400）。
+   *
+   * 而「轮」也切不动时（最后一轮自己就超），再走 shrinkTail 就地瘦身：
+   * 只截内容、不删消息，配对关系不会坏。
    */
-  return dropOldestTurns(trimmed, (next) => messagesTokens(next) > budget)
+  const dropped = dropOldestTurns(trimmed, (next) => messagesTokens(next) > budget)
+  return messagesTokens(dropped) <= budget ? dropped : shrinkTail(dropped, budget, opts)
 }
 
 /** 折叠标记：带这个尾巴的说明已经被折叠过，不要重复处理 */
@@ -626,7 +896,7 @@ const MASK_MARK = '（较早的工具输出已折叠'
  * 如果每一轮都按「距现在第几轮」来折叠，等于每轮都把整个历史重算一遍，反而更慢。
  * 所以做成「超阈值时一次性折一大批，然后很久不再动」的阶梯式行为。
  */
-export function maskObservations(list: ChatMessage[], cap: number): ChatMessage[] {
+export function maskObservations(list: ChatMessage[], cap: number, opts?: CompactOptions): ChatMessage[] {
   if (cap <= 0 || messagesTokens(list) <= cap * 0.75) return list
   // 最近一轮的原文必须留着（模型正在用它推理），倒数第二条也留着，避免刚查完就看不见
   let lastUser = -1
@@ -642,10 +912,13 @@ export function maskObservations(list: ChatMessage[], cap: number): ChatMessage[
     if (i >= guard || m.role !== 'tool') return m
     if (m.content.length <= 900 || m.content.includes(MASK_MARK)) return m
     changed = true
-    const head = m.content.slice(0, 600).trimEnd()
+    const head = clipSafe(m.content, 600, '').trimEnd()
+    const where = opts?.spill?.(m.content, { toolName: m.toolName, index: i })
+    // 存下来了就指路（模型可以直接 read_file 那一段），没存下才让它重新调用工具
+    const how = where ? `完整原文可用 read_file 读 ${where}` : `需要细节请重新调用 ${m.toolName ?? '该工具'}`
     return {
       ...m,
-      content: `${head}\n${MASK_MARK}：原输出 ${m.content.length} 字符，需要细节请重新调用 ${m.toolName ?? '该工具'}）`
+      content: `${head}\n${MASK_MARK}：原输出 ${m.content.length} 字符，${how}）`
     }
   })
   return changed ? out : list
@@ -694,6 +967,21 @@ export function systemPrompt(
     hook?: string | null
     /** 本轮是否用 toolbox 网关收起了部分工具：提示里要教它怎么用 */
     toolbox?: boolean
+    /**
+     * 标了「子」的模型数。只用来告诉模型「有没有子智能体可用」，
+     * **不再用来判断能不能并行** —— 配了 1 个也是串行（见 lanes）。
+     */
+    subAgents?: number
+    /**
+     * 本次真能同时跑几路子任务（`worker.ts` 的 `parallelLanes`，算式见
+     * `shared/agentpool.ts` 的 `laneCount`）。
+     *
+     * 以前这里按「配了几个子智能体」猜：配了 1 个也教模型「连写 2～3 个」，
+     * 而执行层的并发上限是「池里几个就绪就几路」，两边对不上 ——
+     * 几路只读审查排成队、还全撞在同一家限流上。
+     * 不传时按「没配 worker」估（本地 1、远端 3），直接调 systemPrompt 的场景都是这种。
+     */
+    lanes?: number
   } = {}
 ): string {
   const ws = workspace || '（未选择工作区）'
@@ -705,32 +993,173 @@ export function systemPrompt(
     '闲聊、常识、日期时间这类问题直接用文字回答：本轮末尾的环境信息里已经给了当前时间，不要为了「今天几号／星期几」去执行命令。',
     '改代码前先看清现状：用 list_dir / glob / grep / read_file 获取真实内容，绝不凭空假设文件存在或内容如何。',
     '修改用 edit_file 做精确替换，保持最小改动；只有新建文件或整体重写才用 write_file。',
-    '需要验证时用 run_shell。默认 shell 是 cmd.exe，需要 unix 命令时把 shell 参数设为 bash。改完代码程序会自动跑测试或构建，你只要按结果继续修。',
+    `需要验证时用 run_shell。默认 shell 是本机默认 shell（${
+      defaultShellKind() === 'cmd' ? 'Windows cmd.exe' : 'macOS/Linux 的 $SHELL'
+    }），可把 shell 参数设为 bash / powershell 切换。改完代码程序会自动跑测试或构建，你只要按结果继续修。`,
+    /**
+     * GUI / 长驻程序的验证方式必须点明。
+     *
+     * 实测里模型连着三次用前台 run_shell 跑 tkinter，分别被 15s/5s/5s 超时杀掉，
+     * 白烧三轮；最后它自己绕过验证，用「exe 已启动」当通过。这类程序不会自己退出，
+     * 前台等它 = 必然超时，所以得把「后台起 + 判存活 + 回收」这条路写进规则。
+     */
+    'GUI / 长驻程序（tkinter、pygame、服务、dev server、浏览器常驻页）不要用前台 run_shell 等它退出——它不会自己结束，只会被超时杀掉。' +
+      '正确做法：run_shell 设 background:true 启动，等几秒用 shell_bg {"action":"log","id":"…"} 看日志；' +
+      '进程还活着、日志里没有 Traceback 就算启动通过；验完用 shell_bg {"action":"kill"} 回收，别留后台进程。',
+    ...(isWin
+      ? [
+          'Windows 上不要用 `python -c "..."` / `node -e "..."` 这种内联多语句跑验证：cmd.exe 对引号的二次解析容易把它截断成半句。把脚本用 write_file 写成 .py / .js 文件，再 run_shell 执行；确实要内联时，把 shell 设成 powershell。',
+          'tail / head / grep / sed / awk 这类 unix 命令在 cmd 和 powershell 里默认跑不了：要么把 shell 显式设成 bash（需 Git Bash），要么换成本机等价命令（type / dir / findstr、PowerShell 的 Get-Content -Tail、Select-String）。ls / cat / rm 在 PowerShell 里虽然有别名，但参数语义不一样，别照抄 unix 写法。'
+        ]
+      : []),
     '工具返回错误时先读错误信息再换方案，不要重复同一次失败调用。',
     '不要一次读取大量无关文件，按需逐步获取。',
     '读文件被截断时用 offset/limit 分段读、用 grep 定位关键词；不要为了看内容写 .py / .sh 临时脚本。',
+    'read_file 返回的每行前面有「行号→」，那是位置标记、不是文件内容：old_string 里不要带它。改文件前必须先 read_file 读过它，old_string 照原文复制（缩进、空格、标点都要一致）；文件在你读过之后被改过，会被要求重读。同一个文件没改动时再读只会得到一句「未变化」的提示——那就直接用上文的内容改，实在要再看一遍传 force:true。',
     '改代码必须落到文件里：新建用 write_file、改动用 edit_file，不要把整段代码贴在回复里当交付。',
-    '一次性调试脚本不要留在用户目录：确需运行时写到系统临时目录，用完删掉；交付目录里只留最终成果文件。',
+    '一次性脚本（生成 / 校验 / 探针用）一律写到 `.roroto/tmp/` 下，用 run_shell 时也带这个前缀（如 `python .roroto/tmp/gen.py`）。交付目录里只留最终成果；写到根目录的临时脚本会在收工时被挪走，届时你会找不到它。',
     '任务完成后用一两句话说明改了什么，不要长篇总结。',
     '一次任务要一直做到完：计划里还有没勾掉的项、或还有文件 / 命令没处理时，不要收工，也不要只说「接下来我会…」就结束。全部做完再给结论。',
     '有附件正文时，先通读再回答；不要只凭文件名猜内容。'
   ]
+  /**
+   * 能力边界：本地中小模型接复杂多文件项目会空转（工具表 + 提示就吃掉大半个窗口）。
+   * 只在「本地 + 参数量中等」时注入 —— 在线强模型和极简小模型各有自己的路径，
+   * 这里专门把「3B~14B 本地模型」这条最容易被误用的区间点出来。
+   */
+  const localSize = modelSizeB(provider.model)
+  if (isLocalProvider(provider) && localSize !== null && localSize > 3 && localSize <= 14) {
+    rules.push(
+      `你是本地 ${localSize}B 模型，上下文和输出都有限：复杂多文件项目（一次要写十几个文件、带前后端和数据库的那种）尽量小步快跑，` +
+        '一次只做「能打开、能验证」的一小步，别试图一口气产出整个项目。' +
+        '如果用户要的是大工程，可以如实说明「当前模型更适合拆成多轮小步完成」，建议换更强的在线模型会更顺。'
+    )
+  }
   rules.push(
     webOn
       ? '需要外部事实（开源项目与仓库名、链接、版本、不熟的库、报错含义、官方文档）时先 web_search，再用 web_fetch 读最相关的一两个页面；引用结论要给出网址。不许凭记忆编造仓库名、项目名或链接——没查到就直说「不确定」。'
       : '联网已在「软件设置」里关闭：你不能搜索或打开网页。遇到必须查最新资料的问题，用已有知识回答并说明可能不是最新，同时提醒用户可以打开联网开关。'
   )
+  /**
+   * 计划怎么切，比计划有多长重要得多。
+   *
+   * 同一个游戏，按「代码层次」切（骨架→函数→事件→样式）会有三个中间态都跑不起来，
+   * 于是验收只能等到最后，错误也就在最后一起爆 —— 这正是之前反复重写的成因。
+   * 按「能跑的状态」切，每一步都有可看的结果，坏了只回退一步。
+   */
   rules.push(
-    '三步以上的任务先调 update_todos 列出计划，之后每完成一步就更新状态（同一时间只留一项 in_progress），做完把全部标为 completed。'
+    '三步以上的任务先调 update_todos 列出计划，之后每完成一步就更新状态（同一时间只留一项 in_progress），做完把全部标为 completed。' +
+      '计划必须按「能跑起来的状态」切，不能按「代码的层次」切：每一步结束时，产物都要能打开、能看到东西。' +
+      '反例（最容易犯的）：1 写 HTML 骨架 2 写全部函数 3 接事件 4 调样式 —— 前三步页面都是死的，一步都验不了。' +
+      '正例：1 打开是一块能左右移动的方块 2 能跳起来 3 有障碍物会撞 4 有分数会涨。' +
+      '每一项后面用一句话写清「怎么算做完了」，例如「打开无报错」「按空格会跳起来」。'
   )
+  /**
+   * 写入粒度硬约束必须写进提示，不能只靠工具层拒绝。
+   *
+   * 工具层拒绝是「事后」的：模型已经烧掉一次完整生成才被拦下。提示里先立规矩，
+   * 它第一笔就按分段来，省掉一整轮重试。两者缺一不可 —— 只写提示不拦，它照样
+   * 一次吐两万字符；只拦不写提示，它会把拒绝当成工具坏了，原样再试一遍。
+   */
+  rules.push(
+    `单次写入有硬上限：一次 write_file 的 content 不超过 ${MAX_SINGLE_WRITE_CHARS} 字符（约 300~400 行），edit_file 的 new_string 同理。` +
+      '本地模型的单次输出上限只有一万多 token，超过这个量必定被切断在半句，文件就成了残片，然后你只能整份重写 —— ' +
+      '反复重写、越写越小，就是这么来的。' +
+      '大文件一律分段：先 write_file 只写骨架（结构 + 空函数 + 结尾留一行标记注释），' +
+      '再用 write_file({append:true, content:"…"}) 一段一段往后接，每段都短到能一次写完。' +
+      '切在「结构 / 样式 / 逻辑」这种天然边界上，不要切在字符串、注释或函数中间。'
+  )
+  /**
+   * 「本次能并行几路」只有一个来源：`laneCount`（执行层的并发上限用的就是它）。
+   * 不传就按「没配 worker」估 —— 本地单槽 1 路、远端 API 3 路，和以前的行为一致。
+   */
+  const lanes = opts.lanes ?? (isLlamaProvider(provider) ? 1 : 3)
+  const canParallel = lanes >= 2
+  const workers = opts.subAgents ?? 0
+  /**
+   * 拆分范例无条件注入。
+   *
+   * 以前这段只在配置了多个模型时才出现，于是单模型的会话里，模型对「怎么拆」
+   * 完全没有具体样板 —— 它只知道「要列计划」，列出来还是「1. 写 HTML 2. 写 JS」，
+   * 粒度和没列一样。范例本身几乎不占字数，但它是把「列计划」和「拆到能执行」
+   * 区别开来的唯一东西。
+   *
+   * 所以「拆」的话照说，但「能同时开」这句要看 lanes —— 只有 1 路时还说「一起派出去」，
+   * 模型会以为派 3 个就是并行，实际在闸门里排队、各自重付一次 prefill。
+   */
+  rules.push(
+    '大任务要拆到「一次只产出一个能跑的小块」，而不是「列三条大纲」。需要 3 步以上、且步骤之间互不依赖（各自读写的文件不同）时，' +
+      (canParallel
+        ? '就在同一轮连写多个 task 一起派出去 —— '
+        : '就拆成几个 task 派出去（本次只能一路一路跑，拆开的好处是每个 task 有自己的上下文，父会话不被中间过程占满）—— ') +
+      '比如「搭页面骨架」「写游戏/业务逻辑」「调样式与资源」「跑本地自测」这几件事互不依赖，适合拆开派。' +
+      '每个 task 的 prompt 必须自包含：涉及哪些路径、要交付什么、验收标准是什么；不要让两个 task 改同一个文件。等全部结果回来再汇总作答。' +
+      '真的 1～2 步就能做完的，自己做，别为了拆而拆。'
+  )
+  /**
+   * 「不干活的并行」必须单独教一次。
+   *
+   * 上面那条范例只举了写代码的活（骨架 / 逻辑 / 样式 / 自测），于是模型学到的
+   * 拆分方式就只有「写」，遇到「帮我看看有没有问题」这类请求时，它默认自己
+   * 一边 grep 一边读，把上下文塞满还只查了一个角度 —— 而 explore 通道本来就是
+   * 为这件事准备的：只读、不写盘、多路之间不可能冲突。
+   *
+   * 但也不能无条件鼓励：能不能真并发取决于 runTaskBatch 的 MAX —— 有工人池按池子
+   * 大小，没有时本地 llama 是 1（单槽，多派只会在闸门里排队、各自重付一次 prefill，
+   * 比串行更慢），远端 API 是 3。所以这里按 canParallel 分两版说法，
+   * 避免教出一个「什么都拆、拆了还更慢」的模型。
+   */
+  /**
+   * 「不干活的并行」必须单独教一次。
+   *
+   * 上面那条范例只举了写代码的活（骨架 / 逻辑 / 样式 / 自测），于是模型学到的
+   * 拆分方式就只有「写」，遇到「帮我看看有没有问题」这类请求时，它默认自己
+   * 一边 grep 一边读，把上下文塞满还只查了一个角度 —— 而 explore 通道本来就是
+   * 为这件事准备的：只读、不写盘、多路之间不可能冲突。
+   *
+   * 但不能无条件鼓励：能开几路由 `lanes` 说了算（和执行层同一个算式），
+   * 只有 1 路时就得说「派 1 个依次查」，否则教出一个「什么都拆、拆完排队更慢」的模型。
+   */
+  rules.push(
+    '除了写代码，**只读的检查也值得派出去**：改完一批代码、用户让你「看看有没有问题」、或者交工前自查时，' +
+      '把审查拆成彼此独立的角度 —— 比如「逻辑与边界条件」「异常处理与资源释放（句柄、监听、定时器、订阅有没有收）」「需求点核对与遗漏」。' +
+      (canParallel
+        ? `同一轮连写 ${Math.min(3, lanes)} 个 \`task(mode=explore)\`，一个盯一个角度。它们只能读、不能写，所以互不干扰，也不会把你正在改的文件搅坏；几份结论由你合成一份再答用户，不要原样转述。`
+        : '派 1 个 `task(mode=explore)`，让它依次查这几个角度（' +
+          (workers > 0 ? '本次只放得下 1 路，理由见下一条）' : '本机只能串行，理由见下一条）') +
+          '。它只能读不能写，改不坏你正在动的文件；结论由你核对后合成一份再答用户。') +
+      '需要动手修的地方自己改，或另派完整模式的 task —— 别把「改」派给 explore。'
+  )
+  if (workers > 0 && canParallel) {
+    rules.push(
+      `已经配好 ${workers} 个子智能体，本次能真正并行 ${lanes} 路，上面那种「同一轮连写多个 task」现在就能用。`
+    )
+  } else if (workers > 0) {
+    /**
+     * 配了子智能体、但这次只放得下 1 路（只配了 1 个，或那 1 个正在冷却/没就绪）。
+     * 这时必须点明「会排队」，否则模型照样连写 3 个 —— 排队跑完的时间和串行做一遍
+     * 差不多，还要多付几次上下文。
+     */
+    rules.push(
+      `配了 ${workers} 个子智能体，但本次同时只放得下 ${lanes} 路：多写的 task 会一个个排队跑。` +
+        '要多角度检查就派 1 个，让它在同一个 prompt 里依次过一遍；真正互不依赖的活再拆成多条。'
+    )
+  } else {
+    rules.push(
+      '（当前没配子智能体时 task 照样可用：它有独立上下文，自己读写文件，只把结论交回来，中间过程不占你的上下文。要查很多文件才答得上来的问题，优先派出去。）'
+    )
+    if (!canParallel) {
+      rules.push(
+        '但这条路在本机是**串行**的：本地 llama.cpp 只有一个槽位，多路 task 会排队，一个跑完才轮到下一个（每个还要重付一次 prefill）。' +
+          '所以真正互不依赖、各自能独立跑完的活再拆成多条，否则一条里连着做更省时间。'
+      )
+    }
+  }
   if (rememberOn) {
     rules.push(
       '遇到值得下次知道的事实（构建/测试命令、目录约定、用户偏好、踩过的坑）就调 remember 记一条，不要重复记同一件事。'
     )
   }
-  rules.push(
-    '要翻阅大量文件才能回答（「这个项目的鉴权怎么走的」）、或要同时对多个互不相关的模块动手时，用 task 派子 agent：它有独立上下文，自己读写文件，只把结论交回来，中间过程不占你的上下文；一次连写多个 task 会并行执行。简单的一两步操作别派，自己做更快。'
-  )
   /**
    * 工具网关的用法必须写进提示：模型看不到没下发的工具，
    * 不告诉它「少了的那几个在哪」，它就会绕开（比如用 run_shell 硬拼 git 命令）。
@@ -851,6 +1280,121 @@ export function systemPrompt(
  * 所以 system 保持逐字节稳定，只有「这一轮才成立」的内容放在这里：
  * 它在请求体的最末尾，前面全部命中缓存，只 prefill 这几百个 token。
  */
+/** 自动派发的两种场景：检查型（要的是审查，不是改）、摸底型（要翻很多文件才看得清现状） */
+export type DelegateHint = 'review' | 'survey'
+
+/** 寒暄 / 应答：这类消息一个字都不该触发派发 */
+const CHITCHAT_RE =
+  /^\s*(?:你好|您好|hi|hello|hey|在吗|在不在|谢谢|感谢|辛苦了|ok|okay|嗯|好的|收到|早|晚安)\s*[!！。.~～?？]*\s*$/i
+/**
+ * 代码语境：派发的价值在「有现成的代码要读」，没这个信号就不派。
+ * 从零写一个演示页时派子 agent 只是把一句话拆成一句话 —— 那种活自己写更快。
+ */
+const CODE_CTX_RE =
+  /代码|文件|模块|项目|仓库|目录|函数|接口|脚本|配置|报错|异常|测试|依赖|调用|实现|逻辑|src\/|\.(?:ts|tsx|js|jsx|mjs|cjs|py|go|rs|java|kt|json|ya?ml|toml|md)\b|`[^`]+`/i
+/** 审查意图：要的是「检查」，不是「改」 */
+const REVIEW_RE =
+  /审查|复查|自查|体检|核对|检查|有没有.{0,6}(?:问题|毛病|bug|漏洞)|看看.{0,8}(?:有没有|是否|问题|毛病|bug|漏洞)|找.{0,6}(?:bug|问题)|对不对|合不合|代码质量|review/i
+/**
+ * 故障报障：用户最常这样开口 —— 「打开 sgf文件后棋子数量不对」「这个功能坏了」。
+ * 这批词单独看很泛（「不对」「错了」日常也用），所以**绝不单独判定**：
+ * delegateHint 里仍要求 CODE_CTX_RE 先命中（有代码语境），才把它当审查信号。
+ * 这样「今天心情不对」「这个想法错了」之类不会被误派去查代码。
+ */
+const BROKEN_RE =
+  /不对|不正确|不对劲|错了|坏了|坏掉|出问题|有问题|故障|失效|崩了|崩溃|挂了|用不了|不能用|对不上|不一致|对不齐|显示错误|算错|数量错/i
+/** 规模信号：这类活往往要翻很多文件，正是子 agent 擅长的 */
+const SCALE_RE =
+  /整个|全部|所有|逐个|每个|全量|跨|多处|多个文件|模块|架构|链路|调用链|流程|全项目|全局|项目里|重构|迁移|梳理|排查/i
+
+/**
+ * 这一轮要不要提醒模型「先派个只读子 agent」。
+ *
+ * 为什么要有它：派不派活过去完全由模型自己判断，而系统提示里的「3 步以上才拆」
+ * 和「1～2 步自己做」是两道劝退闸 —— 实测连开几个会话，task 调用恒为 0，
+ * 用户得手打一句「你有员工，派活给他」才破冰。能力早就在，缺的是触发信号。
+ *
+ * 判据刻意保守，宁可漏派也不要误派：
+ * - 只看用户这一轮的原话（被注入的续跑 / 验证文字不算）；
+ * - 只在第一步判一次，且 task 得真在工具表里（小模型、档案白名单里没有就不提）；
+ * - 寒暄、没有代码语境的纯问答一律不触发；
+ * - 计划模式不触发：那一轮本来就不许动手。
+ */
+export function delegateHint(input: {
+  text: string
+  step: number
+  hasTask: boolean
+  enabled: boolean
+  planMode?: boolean
+  nonInteractive?: boolean
+}): DelegateHint | null {
+  // 非交互（定时任务 / 交接）不提醒：没人盯着，多开一个子 agent 只是白烧 token
+  if (!input.enabled || !input.hasTask || input.nonInteractive || input.planMode) return null
+  // 只在第一步：后面每步都念一遍，模型会以为「一直没派成功」而反复派
+  if (input.step > 0) return null
+  const raw = (input.text ?? '').trim()
+  if (raw.length < 6) return null
+  if (CHITCHAT_RE.test(raw)) return null
+  if (!CODE_CTX_RE.test(raw)) return null
+  // 审查词优先级最高：明确要「检查」的，一律 review
+  if (REVIEW_RE.test(raw)) return 'review'
+  if (SCALE_RE.test(raw)) return 'survey'
+  // 长需求通常就是多文件的活：本地小模型一口气读下去必然吃满窗口
+  if (raw.length >= 80) return 'survey'
+  /**
+   * 故障报障词放最后 —— 它和上面两者会抢：
+   * - 短报障（「打开 sgf文件后棋子数量不对」）才是单点 review；
+   * - 又长又带「出问题」的多文件需求，上面已被长度兜底成 survey（派多路摸底更合适）。
+   * 且 BROKEN_RE 始终在 CODE_CTX_RE 之后，「不对/坏了」这类泛词只在代码语境里才算数。
+   */
+  if (BROKEN_RE.test(raw)) return 'review'
+  return null
+}
+
+/**
+ * 提醒文案。
+ *
+ * 按能不能真并发分两版：本地单槽 llama 上多派几路只会在闸门里排队、
+ * 各自重付一次 prefill（见 runTaskBatch 的 MAX），硬劝「派 3 个」只会更慢。
+ * 无论哪一版都只说 mode=explore —— 写文件的子任务不在这条自动通道上。
+ */
+export function delegateNoteText(kind: DelegateHint, parallel: boolean): string {
+  const how = parallel ? '2～3 个' : '1 个'
+  // 单路时不能写「它们」：模型会以为暗示它该派多个，和上一句「派 1 个」矛盾
+  const it = parallel ? '它们' : '它'
+  const split = parallel
+    ? '，按「逻辑与边界」「异常与资源释放」「需求核对」各盯一个角度'
+    : '，让它把逻辑与边界、异常与资源释放、需求核对依次过一遍'
+  if (kind === 'review') {
+    return (
+      `【自动派发】用户这轮要的是「检查」，不是「改」：先派 ${how} task(mode=explore) 做只读审查${split}，` +
+      `拿到结论再决定改不改。${it}改不了文件，所以不会和你正在改的东西打架。` +
+      '别自己一路 grep 到底 —— 那会把上下文吃满，还只看了一个角度。这次派完就继续干活，不要反复派。'
+    )
+  }
+  return (
+    `【自动派发】这件事要翻的文件不止一两个：先派 ${how} task(mode=explore) 摸清现状（相关文件在哪、调用链怎么走、现有实现长什么样），` +
+    '拿到结论再动手改。不要凭假设直接写 —— 改错一处要回滚的代价比派这一趟高得多。这次派完就继续干活，不要反复派。'
+  )
+}
+
+/**
+ * 这一轮用户真正说的话。
+ *
+ * 跳过程序注入的 runtime / continue / compact 消息（它们不是用户意图），
+ * 并切掉附件正文 —— 附件里可能是整份源码，拿它去匹配「代码语境」等于永远命中。
+ */
+export function lastUserText(session: Session): string {
+  for (let i = session.messages.length - 1; i >= 0; i--) {
+    const m = session.messages[i]
+    if (m.role !== 'user') continue
+    if (m.id === 'runtime' || m.id === 'continue' || m.id === 'compact-user') continue
+    const at = m.content.indexOf(ATTACH_BODY_MARK)
+    return (at >= 0 ? m.content.slice(0, at) : m.content).slice(0, 2000)
+  }
+  return ''
+}
+
 export function runtimeBlock(opts: {
   clock: string
   hook?: string | null
@@ -858,8 +1402,15 @@ export function runtimeBlock(opts: {
   diag?: string | null
   nudge?: string | null
   cont?: string | null
+  /** 自动派发提醒：由 delegateHint / delegateNoteText 生成，不传就没有这一段 */
+  delegate?: string | null
 }): string {
   const parts = [`【本轮环境】当前时间：${opts.clock}（系统本地时区）`]
+  /**
+   * 派发提醒放在最前面：它是「开工前该做的第一步」，压在最后会被
+   * 验证失败 / 编译诊断那几段挤掉注意力。
+   */
+  if (opts.delegate) parts.push('', opts.delegate)
   if (opts.hook) {
     parts.push('', '【项目钩子提供的事实】直接当已知条件用，不要重复去查：', opts.hook)
   }
@@ -1016,6 +1567,11 @@ export class AgentEngine {
    * 两边必须同进同退，漏删会让界面永远显示一个幽灵任务。
    */
   private live = new Map<string, RunningRun>()
+  /**
+   * 每条会话此刻有几个子 agent 在跑。侧栏的「第二枚机器人」看的就是它。
+   * 单独存而不塞进 live：live 是「谁占着会话锁」的快照，子 agent 并不额外占锁。
+   */
+  private subagents = new Map<string, number>()
   private approvals = new Map<
     string,
     { resolve: (ok: boolean) => void; sessionId: string; high: boolean; tool: string }
@@ -1041,8 +1597,23 @@ export class AgentEngine {
   private summaries = new Map<string, { upTo: number; text: string; tokens: number }>()
   /** 「工作区钩子未受信任」的提示每个会话只说一次，别每轮都念 */
   private hookNotice = new Set<string>()
-  /** 各会话当前的执行计划（update_todos 维护，只用于界面展示） */
+  /** 各会话当前的执行计划（update_todos 维护；同时驱动界面与「按步推进」门禁） */
   private todos = new Map<string, TodoItem[]>()
+  /**
+   * 打开验收没通过的文件：sessionId → 相对路径 → 错误摘要。
+   *
+   * 清空的条件只有一个：这个文件重新写完之后，在浏览器里真的打开无报错。
+   * 它挡的是「页面还是白屏，模型却把计划项标成完成」—— 这是整个流程里最容易
+   * 骗过使用者的一个动作，因为它不需要任何证据。
+   */
+  private verifyFails = new Map<string, Map<string, string>>()
+  /**
+   * 门禁连续拒绝次数：sessionId → 次数。
+   *
+   * 需要上限，否则一个改不动的 9B 会在「提交计划 → 被拒 → 再提交」里空转，
+   * 把一步的预算全烧在重发计划上。到顶就放行，但要让用户看见是强推过去的。
+   */
+  private planGateStrikes = new Map<string, number>()
   /** resume 时从 checkpoint 还原的「上次改过的文件」，接入本轮 touched 判断 */
   private resumeTouched = new Map<string, Set<string>>()
   /**
@@ -1055,6 +1626,11 @@ export class AgentEngine {
    * 插话只断这一步，点「停止」才断整轮。工具执行时同时听两个信号。
    */
   private stepCut = new Map<string, AbortController>()
+  /**
+   * 每个会话当前实际在用的供应商 id。
+   * 等审批 / 等回答时用它给本地实例续命 —— 那段时间没有任何在途请求，空闲卸载会误判成闲置。
+   */
+  private liveProviders = new Map<string, string>()
   /**
    * 全局并发闸门：会话锁管「同一个会话不重复跑」，它管「同时别开太多会话」。
    * 本地一份模型服务被 5 个会话一起抢，5 个都会变慢，等于全都卡住。
@@ -1110,10 +1686,21 @@ export class AgentEngine {
         return {
           ...r,
           state: running ? ('running' as const) : ('queued' as const),
-          position: running ? 0 : this.queue.position(r.sessionId)
+          position: running ? 0 : this.queue.position(r.sessionId),
+          subagents: this.subagents.get(r.sessionId) ?? 0
         }
       })
       .sort((a, b) => a.startedAt - b.startedAt)
+  }
+
+  /**
+   * 子 agent 开始/结束时加减计数。try/finally 在调用处包住整段执行，
+   * 用户点「停止」抛 AbortError 也不会把机器人永远留在侧栏上。
+   */
+  private markSubagent(sessionId: string, delta: 1 | -1): void {
+    const next = Math.max(0, (this.subagents.get(sessionId) ?? 0) + delta)
+    if (next === 0) this.subagents.delete(sessionId)
+    else this.subagents.set(sessionId, next)
   }
 
   /**
@@ -1131,7 +1718,8 @@ export class AgentEngine {
       kind,
       state: 'queued',
       position: 0,
-      startedAt: Date.now()
+      startedAt: Date.now(),
+      subagents: 0
     })
   }
 
@@ -1272,6 +1860,81 @@ export class AgentEngine {
     await store.appendMessages(session.id, rows)
   }
 
+  /**
+   * 折叠历史时的落盘旁路。
+   *
+   * 位置选在工作区的 `.roroto/spill/<会话>/`，不是 userData：工具的 safePath 把读写
+   * 限定在工作区内，存到别处的文件模型根本 read_file 不了，那就只剩「用户能看」这点价值，
+   * 而这条改动的全部意义就是让模型能**按需取回**被折叠的原文。
+   * `.roroto` 本来就是这个项目的内部目录（已进 artifacts 的忽略列表），不污染源码树。
+   *
+   * 没有工作区的会话（纯聊天）不落盘：给了路径它也读不到，不如保持原来的折叠文案。
+   */
+  private spillOptionsFor(session: Session): CompactOptions {
+    return session.workspace ? { spill: (text, meta) => this.spillTo(session, text, meta.toolName) } : {}
+  }
+
+  /** 把一段输出存进工作区的 spill 目录，返回模型能 read_file 的相对路径 */
+  private spillTo(session: Session, text: string, toolName?: string): string | null {
+    const workspace = session.workspace
+    if (!workspace) return null
+    const abs = saveSpill(path.join(workspace, '.roroto', 'spill'), session.id, text, { toolName })
+    if (!abs) return null
+    return path.relative(workspace, abs).split(path.sep).join('/')
+  }
+
+  /**
+   * 输出被截断、工具参数只写了一半时，接着写而不是重来。
+   *
+   * 以前撞墙只有一条路：拦下这次写入，告诉模型「大文件分两步走」。
+   * 可模型已经把 21574 字符的 HTML 写出来了，可能只差最后十几行 ——
+   * 全部丢掉重写，等于白烧一次 8192 tokens 和三分半钟（本地 9B 的真实账单，
+   * 而且下一轮大概率还会撞）。
+   *
+   * 实现放在 heal.ts：子 agent 也要用同一套（它只有 30 步，更经不起重写），
+   * 而子 agent 不是这个类的实例，逻辑长在这里它就拿不到。
+   *
+   * @returns 补全成功的条数。0 说明这一轮确实没写完 —— 调用方可以退回升档重试
+   */
+  private async healTruncatedWrite(
+    session: Session,
+    provider: ProviderConfig,
+    messages: ChatMessage[],
+    signal: AbortSignal,
+    result: StreamResult,
+    ctxWindow: number
+  ): Promise<HealResult> {
+    const out = await healTruncatedWrites({
+      provider,
+      messages,
+      calls: result.toolCalls,
+      signal,
+      /**
+       * 续写请求要能真的发出去：原请求就是因为 prompt 太大才被挤断的，
+       * 拿同一份满窗 prompt 再发一次，多半直接失败，然后安静退回「拦下」。
+       * 折到 60% 窗口并不是精确值，只是给续写留出落笔的地方。
+       */
+      shrink: (list) => compact(list, Math.max(1200, Math.floor(ctxWindow * 0.6)), this.spillOptionsFor(session)),
+      onUsage: (u) => {
+        const cur = result.usage
+        result.usage = {
+          prompt: (cur?.prompt ?? 0) + u.prompt,
+          completion: (cur?.completion ?? 0) + u.completion,
+          cached: (cur?.cached ?? 0) + (u.cached ?? 0) || undefined,
+          promptN: cur?.promptN,
+          promptMs: cur?.promptMs
+        }
+      },
+      /**
+       * 续写拼完但结构仍不完整时，把半成品留在工作区。
+       * 让模型 read_file 接着补，而不是把两万字符再吐一遍。
+       */
+      onSalvage: (text) => this.spillTo(session, text, 'partial'),
+      onHint: (message) => this.emit(session.id, { type: 'hint', message })
+    })
+    return out
+  }
+
   respondApproval(id: string, approved: boolean, always = false, persist = false): void {
     // 配额确认走同一个 IPC（界面上都是「需要确认」弹窗），但返回值是三态
     const quota = this.quotas.get(id)
@@ -1329,6 +1992,24 @@ export class AgentEngine {
     entry.resolve(answer)
   }
 
+  /**
+   * 等用户期间给本地实例续命。
+   *
+   * 审批 / 提问弹窗最长会挂 10 分钟，这段时间没有在途 HTTP 请求、`/slots` 也是空闲的，
+   * 空闲卸载只认这两条信号 —— 于是模型被停掉，用户点完「允许」，下一句就是
+   * 「进程不在了」。每 45 秒打一次点，成本可忽略，换来的是等待期间模型不被回收。
+   *
+   * 返回 stop，由等待方在收尾时调用（正常回答 / 中止 / 超时都要清）。
+   */
+  private keepLocalWarm(sessionId: string): () => void {
+    const timer = setInterval(() => {
+      const key = this.liveProviders.get(sessionId)
+      if (key) touchIdle(key)
+    }, 45_000)
+    timer.unref?.()
+    return () => clearInterval(timer)
+  }
+
   private askQuestion(
     sessionId: string,
     question: string,
@@ -1340,6 +2021,7 @@ export class AgentEngine {
     this.emit(sessionId, { type: 'question', request })
     return new Promise((resolve) => {
       let settled = false
+      const stopWarm = this.keepLocalWarm(sessionId)
       // 同 askApproval：signal 已断时会在建 timer 之前就 finish，用 const 会踩 TDZ
       let timer: ReturnType<typeof setTimeout> | null = null
       const finish = (answer: string) => {
@@ -1348,6 +2030,7 @@ export class AgentEngine {
         this.questions.delete(request.id)
         if (signal) signal.removeEventListener('abort', onAbort)
         if (timer) clearTimeout(timer)
+        stopWarm()
         this.emit(sessionId, { type: 'question_dismiss', id: request.id })
         resolve(answer)
       }
@@ -1390,6 +2073,7 @@ export class AgentEngine {
     this.emit(sessionId, { type: 'approval', request })
     return new Promise((resolve) => {
       let settled = false
+      const stopWarm = this.keepLocalWarm(sessionId)
       // 先声明再赋值：signal 已经断了的分支会在下面立刻 finish，
       // 那时 timer 还没建立，用 const 会踩进 TDZ 直接抛 ReferenceError
       let timer: ReturnType<typeof setTimeout> | null = null
@@ -1399,6 +2083,7 @@ export class AgentEngine {
         this.approvals.delete(request.id)
         if (signal) signal.removeEventListener('abort', onAbort)
         if (timer) clearTimeout(timer)
+        stopWarm()
         // 界面据此把弹窗收掉：中止或超时时没人会点按钮，不主动通知就会留一个僵尸弹窗
         this.emit(sessionId, { type: 'approval_dismiss', id: request.id })
         resolve(approved)
@@ -1487,7 +2172,7 @@ export class AgentEngine {
       const live = visionChanged ? await loadConfig() : null
       const session = await store.appendMessages(sessionId, [
         {
-          id: store.newId(),
+          id: options?.userMessageId ?? store.newId(),
           role: 'user',
           content: body,
           ...(images.length ? { images } : {}),
@@ -1544,11 +2229,14 @@ export class AgentEngine {
     this.queue.release(sessionId)
     this.controllers.delete(sessionId)
     this.live.delete(sessionId)
+    // 一轮收工时子 agent 必然已经结束，顺手清掉计数，别留到下一轮
+    this.subagents.delete(sessionId)
     this.alwaysApprove.delete(sessionId)
     this.alwaysApproveHigh.delete(sessionId)
     // 插话只属于这一轮：不清掉的话，下次提问会莫名带上上一轮没说完的那句话
     this.steers.delete(sessionId)
     this.stepCut.delete(sessionId)
+    this.liveProviders.delete(sessionId)
     // 收工结论只属于这一轮：读走就删，下次运行不该带着上次的结论
     const note = this.finishNotes.get(sessionId)
     this.finishNotes.delete(sessionId)
@@ -1608,12 +2296,30 @@ export class AgentEngine {
     }
     // 把结构化进度拼进「继续」消息：明确告诉模型做到哪、还剩什么、别重复已完成的部分
     const brief = cp ? `\n\n${checkpointBrief(cp)}` : ''
-    await this.send(
-      sessionId,
-      `继续。上次执行被中断了，请从断点接着做完，不要重复已经完成的部分。${brief}`,
-      undefined,
-      { reason: 'resume' }
-    )
+    try {
+      await this.send(
+        sessionId,
+        `继续。上次执行被中断了，请从断点接着做完，不要重复已经完成的部分。${brief}`,
+        undefined,
+        // id 标成 continue：让 lastUserText() 跳过这句注入文字、回溯到用户原始意图，
+        // 否则续跑这一轮的自动派发判定会落在这句没有代码语境的话上，子 agent 再也不启动。
+        { reason: 'resume', userMessageId: 'continue' }
+      )
+    } catch (err) {
+      /**
+       * 恢复本身失败（典型：历史已经压不下去，服务端一直 400）：
+       * 把状态从 running 改成 interrupted，别让启动横幅无限次把用户骗回同一个死循环。
+       *
+       * 文件不删：计划、改过的文件都还在，用户想再试直接发一句「继续」即可；
+       * 只是它不再被 listInterruptedCheckpoints 当成「还能自动恢复」的任务。
+       */
+      if (cp) {
+        await saveCheckpoint({ ...cp, status: 'interrupted', updatedAt: Date.now() }).catch(
+          () => undefined
+        )
+      }
+      throw err
+    }
   }
 
   /**
@@ -1687,7 +2393,7 @@ export class AgentEngine {
       notes.push(
         [
           `【图片看不了】用户发了 ${imageFiles.length} 张图片，但当前模型（${use.model}）没有视觉能力，你确实看不到画面。`,
-          '必须直接说明这一点，并给出可行做法：在「模型设置 → 模型 API」里换成支持看图的模型（如 qwen2.5-vl、llava、gemma3、mistral-small-3.1、gpt-4o），',
+          '必须直接说明这一点，并给出可行做法：在「模型设置 → 线上模型」里换成支持看图的模型（如 qwen2.5-vl、llava、gemma3、mistral-small-3.1、gpt-4o），',
           '或者让用户把图里的文字/关键数据打字发过来。绝对不要反问「你想让我识别什么」，那等于没读消息。'
         ].join('\n')
       )
@@ -1845,7 +2551,7 @@ export class AgentEngine {
       const label = m.role === 'user' ? '用户' : m.role === 'assistant' ? '助手' : `工具(${m.toolName ?? ''})`
       let body = (m.content || '').trim()
       if (m.toolCalls?.length) body += `［调用了 ${m.toolCalls.map((c) => c.name).join('、')}］`
-      if (body.length > 600) body = `${body.slice(0, 600)}…`
+      if (body.length > 600) body = clipSafe(body, 600)
       if (body) lines.push(`${label}: ${body}`)
     }
     if (!lines.length) return cached
@@ -1917,14 +2623,17 @@ export class AgentEngine {
     messages: ChatMessage[],
     tools: ToolSpec[],
     signal: AbortSignal,
-    onText: (text: string) => void
+    onText: (text: string) => void,
+    opts?: {
+      escalate?: boolean
+      onProgress?: (generated: number) => void
+      onWait?: (info: { waitedMs: number; promptTokens: number }) => void
+    }
   ): Promise<{ provider: ProviderConfig; result: StreamResult }> {
     const chain: ProviderConfig[] = [primary]
     if (config.autoFallback !== false) {
-      for (const p of config.providers) {
-        if (p.id === primary.id || !p.fallback || !p.model) continue
-        chain.push(p)
-      }
+      // 设置页不再提供备用勾选：本地供应商自动成链，显式勾过的老配置优先
+      chain.push(...fallbackCandidates(config.providers, primary.id))
       /**
        * 默认核心兜底：用户切到在线 API 或别的本地模型都行，能用就用他的；
        * 都不好使（key 失效 / 断网 / 本地服务没起）才落到 core/Core.gguf。
@@ -1973,6 +2682,9 @@ export class AgentEngine {
             messages,
             tools: use.noTools ? [] : tools,
             signal,
+            escalate: opts?.escalate,
+            onProgress: opts?.onProgress,
+            onWait: opts?.onWait,
             onText: (t) => {
               spoke = true
               onText(t)
@@ -2013,7 +2725,7 @@ export class AgentEngine {
             )
             if (ready) continue
           }
-          if (retryable(err) && attempt < RETRY_TIMES) {
+          if (retryable(err) && !quietTimeout(err) && attempt < RETRY_TIMES) {
             const wait = RETRY_BASE_MS * (attempt + 1)
             const reason = (err as Error).message.slice(0, 80)
             this.emit(sessionId, {
@@ -2023,6 +2735,12 @@ export class AgentEngine {
             await waitAbortable(wait, signal)
             continue
           }
+          /**
+           * 首字前的超时不要「换一家」也不要原地重试：换一家等于悄悄换模型，
+           * 重试等于让服务端再 prefill 一遍同样长的提示。统一抛回上层，
+           * 由它决定「缩一半提示再试」还是「停下来说清楚」。
+           */
+          if (quietTimeout(err)) throw err
           const reason = switchReason(err)
           const next = chain[i + 1]
           if (!reason || !next) throw err
@@ -2066,7 +2784,7 @@ export class AgentEngine {
   }
 
   /**
-   * 这个模型不吃原生工具调用：记进配置（= 设置页里那个「模型不支持原生工具调用」勾选）。
+   * 这个模型不吃原生工具调用：记进配置里的 noTools 字段（设置页已不提供该勾选）。
    * 不记的话，每发一条消息都要先撞一次 400 再降级，白等一整轮。
    */
   private async rememberNoTools(providerId: string): Promise<void> {
@@ -2139,11 +2857,15 @@ export class AgentEngine {
       provider.kind === 'ollama' ? { ...provider, contextWindow: ctxWindow } : provider
     /** 自动切换后当前实际在用的供应商：算预算、写系统提示都按它来 */
     let runProvider = chatProvider
+    // 记下来：等审批 / 等回答时按它给本地实例续命（见 keepLocalWarm）
+    this.liveProviders.set(session.id, runProvider.id)
     // 未选择工作区时，默认使用软件根目录下的 workspace/
     // 定时任务可以钉死一个工作区：档案是给某个仓库用的，不该跟着界面当前选择跑
     const forcedWs = options?.workspace ? path.resolve(options.workspace) : null
     if (forcedWs) await fs.mkdir(forcedWs, { recursive: true }).catch(() => undefined)
     const workspace = forcedWs ?? (await effectiveWorkspace(config))
+    /** 本轮开始时刻：收工清理只动这之后出现的临时脚本 */
+    const runStartedAt = Date.now()
 
     /**
      * 「以后都这样」的长期放行：一次读盘，之后全用内存判断。
@@ -2269,6 +2991,8 @@ export class AgentEngine {
     /** 自动验证失败的结论，下一轮塞进系统提示让模型继续修 */
     let verifyNote: string | null = null
     let verifyRounds = 0
+    /** 覆盖度提示只回灌一次：它是建议，不是门禁，反复推只会拖长任务 */
+    let stateHintRounds = 0
     /** 诊断回灌收口：收工前还有编译错误就再推一轮，计数上限防止死循环 */
     let diagRounds = 0
     let diagNote: string | null = null
@@ -2293,6 +3017,21 @@ export class AgentEngine {
     let nudgeNote: string | null = null
 
     /**
+     * 写入账本：同一个文件在一轮里被整份重写了多少次、最大写到多大。
+     *
+     * 为什么需要它：重复动作护栏比的是「调用参数是否一模一样」，而实测里模型每次
+     * 重写的参数都略有差别（换个变量名、多一句注释），护栏一次都没触发 —— 结果同一个
+     * 文件被写了十几次，每次都在几百字符处被截断，六万 token 只换来 693 字节。
+     * 这里换一个与「参数像不像」无关的口径：**这个文件到底有没有长大**。
+     *
+     * 只记整份 write_file（append 与 edit_file 不算）：它们在正常迭代里本来就会
+     * 反复出现，算进去会把「小步修改」误判成空转。
+     */
+    const writeLedger = new Map<string, { attempts: number; maxSize: number }>()
+    /** 触发产出比熔断时的结论；非空即收工 */
+    let writeBreaker: string | null = null
+
+    /**
      * 自动续跑。
      *
      * 模型经常「早退」：写完一两个文件就说「接下来我会…」，或者计划里还留着没勾掉的项，
@@ -2300,13 +3039,23 @@ export class AgentEngine {
      * 用户只能一次次手点「继续」。下面这些状态就是用来把这一轮自己接上去的。
      */
     const autoContinue = config.autoContinue !== false
+    /**
+     * 用户这一轮的原话：自动派发只按它判断意图。
+     * 取一次就够 —— 循环中途注入的续跑 / 验证文字不是用户意图，不能拿来当触发依据。
+     */
+    const turnText = lastUserText(session)
     /** 一次提问最多连跑多少步：开着自动续跑时放宽到 4 倍，但仍有硬上限，防止真死循环 */
     const stepBudget = autoContinue
       ? Math.min(600, Math.max(config.maxSteps, config.maxSteps * 4))
       : config.maxSteps
     /** 已自动续跑次数上限（每次续跑之间必须真的有产出，见下面的 sinceContinue 判断） */
     const MAX_CONTINUE = 12
-    /** 一轮里重复动作被拦下这么多次，就不再让它自己折腾了 */
+    /**
+     * 软预警阈值：一次运行累计超过这个 token 数（用户没设硬上限时）就提示一次。
+     * 150 万是实测里「正常多文件任务 vs 空转」的分界附近：一个单页游戏烧到 282 万
+     * 明显是模型在反复读文件试错，早该有人提醒它或提醒用户换方向。
+     */
+    const SOFT_TOKEN_WARN = 1_500_000    /** 一轮里重复动作被拦下这么多次，就不再让它自己折腾了 */
     const MAX_REPEAT_BLOCKS = 3
     let continues = 0
     /** 上次续跑之后执行过多少次工具调用：一次都没动就说明再推也没用 */
@@ -2324,11 +3073,26 @@ export class AgentEngine {
      * 否则小模型会把同一个 web_search 发到几十次。
      */
     const callGuard = createToolCallGuard()
+    /**
+     * 临时脚本护栏：和签名护栏一起用，但判据是「同一目录第几个脚本」。
+     * 模型绕过签名护栏的方式就是换文件名（`_tmp_fix.js` → `_tmp_inspect.js`），
+     * 参数每次都不同，只有按目录计数才拦得到。
+     */
+    const scratchGuard = createScratchGuard()
+    /**
+     * 连续同类错误护栏：上面两道都盯「调用动作」，模型换脚本名/换参数就能绕过。
+     * 这道只盯结果里的错误类别——换皮重试时错的始终是同一类（如一直 ENOENT），
+     * 连续几次就把「工作目录在哪、别再写外部临时脚本」直接回灌给它。
+     */
+    const errorStreak = createErrorStreakGuard({ workspace })
     /** 本批次被护栏拦下的次数：连着拦说明它自己走不出去，该停了 */
     let repeatBlocked = 0
     let repeatHinted = false
+    let scratchHinted = false
     /** 护栏判定「这一轮已经不会自己走出去了」：跳出 step 循环，而不是继续空转 */
     let repeatHalted = false
+    /** 连续同类错误护栏判定要收工（本批次工具跑完再生效，结果要先落库给模型看） */
+    let errorHalted = false
 
     /**
      * 用量闸门的状态。runTokens 只算这一次运行（含自动续跑，因为是同一个任务），
@@ -2344,6 +3108,9 @@ export class AgentEngine {
     let dayTokens = await dayUsage().catch(() => 0)
     let quotaWaived = false
     let quotaWarned = false
+    // 没设上限时的软预警：默认不限额是为了「行为不变」，但一次任务烧掉上百万
+    // token 还没做完，几乎可以肯定是模型在空转 —— 这时主动提醒一次，不打断。
+    let softWarned = false
 
     /**
      * 结构化 checkpoint：把「计划 + 改过的文件 + 验证结论」独立落盘，不随对话压缩失真。
@@ -2365,7 +3132,8 @@ export class AgentEngine {
           }
         }),
         verifyNote,
-        lastCalls: recentCalls.slice(-10),
+        // 只留签名：完整 args 里可能是整份文件（单条上万字符），落盘没意义，还会让 checkpoint 越滚越大
+        lastCalls: recentCalls.slice(-10).map((s) => (s.length > 300 ? clipSafe(s, 300) : s)),
         continues,
         createdAt: checkpointStartedAt,
         updatedAt: Date.now()
@@ -2428,6 +3196,19 @@ export class AgentEngine {
         if (answer === 'always') quotaWaived = true
       }
 
+      // 软预警：用户没设单次上限、但这一轮已经烧掉异常多的 token，主动提醒一次。
+      // 不打断（默认不限是刻意的），只是把「可能该收手/拆小/换模型」这条信息交出去。
+      if (!quotaWaived && !softWarned && parseLimit(config.tokenLimitPerRun) === 0 && runTokens >= SOFT_TOKEN_WARN) {
+        softWarned = true
+        this.emit(session.id, {
+          type: 'hint',
+          message:
+            `这一轮已经用了 ${Math.round(runTokens / 1000)}k token 还没结束。` +
+            '如果是本地小模型在反复空转，建议拆小任务或换更强模型；' +
+            '要设硬上限，到「软件设置 → 审批与执行」里给「单次运行 token 上限」填一个数字。'
+        })
+      }
+
       // 切换过供应商后，提示词和「小模型」判断都要按新模型来
       const smallNow = isSmallModel(runProvider.model)
       // 小模型走极简工具表；窗口紧张的本地模型走「精简 + toolbox 网关」；其余全量
@@ -2436,6 +3217,20 @@ export class AgentEngine {
       const hiddenSpecs = pick.hidden
       // 输出也要留位置：窗口是「提示 + 生成」共用的，全给历史会把回答挤断
       const outputReserve = Math.min(4096, Math.max(512, Math.floor(ctxWindow * 0.25)))
+
+      /**
+       * 配了几个「子」模型（只用于措辞：「配了几个」）。
+       * 判断能不能并行**不用它** —— 配了 1 个也是串行，得看真正就绪的路数。
+       */
+      const workerCount = subAgentProviders(config.providers, config.activeId ?? runProvider.id).length
+      /**
+       * 本次真能并行几路。系统提示和自动派发文案都从这里取，执行层的并发上限
+       * （runTaskBatch 的 MAX）用的也是同一个算式 —— 三处一个口径。
+       *
+       * 这里必须 await：`workerPool` 要查本地实例状态，而 `promptFor` 是同步的，
+       * 在它里面 await 会把提示构建变成异步，影响所有调用点。
+       */
+      const lanes = await parallelLanes(runProvider, config)
 
       const promptFor = (summaryText: string | null | undefined): string => {
         const base = smallNow
@@ -2458,10 +3253,29 @@ export class AgentEngine {
               persona: profile?.role ?? null,
               handoffTo: roster.map((a) => ({ name: a.name, role: a.role })),
               skills: skillsOn.map((s) => ({ name: s.name, desc: s.desc })),
-              toolbox: hiddenSpecs.length > 0
+              toolbox: hiddenSpecs.length > 0,
+              // 「能不能连派多个」只看本次真能并行几路，不看配了几个
+              subAgents: workerCount,
+              lanes
             })
         return mode === 'plan' ? `${base}\n\n${PLAN_MODE_NOTE}` : base
       }
+      /**
+       * 自动派发：任务像「要翻很多文件」或「要的是检查」时，程序在当轮提醒一句。
+       *
+       * 为什么不能只靠系统提示：派不派活过去完全由模型自己判断，实测连开几个会话
+       * task 调用恒为 0，用户手打「你有员工，派活给他」才破冰 —— 能力早就在，
+       * 缺的是每轮都成立的触发信号。这里只提醒，派几个、派什么仍由模型决定。
+       */
+      const delegateTip =
+        delegateHint({
+          text: turnText,
+          step,
+          hasTask: stepTools.some((t) => t.name === 'task'),
+          enabled: config.autoDelegate !== false,
+          planMode: mode === 'plan',
+          nonInteractive
+        }) ?? null
       /**
        * 本轮才成立的环境信息（时间 / 钩子 / 验证 / 续跑）：拼在最后一条 user 消息尾部，
        * 不进 system 提示 —— 见 runtimeBlock 上的说明，这是让前缀缓存能命中的前提。
@@ -2472,7 +3286,9 @@ export class AgentEngine {
         verify: verifyNote,
         diag: diagNote,
         nudge: nudgeNote,
-        cont: continueNote
+        cont: continueNote,
+        // 能不能真并发只看 lanes：有 worker 池按池子，没有时本地单槽 1、远端 3
+        delegate: delegateTip ? delegateNoteText(delegateTip, lanes >= 2) : null
       })
 
       /**
@@ -2485,7 +3301,8 @@ export class AgentEngine {
 
       /** 在这个窗口下，历史最多还能放多少 token */
       const capOf = (ctx: number, prompt: string, summarized: number): number => {
-        const usable = Math.floor((ctx - overheadOf(prompt, tailNote) - outputReserve) * 0.95)
+        // 留 10% 余量（原来 5%）：tokenizer 与估算总有偏差，本地模型上几十个 token 就足以让整轮 400
+        const usable = Math.floor((ctx - overheadOf(prompt, tailNote) - outputReserve) * 0.9)
         return Math.max(600, Math.min(Math.floor(ctx * 0.7), usable) - summarized)
       }
 
@@ -2528,12 +3345,22 @@ export class AgentEngine {
       const overhead = overheadOf(promptText, tailNote)
 
       const historyCap = (ctx: number): number =>
-        Math.max(600, Math.min(Math.floor(ctx * 0.7), Math.floor((ctx - overhead - outputReserve) * 0.95)) - summarized)
+        Math.max(
+          600,
+          Math.min(Math.floor(ctx * 0.7), Math.floor((ctx - overhead - outputReserve) * 0.9)) -
+            summarized
+        )
+
+      /**
+       * 折叠旁路只建一次：里面要拼工作区路径，而 buildMessages 在一次请求里会被
+       * 反复调用（预算逐级收紧时会重试三次），没必要每次都算。
+       */
+      const compactOpts = this.spillOptionsFor(session)
 
       const buildMessages = (cap: number): ChatMessage[] => {
         // 先折叠较早的工具输出，再按预算裁剪：这样 compact 丢掉的是整轮对话，
         // 而不是「把宝贵的轮次换成几屏早就没用的 grep 结果」
-        const history = compact(maskObservations(rest, cap), cap)
+        const history = compact(maskObservations(rest, cap, compactOpts), cap, compactOpts)
         const list: ChatMessage[] = [
           { id: 'system', role: 'system', content: promptText, createdAt: Date.now() },
           ...history.filter((m) => m.role !== 'system')
@@ -2568,14 +3395,67 @@ export class AgentEngine {
         this.emit(session.id, { type: 'delta', messageId, text: t })
       )
       // 小模型陷入复读循环时，界面不再跟着滚屏；落库前还会把尾巴剪掉
-      const loopGuard = createLoopGuard()
+      let loopGuard = createLoopGuard()
+      // 升档重试只做一次：第二次还撞就该让用户看到「换更大输出的模型」这条建议了
+      let escalated = false
 
       let attempt: { provider: ProviderConfig; result: StreamResult } | null = null
+      /**
+       * 实时生成量：模型写大文件时一次调用能吐七八千 token、跑几分钟，这期间
+       * 既没有正文 delta 也没有 usage，界面上除了计时器什么都没有，用户会以为卡死。
+       * 把已生成量节流上报（~300ms 一次），界面就能显示「正在生成 · 约 3.2K」。
+       * 一帧一报太密，数字会一直闪。
+       */
+      let lastProgressAt = 0
+      let reportedGen = 0
+      const onProgress = (n: number): void => {
+        if (n <= reportedGen) return
+        reportedGen = n
+        const now = Date.now()
+        if (now - lastProgressAt < 300) return
+        lastProgressAt = now
+        this.emit(session.id, { type: 'gen_progress', completion: n })
+      }
       let spoke = false
+      /**
+       * 首字之前的静默期。
+       *
+       * 本地模型收到 1.5 万 token 的提示后，要先整段 prefill 才吐第一个字；弱卡上几分钟是常态。
+       * 这段以前是**完全静默**的：界面只有计时器在走，用户以为死了，实际上服务端正在满负荷算。
+       * 这里把「已等多久、这次要读多少」定期说出去 —— 只报到 90 秒，之后每分钟一条，
+       * 避免大任务刷屏。
+       */
+      let waitEmittedAt = 0
+      const onWait = (info: { waitedMs: number; promptTokens: number }): void => {
+        const s = Math.round(info.waitedMs / 1000)
+        const due = waitEmittedAt === 0 ? s >= 30 : s - waitEmittedAt >= 60
+        if (!due) return
+        waitEmittedAt = s
+        const k = info.promptTokens >= 1000 ? `${(info.promptTokens / 1000).toFixed(1)}K` : String(info.promptTokens)
+        this.emit(session.id, {
+          type: 'hint',
+          message:
+            `还在等第一个字：这次请求约 ${k} tokens，已等 ${s} 秒。` +
+            '本地模型要先把整段提示读完才开始生成，上下文越长这一步越慢，属于正常。' +
+            '超过 10 分钟仍无输出会自动停下并说明原因。'
+        })
+      }
+      /** 首字超时后缩小提示重试的次数：一次就够，再缩也过不去就是模型 / 显存的问题 */
+      let shrunkForTimeout = 0
       // 撞上「超出上下文」时自动压缩历史重试：这类错误换供应商没用，但压小历史就能过，
       // 不该把一句 400 甩给用户（尤其是「继续」这种什么都没干就失败的情况）
       for (let retry = 0; ; retry++) {
-        // 让界面知道这一轮真实吃了多少上下文（估算值，中文≈1 字 1 token，代码≈3.6 字符 1 token）
+        /**
+         * 发送前先按「历史 + 工具定义」估一遍（system 与 tailNote 已经算在 messages 里，别重复加）。
+         * 超了就再瘦一次，别等 400 回来 —— 一次 400 要等服务端把 prompt eval 跑到报错点，
+         * 本地卡上白白烧几十秒，还得多一轮重试。
+         */
+        const requestEstimate = messagesTokens(messages) + toolSpecsTokens(stepTools)
+        if (requestEstimate > ctxWindow * 0.98) {
+          stepCap = Math.max(600, Math.floor(stepCap * 0.7))
+          messages = buildMessages(stepCap)
+        }
+        // 让界面知道这一轮真实吃了多少上下文（估算值，中文≈1 字 1 token，代码≈3 字符 1 token）
         this.emit(session.id, {
           type: 'context',
           used:
@@ -2602,20 +3482,47 @@ export class AgentEngine {
             (t) => {
               spoke = true
               if (loopGuard.push(t)) gate.push(t)
-            }
+            },
+            { onProgress, onWait }
           )
           break
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err ?? '')
+          /**
+           * 首字之前的超时：唯一的出路是把这次要读的东西变少。
+           *
+           * 不这么做的话，「超时 → 原样重发 → 再从头 prefill → 再超时」会无限循环，
+           * 用户看到的就是十几分钟没有任何动静。缩一半历史再试一次，还不行就停。
+           */
+          if (!signal.aborted && !spoke && quietTimeout(msg)) {
+            if (shrunkForTimeout >= 1) throw err
+            shrunkForTimeout += 1
+            stepCap = Math.max(600, Math.floor(stepCap * 0.5))
+            messages = buildMessages(stepCap)
+            waitEmittedAt = 0
+            this.emit(session.id, {
+              type: 'hint',
+              message:
+                '这次请求在吐出第一个字之前就超时了：多半是提示太长、预填充跑不完（也可能是显存不足在反复换页）。' +
+                '已把历史压缩一半重试一次；如果仍然不行，请缩小任务范围、或把「软件设置 → 上下文」调小一档再试。'
+            })
+            continue
+          }
           if (signal.aborted || spoke || !isContextOverflow(msg)) throw err
           /**
            * 已经砍过两次历史还是超窗：别再甩一句「HTTP 400」了事。
            * 用户看到的应该是一个能动手的下一步，而不是一串服务端原文。
            */
           if (retry >= 2) {
-            throw new Error(
-              `${msg}\n这轮对话的历史已经压到极限。可以：① 到「软件设置 → 上下文」把上限调到 8192，引擎会按更小的预算压缩历史；② 换上下文更大的模型；③ 新开一个会话重说需求。`
-            )
+            /**
+             * 提示必须按当前配置分支：`contextLimit` 关掉时，`ctxWindowFor` 根本不读「上下文」里那个值，
+             * 让用户「调到 8192」是句空话 —— 他调完还会以同样的 400 回来。
+             */
+            const advice =
+              config.contextLimit === true
+                ? '① 到「软件设置 → 上下文」把上限调得更小（引擎会按更小的预算压缩历史）；② 换上下文更大的模型；③ 新开一个会话重说需求。'
+                : '① 到「软件设置 → 上下文」打开「限制上下文」并填一个更小的值（只填数字、开关不打开是不生效的）；② 换上下文更大的模型；③ 新开一个会话重说需求。'
+            throw new Error(`${msg}\n这轮对话的历史已经压到极限。可以：${advice}`)
           }
 
           const proved = contextLimitOf(msg)
@@ -2624,8 +3531,13 @@ export class AgentEngine {
             ctxWindow = Math.max(2048, proved)
             void this.rememberCtx(runProvider.id, ctxWindow)
           }
-          // 估算有误差时上限可能正好相等，所以无论成立与否都再砍一半历史试一次
-          stepCap = Math.max(600, Math.floor(historyCap(ctxWindow) * 0.5))
+          /**
+           * 必须在上一次的基础上继续砍。
+           * 以前每次都从 historyCap(ctxWindow) 重算 0.5，只要 ctxWindow 没变，两次算出来一模一样，
+           * 于是三次重试发出的是同一份历史 —— 日志里 task 24031/24034/24037 全是 16431 tokens，
+           * 服务端也三次都回同样的 400。递减才是真的递减。
+           */
+          stepCap = Math.max(600, Math.floor(Math.min(stepCap, historyCap(ctxWindow)) * 0.5))
           messages = buildMessages(stepCap)
           this.emit(session.id, {
             type: 'hint',
@@ -2637,12 +3549,88 @@ export class AgentEngine {
       }
       gate.flush()
       if (!attempt) throw new Error('模型没有返回结果')
-      const result = attempt.result
+      let result = attempt.result
       // 真的换了供应商：后面的步骤直接用新的，避免每轮都先撞一次墙
       if (attempt.provider.id !== runProvider.id) {
         runProvider = attempt.provider
+        this.liveProviders.set(session.id, runProvider.id)
         const real = await effectiveContextWindow(runProvider)
         ctxWindow = this.ctxWindowFor(runProvider, config, real)
+      }
+
+      /**
+       * 撞到输出上限、工具参数只写了一半：先试着把剩下的续出来。
+       * 必须在「落库 + 执行工具」之前 —— 参数补全后这一条就是个正常调用，
+       * 后面的截断拦截、参数容错都按正常流程走。
+       */
+      const healOut = await this.healTruncatedWrite(
+        session,
+        this.fitted(runProvider, config),
+        messages,
+        signal,
+        result,
+        ctxWindow
+      )
+
+      /**
+       * 升档重试：撞到输出上限、又没有可续写的写入时，换更大的输出预算重发一次。
+       *
+       * 为什么不一上来就给最大：云端网关按 max_tokens 预扣额度（OpenRouter 尤其明显），
+       * 每句话都冻结 32K，余额不足的用户会直接 402。绝大多数回复 8K 就够，所以首轮小、
+       * 撞墙才升 —— 和 Claude Code 的 8K→64K 同一个思路。本地模型反过来：不占预扣，
+       * 首轮直接给足（见 providers/budget.ts），这里根本不会触发。
+       *
+       * 只升一次，且只在「续写也救不了」时升：已经写出 20K 字符的写入应该接着写，
+       * 而不是整份丢掉重来。
+       */
+      if (healOut.healed === 0 && result.finishReason === 'length' && !escalated && healOut.oversize === 0) {
+        const promptNow = messagesTokens(messages) + toolSpecsTokens(stepTools)
+        if (escalationRoom(runProvider, promptNow) > 0) {
+          escalated = true
+          this.emit(session.id, {
+            type: 'hint',
+            message: '回答撞到输出上限，正在用更大的输出预算重发一次…'
+          })
+          // 界面上那半截正文必须清掉，否则重发的答案会接在半句后面
+          this.emit(session.id, { type: 'assistant_reset', messageId })
+          loopGuard = createLoopGuard()
+          try {
+            const again = await this.chatWithFallback(
+              session.id,
+              config,
+              attempt.provider,
+              messages,
+              stepTools,
+              signal,
+              (t) => {
+                if (loopGuard.push(t)) gate.push(t)
+              },
+              { escalate: true, onProgress }
+            )
+            // 第一次烧掉的 token 是真花的，不能因为结果被替换就不计
+            const before = result.usage
+            const after = again.result.usage
+            if (before) {
+              again.result.usage = after
+                ? {
+                    prompt: after.prompt + before.prompt,
+                    completion: after.completion + before.completion,
+                    cached: (after.cached ?? 0) + (before.cached ?? 0) || undefined,
+                    promptN: after.promptN ?? before.promptN,
+                    promptMs: after.promptMs ?? before.promptMs
+                  }
+                : before
+            }
+            attempt = again
+            result = again.result
+            if (again.provider.id !== runProvider.id) {
+              runProvider = again.provider
+              this.liveProviders.set(session.id, runProvider.id)
+            }
+          } catch {
+            // 升档失败就按第一次的结果继续：已经拿到的内容不能再丢一次
+          }
+        }
       }
 
       // 用量统计：本地服务不给 usage 就跳过，不编数字
@@ -2829,11 +3817,66 @@ export class AgentEngine {
               output: result.output,
               durationMs: result.durationMs
             })
+
+            // 独立 smoke 断言：验证落到「模型自己写的 npm test」时，检查这套测试
+            // 是不是只做了字符串存在性检查而根本没运行代码。是的话，即使 exit 0
+            // 也不能算通过 —— 那正是「26 项 includes 全过但一行游戏没跑」的造假形态。
+            if (result.ok && plan.smoke) {
+              // 真正要查的是测试脚本本体；Python 计划会直接把测试文件带上来，
+              // 否则 resolveTestTarget 只认 package.json，Python 项目的这条检查会一直空转
+              const testTarget = plan.testFile
+                ? path.resolve(workspace, plan.testFile)
+                : await resolveTestTarget(workspace).catch(() => null)
+              const s = testTarget ? await assertSmoke(testTarget).catch(() => null) : null
+              if (s && s.existenceOnly) {
+                const detail = s.suspicious.slice(0, 3).join('\n  ')
+                const smokeNote =
+                  `【独立 smoke 断言】这条「测试」没有真正运行程序，只是检查文件里有没有某些字符串，` +
+                  `不能证明功能正常（${s.suspicious.length} 处存在性检查）。\n  ${detail}\n` +
+                  `这种检查抓不到「键按了没反应」「画布没渲染」这类运行时问题。请换成真正启动/运行代码的验证，或说明为什么现有测试足够。`
+                this.emit(session.id, { type: 'verify_result', command: plan.command, label: '独立 smoke 断言', ok: false, output: smokeNote, durationMs: 0 })
+                verifyNote = smokeNote
+                touched.clear()
+                continue
+              }
+            }
+
             if (!result.ok) {
               // 失败就带着结论再走一轮，最多两次，避免修不好时无限循环
               verifyNote = `命令：${plan.command}（${plan.label}）\n${result.output}`
+              // 验证失败也要记进 verifyFails：让「验收失败不得标完成」这条门禁能拦住
+              // 模型在下一轮直接把 todo 标 completed 的偷跑（此前测试失败只影响 verifyNote，
+              // 不进 todoGate 的 blocking，等于「验收失败不得标完成」对测试失败失效）。
+              const fails = this.verifyFails.get(session.id) ?? new Map<string, string>()
+              fails.set('<verify>', `${plan.label}未通过`)
+              this.verifyFails.set(session.id, fails)
               touched.clear()
               continue
+            }
+            /**
+             * 测试过了 ≠ 核心交互验过了。
+             *
+             * 围棋程序那次的教训：验证是 `import ui` + 几条字符串检查，全过，
+             * 而轮次错乱、AI 卡死两个 bug 全漏。这里在「看起来通过」之后再问一次
+             * 「测试里到底断言了什么」，没有状态断言就回灌一条提示让它补。
+             * 只推一次、且不记失败 —— 这是建议，不是新的门禁。
+             */
+            if (stateHintRounds < 1) {
+              const gap = await stateCoverageGap(workspace, [...touched]).catch(() => null)
+              if (gap) {
+                stateHintRounds += 1
+                this.emit(session.id, {
+                  type: 'verify_result',
+                  command: plan.command,
+                  label: '覆盖度提示',
+                  ok: true,
+                  output: gap,
+                  durationMs: 0
+                })
+                verifyNote = gap
+                touched.clear()
+                continue
+              }
             }
             // 验证通过也不在这里直接收工：接着走下面的「任务是不是真做完了」判断
           }
@@ -2885,9 +3928,32 @@ export class AgentEngine {
           }
         }
 
+        // 正常收工前最后一道：还有文件卡在验收失败，不能静默标完成。
+        // verifyFails 里非空说明这一轮里 webcheck / 语法检查 / 独立验证还有未通过项，
+        // 但模型既没继续修、计划也没能推进 —— 此时若直接收工会把「没跑起来」当成交付。
+        // 再给模型一次机会：把失败项摆给它，让它回去修，而不是让用户拿到一个坏产物。
+        const stillFailing = this.verifyFails.get(session.id)
+        if (stillFailing && stillFailing.size > 0 && continues < MAX_CONTINUE) {
+          const detail = [...stillFailing.entries()]
+            .slice(0, 3)
+            .map(([f, e]) => `${f}（${e}）`)
+            .join('；')
+          continues += 1
+          sinceContinue = 0
+          continueNote =
+            `你宣布做完了，但下面这些验收项仍然未通过，还不能算完成：\n${detail}\n` +
+            `按验收给出的提示修掉它们，重新打开验证通过后，再用 update_todos 把对应项标 completed。`
+          this.emit(session.id, { type: 'auto_continue', round: continues, reason: '还有验收项未通过' })
+          continue
+        }
+
         // 正常收工：任务完成，清除 checkpoint（不是中断，下次启动不该提示恢复）
         persistCheckpoint('done')
         await clearCheckpoint(session.id)
+        // 任务真正收工后清掉写前快照：回滚是「运行中改坏了」的兜底，交付后不再需要
+        await clearSnapshots(workspace, session.id).catch(() => {})
+        // 交付目录的卫生在「真正收工」这条路上也要做一次 —— 这里是主循环里最常见的一条出口
+        await this.tidyWorkspace(session, workspace, runStartedAt)
         /**
          * 把结论写清楚再交还控制权。
          *
@@ -2916,9 +3982,9 @@ export class AgentEngine {
         provider: runProvider,
         workspace,
         tools: (isSmallModel(runProvider.model) ? tools : fullTools).filter(
-          // handoff 也不给子 agent：它没有身份、没法承担责任，要交接让父 agent 自己判断
+          // handoff 不给子 agent：它没有身份、没法承担责任，要交接让父 agent 自己判断；
+          // task 保留一层：子 agent 可以再派一层孙 agent（孙 agent 不能再派，见 subagent 的 depth 封顶）
           (t) =>
-            t.name !== 'task' &&
             t.name !== 'update_todos' &&
             t.name !== 'question' &&
             t.name !== 'handoff' &&
@@ -2966,6 +4032,8 @@ export class AgentEngine {
       const announced = new Set<string>()
       /** 因为插话而没轮到的，循环结束后统一补占位结果 */
       const notRun: ToolCall[] = []
+      /** 这一批里拦下了几条「截断写入」：只提示一次，别每拦一条弹一次 */
+      let truncWriteSkipped = 0
       let ci = 0
       for (; ci < toolCalls.length; ci++) {
         let call = toolCalls[ci]
@@ -2978,9 +4046,88 @@ export class AgentEngine {
           notRun.push(...toolCalls.slice(ci))
           break
         }
+        /**
+         * 续写救回来了、但拼完结构仍不完整：同样不执行。
+         *
+         * 这是「正确性」而不是「效率」问题：一份缺收尾的文件写下去，会覆盖掉
+         * 用户原本能用的版本，而且界面上看起来一切正常。拦下的文案由 heal 生成 ——
+         * 它知道半成品存在哪、缺的是什么闭合标记，这里再拼一次只会拼错。
+         */
+        if (call.truncRejected) {
+          truncWriteSkipped += 1
+          if (truncWriteSkipped === 1) {
+            this.emit(session.id, {
+              type: 'hint',
+              message: '续写后的内容仍不完整，已拦下这次写入，正在让模型接着补。'
+            })
+          }
+          await this.skipTools(session, [call], call.truncRejected, announced)
+          continue
+        }
         // 工具网关：展开成真名后再走风险 / 审批 / 钩子，网关不是绕过检查的后门
         const unwrapped = unwrapToolbox(call, fullTools)
         if (unwrapped) call = unwrapped
+        /**
+         * 半截参数不执行。
+         *
+         * `argRepair` 有值说明模型给的原文不是合法 JSON，是容错层把没闭合的字符串补上的；
+         * 反过来 JSON 完整的调用说明这条已经写完了，即使它后面的输出被切也照常执行。
+         * 除了 `finish_reason=length`，还要兜住「服务端根本不报 length」的网关（中转站、
+         * 部分 Ollama 版本）：那时只认「原文断在字符串中间」这个硬证据，尾逗号这类
+         * 语法修复内容是完整的，不能误伤。
+         */
+        const rawArg = typeof call.args?.[RAW_ARG_KEY] === 'string' ? String(call.args[RAW_ARG_KEY]) : ''
+        if (isTruncatedWrite(result.finishReason, call.name, call.argRepair, rawArg)) {
+          truncWriteSkipped += 1
+          const target = String(call.args?.path ?? call.args?.file_path ?? '目标文件')
+          /**
+           * 报「已生成多少字符、最后停在哪」而不是解析后的 content 长度。
+           * 截断时 content 根本不存在（参数挂在 _raw 上），以前这里恒等于 0，
+           * 模型读到「约 0 字符」完全不知道断在哪，只能整份重写。
+           */
+          const part = rawArg
+            ? partialString(rawArg, WRITE_TEXT_KEYS)
+            : null
+          const wrote =
+            part?.text.length ?? (typeof call.args?.content === 'string' ? call.args.content.length : rawArg.length)
+          const tail = clipTailSafe(part?.text ?? '', 60).replace(/\s+/g, ' ').trim()
+          if (truncWriteSkipped === 1) {
+            this.emit(session.id, {
+              type: 'hint',
+              message: '上一条回复的输出被截断，半截的文件写入已拦下，文件保持原样。'
+            })
+          }
+          // 没说 length 的网关要讲清判断依据，否则模型会去质疑「我明明写完了」
+          const cutWhy =
+            result.finishReason === 'length'
+              ? '上一条回复撞到输出上限被切断'
+              : '上一条回复在字符串中间就断了（这个服务端没有报 finish_reason，但内容确实没写完）'
+          await this.skipTools(
+            session,
+            [call],
+            `[已拦下·输出被截断] ${cutWhy}，这次「${call.name}」的参数只生成到一半` +
+              `（已生成 ${wrote} 字符${tail ? `，最后停在「…${tail}」` : ''}），所以没有执行，${target} 保持原样。\n` +
+              '半截内容写下去会把已经写好的文件覆盖成残废，然后你又得从头重写一遍 —— 这正是反复重写的原因。\n' +
+              (truncWriteSkipped >= 2
+                ? /**
+                   * 第二次以上还撞墙，说明「它自己一次写完」这条路已经证明走不通了。
+                   * 只劝一次是不够的：实测它会把同一句话读三遍然后照样重来，
+                   * 所以这里点名换手段 —— 要么用 append 分段，要么派子 agent 分担。
+                   */
+                  '这已经是本次任务里第 ' +
+                  truncWriteSkipped +
+                  ' 次撞到输出上限了，说明「你一个人一口气写完」这条路走不通，别再试同一件事。\n' +
+                  '两条可走的路，选一条，立刻做：\n' +
+                  `  A) 用分段写：先 write_file 只写骨架（结构 + 空函数 + 结尾标记），再 write_file({append:true, content:"…"}) 一段一段往后接，每段控制在几千字符；\n` +
+                  `  B) 派子 agent 分担：用 task 把「${target}」拆成互不依赖的几块（比如 HTML 结构 / CSS 样式 / JS 逻辑），每个 task 只写自己那一块，最后由你或其中一个 task 拼起来。\n` +
+                  '不管走哪条，都不要再一次生成整份文件 + 长篇解释。'
+                : '接下来这样做：大文件分两步走，先 write_file 只写骨架（函数签名和结构），' +
+                  '再用 write_file({append:true}) 或 edit_file 一段一段填实现；' +
+                  '一条回复里不要同时装「整份文件 + 长篇解释」。'),
+            announced
+          )
+          continue
+        }
         /**
          * 插话就停手：这一批里还没轮到的都不做了。
          * 断的是「动作」，所以已经在跑的那个由它自己响应 stepSignal 停下。
@@ -2988,6 +4135,44 @@ export class AgentEngine {
         if (this.steered(session.id)) {
           notRun.push(...toolCalls.slice(ci))
           break
+        }
+
+        // 连续只读工具并发跑（读 5 个文件不该排 5 次队）；不适合并发就退回串行
+        {
+          const batch = await this.tryParallelReads({
+            session,
+            calls: toolCalls,
+            from: ci,
+            workspace,
+            signal: stepSignal,
+            cut: cut.signal,
+            rootAborted: signal.aborted,
+            permRules,
+            agentId: memNs,
+            readCap: Math.min(40000, Math.max(4000, Math.round(ctxWindow * 1.2))),
+            hiddenSpecs: hiddenSpecs.map((t) => ({ name: t.name, description: t.description })),
+            announced,
+            callGuard,
+            scratchGuard,
+            errGuard: errorStreak
+          })
+          if (batch.consumed > 0) {
+            /**
+             * 这几笔账必须在这里补上：并发路径用 continue 跳过了循环尾部，
+             * 而「上一轮到底有没有干活」直接决定自动续跑会不会误判空转 ——
+             * 读文件也是干活，漏记会让模型刚查完资料就被判定「没动作」。
+             */
+            const start = ci
+            for (let k = start; k < start + batch.consumed; k++) {
+              recentCalls.push(`${toolCalls[k].name}:${JSON.stringify(toolCalls[k].args ?? {})}`)
+            }
+            while (recentCalls.length > 40) recentCalls.shift()
+            sinceContinue += batch.consumed
+            toolsRun += batch.consumed
+            ci = start + batch.consumed - 1
+            if (batch.halted) errorHalted = true
+            continue
+          }
         }
 
         // task：模型连着写的几个子任务一起并行跑，回来再按原顺序落库
@@ -3027,34 +4212,28 @@ export class AgentEngine {
          * 免了它再跑一遍去拿同一份数据。
          */
         const repeat = callGuard.check(call.name, args)
-        if (repeat.verdict === 'block') {
+        /**
+         * 临时脚本护栏：换名字新建脚本时签名次次不同，上面那道拦不住，
+         * 这里按「同一目录第几个脚本」判。两者共用同一份「连续被拦就收工」的计数。
+         */
+        const scratch = repeat.verdict === 'block' ? null : scratchGuard.check(call.name, args)
+        if (repeat.verdict === 'block' || scratch?.verdict === 'block') {
+          const note = repeat.verdict === 'block' ? repeat.note : scratch!.note
           repeatBlocked += 1
-          if (!repeatHinted) {
+          if (scratch?.verdict === 'block' && !scratchHinted) {
+            scratchHinted = true
+            this.emit(session.id, {
+              type: 'hint',
+              message: '助手又在新建临时脚本，已拦下这次执行，让它直接改真实文件。'
+            })
+          } else if (repeat.verdict === 'block' && !repeatHinted) {
             repeatHinted = true
             this.emit(session.id, {
               type: 'hint',
               message: `助手在重复同一个动作（${call.name}），已拦下这次执行并让它换个做法。`
             })
           }
-          const skipMessage: ChatMessage = {
-            id: store.newId(),
-            role: 'tool',
-            content: repeat.note,
-            toolCallId: call.id,
-            toolName: call.name,
-            toolArgs: args,
-            createdAt: Date.now()
-          }
-          session.messages.push(skipMessage)
-          await store.appendMessages(session.id, [skipMessage])
-          this.emit(session.id, {
-            type: 'tool_result',
-            callId: call.id,
-            tool: call.name,
-            result: repeat.note,
-            ok: false,
-            durationMs: 0
-          })
+          await this.skipTools(session, [call], note, announced)
           /**
            * 拦一次它换参数再试是正常的；连着被拦三次说明它已经不会自己走出这个坑，
            * 再转下去只会把上下文和步数烧光，停在这里把话交给用户。
@@ -3062,6 +4241,7 @@ export class AgentEngine {
           if (repeatBlocked >= MAX_REPEAT_BLOCKS) {
             repeatHalted = true
             notRun.push(...toolCalls.slice(ci + 1))
+            this.finishNotes.set(session.id, guardHaltNote())
             this.emit(session.id, {
               type: 'hint',
               message:
@@ -3155,6 +4335,30 @@ export class AgentEngine {
         }
         const beforeByTarget = new Map<string, string | null>()
         for (const t of writeTargets) beforeByTarget.set(t, await readTextOrNull(t))
+        // 写前快照：非 git 工作区也能回到上一版。只备份「已存在的文件」，
+        // 新建文件不备份（回滚=删除）。失败静默 —— 快照是兜底，不阻断写入。
+        if (writeTargets.length) {
+          for (const t of writeTargets) {
+            if ((beforeByTarget.get(t) ?? null) !== null) {
+              await snapshotBeforeWrite(workspace, session.id, t).catch(() => null)
+            }
+          }
+        }
+        /**
+         * 跑命令前给源码拍一张快照。
+         *
+         * 门禁全挂在 write_file / edit_file 上，而 `python gen.py`、`node build.js`、
+         * `npx prettier --write` 这类间接写入从工具层看只是「跑了条命令」——
+         * 文件被改了，语法校验没跑、变更快照没记、验收门禁一无所知。
+         * 这里不猜命令会写什么，直接用文件系统事实兜住：跑完对比快照，
+         * 改过的源码一律补进 writeTargets，后面那套门禁就自动生效了。
+         *
+         * 只在确实要执行时拍：被拒绝 / 被钩子拦下的命令不会改文件，白算一次。
+         */
+        const shellSnap =
+          approved && !settled.blocked && !disabled(call.name) && call.name === 'run_shell'
+            ? await snapshotSources(workspace).catch(() => null)
+            : null
         let output: string
         let ok = true
         /**
@@ -3192,12 +4396,67 @@ export class AgentEngine {
           ok = false
           output = `「${call.name}」已在软件设置里关闭，本次没有执行。请换用其他办法；如果确实需要它，提醒用户到「软件设置 → 联网与记忆」打开。`
         } else if (call.name === 'update_todos') {
-          // 计划只在引擎内存里维护 + 推给界面；历史里留着本次调用的参数，重开会话能还原
+          /**
+           * 计划不只是给人看的那排勾。
+           *
+           * 它现在参与控制流：跳项推进、以及「页面根本打不开却宣布做完」都会被
+           * 挡回来。挡回来时**不改动现有计划**，把原因和下一步一起说清楚，
+           * 让模型下一轮能照着改 —— 单纯说「不允许」它只会原样再发一遍。
+           *
+           * 注意这里不把 ok 置 false：那会喂给「连续同类错误」护栏，
+           * 三次拒绝就可能把整轮叫停，而我们要的是让它改，不是停。
+           */
           const items = normalizeTodos(args.items)
-          this.todos.set(session.id, items)
-          planTouched = true
-          this.emit(session.id, { type: 'todos', items })
-          output = formatTodos(items)
+          const prev = this.todos.get(session.id) ?? []
+          const verdict = todoGate(prev, items, this.verifyFails.get(session.id))
+          const strikes = this.planGateStrikes.get(session.id) ?? 0
+
+          if (!verdict.ok && strikes < MAX_PLAN_GATE_STRIKES) {
+            this.planGateStrikes.set(session.id, strikes + 1)
+            output =
+              `这次计划更新没有生效。${verdict.reason}\n${verdict.hint}` +
+              (prev.length ? `\n\n当前仍然是上一版计划，按它继续：\n${formatTodos(prev)}` : '')
+          } else if (!verdict.ok) {
+            // 连续拒绝到顶：不再静默放行，转人工确认。
+            // 以前这里直接放行——模型重复几轮同一套坏计划，护栏就把它「硬推过去」，
+            // 于是「验收没过却标完成」在最该拦的场景失守。现在把决定权交还用户：
+            // 用户明确点头才放行，否则继续拦，绝不悄悄把未过验收的活算作完成。
+            this.planGateStrikes.delete(session.id)
+            if (nonInteractive) {
+              // 无头模式没有用户可问：保持拦截，把原因讲清楚让模型自己换方向
+              output =
+                `这次计划更新仍然没有生效（已连续拒绝 ${strikes} 次）。${verdict.reason}\n${verdict.hint}` +
+                (prev.length ? `\n\n当前仍然是上一版计划，按它继续：\n${formatTodos(prev)}` : '')
+            } else {
+              const answer = await this.askQuestion(
+                session.id,
+                `计划门禁已经连续拒绝 ${strikes} 次，模型提交的计划仍未通过：${verdict.reason}\n\n` +
+                  `是否允许这次强行推进？如果选「否」，我会让它继续按当前计划修正。`,
+                ['强行放行', '不放行，继续修正'],
+                signal,
+                false
+              )
+              if (answer && answer.includes('放行')) {
+                this.todos.set(session.id, items)
+                planTouched = true
+                this.emit(session.id, { type: 'todos', items })
+                output = `（用户已确认强行放行）${formatTodos(items)}`
+              } else {
+                // 用户不放行：拦截，让模型回去改
+                this.planGateStrikes.set(session.id, 0)
+                output =
+                  `这次计划更新仍然没有生效（用户未同意强行推进）。${verdict.reason}\n${verdict.hint}` +
+                  (prev.length ? `\n\n当前仍然是上一版计划，按它继续：\n${formatTodos(prev)}` : '')
+              }
+            }
+          } else {
+            this.planGateStrikes.delete(session.id)
+            // 计划只在引擎内存里维护 + 推给界面；历史里留着本次调用的参数，重开会话能还原
+            this.todos.set(session.id, items)
+            planTouched = true
+            this.emit(session.id, { type: 'todos', items })
+            output = formatTodos(items)
+          }
         } else if (call.name === 'question') {
           // 暂停下来问用户，等应答后把答案作为工具结果回传，接着跑
           const opts = Array.isArray(args.options)
@@ -3230,6 +4489,13 @@ export class AgentEngine {
               allowOutside: risk?.kind === 'outside',
               agentId: memNs,
               sessionId: session.id,
+              /**
+               * 单次读文件的字符上限按窗口折算。
+               * 写死 40000 在 16K 窗口上等于一次读就吃掉三分之二历史：
+               * 读完立刻触发压缩，模型忘了刚读的内容再去读一遍，来回抖。
+               * 1.2 字符/token 是保守估计（代码约 3，中文约 1）。
+               */
+              readCap: Math.min(40000, Math.max(4000, Math.round(ctxWindow * 1.2))),
               hiddenTools: hiddenSpecs.map((t) => ({ name: t.name, description: t.description })),
               handoff:
                 roster.length === 0
@@ -3263,7 +4529,7 @@ export class AgentEngine {
                * checkpoint 里就留下 `..\..\src\a.ts`；重启后「继续」还原出错误路径，
                * 诊断和验证拿到的文件全都不存在 —— 而且是静默跳过，看不出来。
                */
-              touched.add(path.resolve(workspace, String(args.path ?? '')))
+              touched.add(resolveToolPath(workspace, String(args.path ?? '')))
             } else if (call.name === 'patch' || call.name === 'format') {
               for (const t of writeTargets) touched.add(t)
             }
@@ -3324,6 +4590,93 @@ export class AgentEngine {
                 diagGapNoted = true
                 output += `\n\n${formatDiagGap(report.skipped)}`
               }
+              /**
+               * HTML 内联脚本单独查一遍。
+               *
+               * 上面的 tsserver 诊断对「工作区里只有一个 index.html」完全不生效
+               * （没有 tsconfig 就直接 skipped:no-config），而「一个文件装下整个游戏」
+               * 恰好是本地小模型最常接的任务 —— 十几处语法错误一次都不报，
+               * 模型只能靠自己看，看完还改不动，最后演成反复重写。
+               *
+               * 这里不依赖任何项目配置，直接把 <script> 交给 node --check。
+               * 和诊断一样：出错才追加，没错一个字都不加。
+               */
+              const htmlFiles = writeTargets.filter((t) => /\.html?$/i.test(t))
+              if (htmlFiles.length) {
+                const issues = await checkHtmlScripts(htmlFiles)
+                const relOf = (f: string) => path.relative(workspace, f).split(path.sep).join('/')
+                if (issues.length) {
+                  output += `\n\n${formatHtmlIssues(issues, workspace)}`
+                  this.emit(session.id, {
+                    type: 'diagnostics',
+                    errors: issues.length,
+                    files: new Set(issues.map((d) => d.file)).size
+                  })
+                  // 语法都过不了，页面必然打不开：直接记成验收未通过，省掉一次八秒的白等
+                  const fails = this.verifyFails.get(session.id) ?? new Map<string, string>()
+                  for (const d of issues) fails.set(relOf(d.file), `内联脚本语法错误（第 ${d.line} 行）`)
+                  this.verifyFails.set(session.id, fails)
+                } else {
+                  /**
+                   * 语法过了再开浏览器真跑一遍。
+                   *
+                   * 这一步才回答「能不能用」：白屏、未定义变量、资源路径写错，
+                   * 全都只在这里暴露。本程序自带 Chromium，不需要额外依赖。
+                   */
+                  const pages = await checkWebPages(htmlFiles, workspace)
+                  const real = pages.filter((p) => !p.skipped)
+                  if (real.length) {
+                    output += `\n\n${formatWebCheck(pages, workspace)}`
+                    const fails = this.verifyFails.get(session.id) ?? new Map<string, string>()
+                    for (const p of real) {
+                      const rel = relOf(p.file)
+                      if (p.ok) fails.delete(rel)
+                      else fails.set(rel, p.errors[0] ?? '打开时报错')
+                    }
+                    if (fails.size) this.verifyFails.set(session.id, fails)
+                    else this.verifyFails.delete(session.id)
+                    if (hasBlockingFailure(pages)) {
+                      this.emit(session.id, {
+                        type: 'diagnostics',
+                        errors: pages.reduce((n, p) => n + p.errors.length, 0),
+                        files: pages.filter((p) => !p.ok).length
+                      })
+                    }
+                  }
+                }
+              }
+
+              /**
+               * 独立 JS 文件（.js/.mjs/.cjs）单独查一遍。
+               *
+               * htmlcheck 只覆盖内联在 .html 里的 <script>，外部脚本（<script src>）
+               * 它明确跳过；tsserver 又要求工作区有 tsconfig + 本地 typescript。
+               * 「index.html + game.js」的网页游戏里，game.js 写坏了一路写下去、
+               * 浏览器打开才白屏 —— 这里补上这一环，把坏掉的独立 JS 当场还回去。
+               *
+               * 和诊断/HTML 检查一样：出错才追加，没错一个字都不加。
+               */
+              const jsFiles = writeTargets.filter((t) => /\.(?:m?js|cjs)$/i.test(t))
+              if (jsFiles.length) {
+                const jsIssues = await checkJsSyntax(jsFiles)
+                if (jsIssues.length) {
+                  output += `\n\n${formatJsIssues(jsIssues, workspace)}`
+                  this.emit(session.id, {
+                    type: 'diagnostics',
+                    errors: jsIssues.length,
+                    files: new Set(jsIssues.map((d) => d.file)).size
+                  })
+                  // 语法都过不了，运行必然抛 SyntaxError：记成验收未通过
+                  const fails = this.verifyFails.get(session.id) ?? new Map<string, string>()
+                  for (const d of jsIssues) {
+                    fails.set(
+                      path.relative(workspace, d.file).split(path.sep).join('/'),
+                      `JS 语法错误（第 ${d.line} 行）`
+                    )
+                  }
+                  this.verifyFails.set(session.id, fails)
+                }
+              }
             }
           } catch (err) {
             ok = false
@@ -3346,6 +4699,36 @@ export class AgentEngine {
         if (ok && cut.signal.aborted && !signal.aborted) {
           ok = false
           output = STEER_CUT_NOTE
+        }
+
+        /**
+         * 命令跑完，按文件系统事实找出「被 shell 改过的源码」，补进门禁流程。
+         *
+         * 这一步让「绕过 write_file」不再意味着「绕过所有检查」：新出现的源码文件
+         * 会被当成 writeTargets，后面的格式化、tsserver 诊断、HTML 语法校验、
+         * 浏览器打开验收、变更快照全部照跑，模型拿到的结果和有门禁时一模一样。
+         *
+         * 上限 20 个：`git checkout` 之类的命令可能一次改上百个文件，全塞进去
+         * 会让这一轮变成一次全量编译，反而卡死。超出部分只在提示里报个数。
+         */
+        if (ok && shellSnap) {
+          const changed = await changedSources(workspace, shellSnap).catch(() => [])
+          const fresh = changed.filter((c) => !writeTargets.includes(c.file))
+          if (fresh.length) {
+            const take = fresh.slice(0, 20)
+            for (const c of take) {
+              writeTargets.push(c.file)
+              beforeByTarget.set(c.file, c.before)
+            }
+            output += `\n\n${formatShellChangeNote(take.map((c) => c.file), workspace)}`
+            if (fresh.length > take.length) {
+              output += `\n（另有 ${fresh.length - take.length} 个文件未纳入本次校验）`
+            }
+            this.emit(session.id, {
+              type: 'hint',
+              message: `这条命令直接改了 ${fresh.length} 个源码文件，已补跑写入门禁`
+            })
+          }
         }
 
         /**
@@ -3378,8 +4761,28 @@ export class AgentEngine {
          * 记的是还没追加护栏提示的原始输出 —— 否则自己写的提示会污染「结果有没有变」。
          */
         callGuard.record(call.name, args, output)
+        // 临时脚本按「目录」记账：下一次在同目录新建第二个脚本才会被拦
+        scratchGuard.record(call.name, args)
         // 到警告线但还没到拦截线：这次照跑，只是提醒它别再原样重发
         if (repeat.verdict === 'warn') output += `\n\n${repeat.note}`
+
+        /**
+         * 连续同类错误护栏：用原始结果判类别（上面的 repeat/scratch 提示不该干扰判断）。
+         * 换脚本名、换扩展名的重试在签名护栏眼里次次不同，但这里按错误类别聚合，
+         * 连续几次「文件找不到」就会把「工作目录在哪、别写外部临时脚本」回灌给模型。
+         */
+        const errGuard = errorStreak.observe(output)
+        if (errGuard.verdict !== 'ok') {
+          output += `\n\n${errGuard.note}`
+          this.emit(session.id, {
+            type: 'hint',
+            message:
+              errGuard.verdict === 'halt'
+                ? `助手连续 ${errGuard.streak} 次犯同一类错误（${errGuard.kind}），已提醒并收工。`
+                : `助手连续 ${errGuard.streak} 次犯同一类错误（${errGuard.kind}），已回灌工作目录提示。`
+          })
+          if (errGuard.verdict === 'halt') errorHalted = true
+        }
 
         // 改动落盘成功才记快照；失败或没变化不会进「变更」列表
         if (ok && writeTargets.length) {
@@ -3398,6 +4801,33 @@ export class AgentEngine {
             })
             if (change) this.emit(session.id, { type: 'file_change', change })
           }
+          /**
+           * 记账：整份重写同一个文件，却一次都没写大。
+           *
+           * 判据刻意不依赖「参数长得像不像」——实测里模型每次重写的写法都有细微差别，
+           * 所以按签名去重的护栏完全拦不住它；但「这个文件最大只写到过 693 字符」
+           * 是骗不了人的事实。
+           */
+          if (call.name === 'write_file' && args.append !== true) {
+            for (const target of writeTargets) {
+              const size = (await readTextOrNull(target))?.length ?? 0
+              const rec = writeLedger.get(target) ?? { attempts: 0, maxSize: 0 }
+              rec.attempts += 1
+              rec.maxSize = Math.max(rec.maxSize, size)
+              writeLedger.set(target, rec)
+              if (!writeBreaker && rec.attempts >= WRITE_BREAKER_ATTEMPTS && rec.maxSize < WRITE_BREAKER_MAX_SIZE) {
+                const name = path.relative(workspace, target).split(path.sep).join('/') || path.basename(target)
+                writeBreaker =
+                  `已停止：${name} 在这一轮里被整份重写了 ${rec.attempts} 次，最大的一次也只有 ${rec.maxSize} 字符。` +
+                  '这不是「快写完了」，而是每次都在半路被截断、然后从头再来 —— 继续下去只会把时间和额度烧光。' +
+                  '留下的可能是一份残片。建议：换更强的模型、把任务拆成更小的几块分别做，或者手工把骨架定下来再让它填。'
+                this.emit(session.id, {
+                  type: 'hint',
+                  message: `检测到 ${name} 被反复重写却一直没有变大（${rec.attempts} 次，最大 ${rec.maxSize} 字符），已停止这一轮。`
+                })
+              }
+            }
+          }
         }
         const durationMs = Date.now() - started
 
@@ -3412,6 +4842,34 @@ export class AgentEngine {
         }
         session.messages.push(toolMessage)
         await store.appendMessages(session.id, [toolMessage])
+        /**
+         * read_file 读到图片时，把画面作为图片消息喂给视觉模型。
+         *
+         * readFileTool 已不再对图片抛「二进制拒绝」，而是返回一句带【图片】标记的话；
+         * 但光有那句话模型还是看不到画面 —— 图片必须进 message.images，provider 构造
+         * 请求时才转成 base64 真正发出去（imageTurnIndex 只认最近一条带 images 的 user 消息）。
+         *
+         * 所以这里补一条紧随其后的 user 消息：content 是说明，images 是绝对路径。
+         * 序列 assistant(tool_calls) → tool → user(images) 对 OpenAI 协议合法。
+         * 模型看不了图时（纯文本模型 / vision 关掉），这条消息会被 provider 降级成纯文本，
+         * 并在正文里明确告诉模型「看不了」，不会静默失败。
+         */
+        if (call.name === 'read_file') {
+          const readTarget = resolveToolPath(workspace, String(args.path ?? ''))
+          if (readTarget && isImagePath(readTarget)) {
+            const imgMsg: ChatMessage = {
+              id: store.newId(),
+              role: 'user',
+              content:
+                `你刚才用 read_file 读取的图片（${String(args.path ?? '')}）画面如下，已经直接传给你了（不是路径，你看得见）。` +
+                '直接描述你看到的内容，据此判断并继续。',
+              images: [readTarget],
+              createdAt: Date.now()
+            }
+            session.messages.push(imgMsg)
+            await store.appendMessages(session.id, [imgMsg])
+          }
+        }
         this.emit(session.id, {
           type: 'tool_result',
           callId: call.id,
@@ -3420,6 +4878,17 @@ export class AgentEngine {
           ok,
           durationMs
         })
+      }
+
+      // 连续同类错误护栏判定收工：并入 repeatHalted，复用同一条收工路径
+      if (errorHalted) repeatHalted = true
+      /**
+       * 产出比熔断同样走收工路径，但结论要说清「为什么停」——
+       * 给用户的话必须能指路（换模型 / 拆小 / 手搭骨架），而不是一句「已停止」。
+       */
+      if (writeBreaker) {
+        if (!this.finishNotes.has(session.id)) this.finishNotes.set(session.id, { note: writeBreaker, ok: false })
+        repeatHalted = true
       }
 
       // 被插话打断 / 被护栏叫停：这一批没轮到的补占位结果，界面才不会留着转圈的卡片
@@ -3475,16 +4944,227 @@ export class AgentEngine {
        * 继续被拦，把上下文和用量烧光。这里跳出 step 循环，把控制权交回用户。
        * checkpoint 保持 running —— 这不是「做完了」，恢复时还能接着干。
        */
-      if (repeatHalted) break
+      if (repeatHalted) {
+        // 和循环中途那次 halt（重复动作拦到上限）一样，补上收工结论。
+        // errorStreak 判定的 halt 走到这里 —— 以前没有任何 note，done 是裸的。
+        if (!this.finishNotes.has(session.id)) this.finishNotes.set(session.id, guardHaltNote())
+        break
+      }
     }
+
+    /**
+     * 收工前的最后一步：把本轮的一次性脚本从交付目录里挪走。
+     *
+     * 实测里交付目录会变成 `index.html` 旁边躺着 `gen.py`、`_check.py`、`verify_ttt.js`、
+     * `__pycache__/`。用户打开文件夹看到的是这些。清理规则见 hygiene.ts：
+     * 只动「名字一眼是临时脚本 + 本轮才出现 + 没有被成果引用」的文件，且只搬不删。
+     * 清不动（被占用 / 没权限）不算错误，绝不因此让一轮任务失败。
+     */
+    await this.tidyWorkspace(session, workspace, runStartedAt)
 
     // 步数预算用完了还没收工：这不是「做完了」，是「这一轮到点了」。
     // 所以保留 checkpoint（running）—— 否则重启后既不出恢复横幅，「继续」也带不上
     // 计划 / 改过的文件 / 验证结论，用户只能自己重述做到哪了。真正收工才标 done 并清除。
     persistCheckpoint('running')
-    // 因为重复动作被叫停的，不是「步数用完了」，别推一条误导的提示
-    if (!repeatHalted) this.emit(session.id, { type: 'step_limit', maxSteps: stepBudget })
+    if (!repeatHalted) {
+      // 真正跑到步数上限才发 step_limit；护栏叫停的终止信号是 done.note，
+      // 不能拿「达到最大步数」误导用户（它的文案和围栏场景对不上）。
+      this.emit(session.id, { type: 'step_limit', maxSteps: stepBudget })
+    }
   }
+
+  /**
+   * 交付目录卫生：把本轮的一次性脚本挪进 `.roroto/trash/`。
+   *
+   * 必须在**每一条收工路径**上调用。「正常结束」是从主循环里 `return` 出去的，
+   * 不是走到方法末尾 —— 第一版只写在末尾，结果实测里 gen.py 一个都没被清掉。
+   * 清理失败只当没做，绝不能把一轮已经成功的任务变成异常。
+   */
+  private async tidyWorkspace(session: Session, workspace: string, since: number): Promise<void> {
+    try {
+      const swept = await sweepWorkspace(workspace, since)
+      const note = formatSweep(swept)
+      if (note) this.emit(session.id, { type: 'hint', message: note })
+    } catch {
+      // 附加动作，失败忽略
+    }
+  }
+
+  /**
+   * 连续只读工具的并发执行。
+   *
+   * 模型一次发五个 read_file 是最常见的形态（先读五个文件再动手）。以前串行跑：
+   * 五次「请求 → 等盘 → 回包」全排队，本地模型上白等十几秒，还多烧步数预算。
+   * 写工具与命令仍然串行 —— 它们的顺序和副作用必须确定。
+   *
+   * 语义和串行完全一致：审批、护栏、钩子、结果落库都按原顺序走一遍，
+   * 只是把 executeTool 那一段的等待重叠起来。任何一条需要人管（坏参数、越界路径、
+   * 命中重复护栏、用户刚插话）就整段退回串行，由原来的路径处理。
+   */
+  private async tryParallelReads(o: {
+    session: Session
+    calls: ToolCall[]
+    from: number
+    workspace: string
+    signal: AbortSignal
+    cut: AbortSignal
+    rootAborted: boolean
+    permRules: Awaited<ReturnType<typeof loadProjectPermissions>>
+    agentId: string | null
+    readCap: number
+    hiddenSpecs: Array<{ name: string; description: string }>
+    announced: Set<string>
+    callGuard: ReturnType<typeof createToolCallGuard>
+    scratchGuard: ReturnType<typeof createScratchGuard>
+    errGuard: ReturnType<typeof createErrorStreakGuard>
+  }): Promise<{ consumed: number; halted: boolean }> {
+    const none = { consumed: 0, halted: false }
+    if (o.cut.aborted || o.rootAborted) return none
+
+    // 1. 收集连续的一段（中间夹着写工具/命令就到此为止，绝不越过它们并行）
+    const run = collectParallelReadRun(o.calls, o.from)
+    if (!run.length) return none
+
+    // 2. 参数先落到确定形态；任何一条需要人管，就整段退回串行
+    const prepared: Array<{
+      call: ToolCall
+      args: Record<string, unknown>
+      warn: string
+      note: string
+    }> = []
+    for (const c of run) {
+      const settled = settleToolArgs(
+        c,
+        toolSpecs.find((t) => t.name === c.name)
+      )
+      if (settled.blocked) return none
+      // 越界路径 / 项目规则：这类要弹审批或直接拒绝，交给串行路径才有完整语义
+      if (classifyRisk(c.name, settled.args, o.workspace, o.permRules)) return none
+      const repeat = o.callGuard.check(c.name, settled.args)
+      if (repeat.verdict === 'block') return none
+      if (o.scratchGuard.check(c.name, settled.args).verdict === 'block') return none
+      prepared.push({
+        call: c,
+        args: settled.args,
+        warn: repeat.verdict === 'warn' ? repeat.note : '',
+        // 参数被容错层修过（尾逗号、单引号）：要告诉模型，否则它一直以为自己的 JSON 是合法的
+        note: settled.note ?? ''
+      })
+    }
+    if (this.steered(o.session.id)) return none
+
+    // 3. 卡片先全部亮出来，用户看到的是「同时在读这五个文件」
+    for (const p of prepared) {
+      o.announced.add(p.call.id)
+      this.emit(o.session.id, { type: 'tool_start', callId: p.call.id, tool: p.call.name, args: p.args })
+    }
+
+    // 4. preToolUse 仍按顺序跑：钩子脚本可能互相依赖，并发执行没人能保证顺序
+    const pre: Array<{ blocked?: string }> = []
+    for (const p of prepared) {
+      pre.push(
+        await runHooks('preToolUse', {
+          workspace: o.workspace,
+          sessionId: o.session.id,
+          agentId: o.agentId,
+          tool: p.call.name,
+          args: p.args
+        })
+      )
+    }
+
+    // 5. 真正并发的一段
+    const results = await Promise.all(
+      prepared.map(async (p, i) => {
+        if (pre[i]?.blocked) return { ok: false, output: `钩子拒绝了这个操作：${pre[i].blocked}`, ms: 0 }
+        const started = Date.now()
+        try {
+          const output = await executeTool(p.call.name, p.args, {
+            workspace: o.workspace,
+            signal: o.signal,
+            allowOutside: false,
+            agentId: o.agentId,
+            sessionId: o.session.id,
+            readCap: o.readCap,
+            hiddenTools: o.hiddenSpecs
+          })
+          return { ok: true, output, ms: Date.now() - started }
+        } catch (err) {
+          return { ok: false, output: `执行失败：${(err as Error).message}`, ms: Date.now() - started }
+        }
+      })
+    )
+
+    // 6. 收尾严格按原顺序：护栏记账、钩子、落库、推界面，顺序一乱护栏就判错
+    let halted = false
+    for (let i = 0; i < prepared.length; i++) {
+      const p = prepared[i]
+      const r = results[i]
+      let output = r.output
+      let ok = r.ok
+      if (ok && o.cut.aborted && !o.rootAborted) {
+        ok = false
+        output = STEER_CUT_NOTE
+      }
+      const post = await runHooks('postToolUse', {
+        workspace: o.workspace,
+        sessionId: o.session.id,
+        agentId: o.agentId,
+        tool: p.call.name,
+        args: p.args,
+        result: output
+      })
+      if (post.context) output += `\n\n【钩子】\n${post.context}`
+      if (post.warning) this.emit(o.session.id, { type: 'hint', message: post.warning })
+      if (p.note) output = `${p.note}\n\n${output}`
+
+      // 记的是「还没追加护栏提示」的原始输出，否则自己写的话会污染「结果有没有变」
+      o.callGuard.record(p.call.name, p.args, output)
+      o.scratchGuard.record(p.call.name, p.args)
+      if (p.warn) output += `\n\n${p.warn}`
+      const guard = o.errGuard.observe(output)
+      if (guard.verdict !== 'ok') {
+        output += `\n\n${guard.note}`
+        this.emit(o.session.id, {
+          type: 'hint',
+          message:
+            guard.verdict === 'halt'
+              ? `助手连续 ${guard.streak} 次犯同一类错误（${guard.kind}），已提醒并收工。`
+              : `助手连续 ${guard.streak} 次犯同一类错误（${guard.kind}），已回灌工作目录提示。`
+        })
+        if (guard.verdict === 'halt') halted = true
+      }
+
+      const toolMessage: ChatMessage = {
+        id: store.newId(),
+        role: 'tool',
+        content: output,
+        toolCallId: p.call.id,
+        toolName: p.call.name,
+        toolArgs: p.args,
+        createdAt: Date.now()
+      }
+      o.session.messages.push(toolMessage)
+      await store.appendMessages(o.session.id, [toolMessage])
+      this.emit(o.session.id, {
+        type: 'tool_result',
+        callId: p.call.id,
+        tool: p.call.name,
+        result: output,
+        ok,
+        durationMs: r.ms
+      })
+    }
+
+    return { consumed: run.length, halted }
+  }
+
+  /**
+   * 上次因为「子智能体还没就绪」而等过预热的时刻。
+   * 冷启动时第一次派活给后台加载留一小段窗口，但 60 秒内只等一次，
+   * 免得实例起不来的机器每次派活都白等。
+   */
+  private lastWorkerWarmWait = 0
 
   /**
    * 并行跑一批子 agent，返回它们改过的文件。
@@ -3509,28 +5189,98 @@ export class AgentEngine {
       tools: []
     })
 
-    // 整批只判断一次：workerPlan 要查本地实例状态，每个子任务都查一遍纯属浪费
-    const plan = await workerPlan(ctx.provider, ctx.config)
-    const runner = plan.provider
+    // 整批只判断一次：workerPlan 要逐个查本地实例状态，每个子任务都查一遍纯属浪费
+    let plan = await workerPlan(ctx.provider, ctx.config)
     /**
-     * 子代理的上下文预算要按它自己要用的模型算，不能沿用主模型的。
-     * 主模型 32K、工人模型 8K 时，沿用主模型的预算会让子代理第一步就超窗报 400；
-     * 反过来主模型 8K、工人 32K 时又会白白浪费上下文。
+     * 组里一个都不能用：后台把整组拉起来。
+     *
+     * 以前这里「绝不 await」，结果第一次派活必定回落主模型 —— 用户刚配好子智能体、
+     * 第一次让它干活却完全看不到子模型，很容易以为功能没生效。现在给刚触发的
+     * 预热留最多 8 秒：加载快的实例当场就能接活，加载慢的仍照旧回落、不阻塞对话。
+     * 60 秒内只等一次，实例起不来的机器不会每次派活都白等。
+     *
+     * 但「在冷却」不算「没起来」（远端 worker 本来就不用预热）：那种情况下等 8 秒
+     * 一点用都没有，只会白拖一轮对话，所以直接跳过。
      */
-    const budgetFor = (p: ProviderConfig): number => {
-      const own = Math.round(Number(p.contextWindow) || 0)
-      if (own <= 0) return ctx.budget
+    const allCooling = plan.skipped.length > 0 && plan.skipped.every((s) => s.cooling)
+    if (plan.pool.length === 0 && plan.configuredCount > 0 && !allCooling) {
+      const warm = warmWorker(ctx.provider, ctx.config).catch(() => ({ ok: false, message: '' }))
+      if (Date.now() - this.lastWorkerWarmWait > 60_000 && !ctx.signal.aborted) {
+        this.lastWorkerWarmWait = Date.now()
+        await Promise.race([warm, new Promise((r) => setTimeout(r, 8_000))])
+        if (!ctx.signal.aborted) plan = await workerPlan(ctx.provider, ctx.config)
+      }
+      void warm
+    }
+    const pool = plan.pool
+    /** 按忙闲把子任务分派到不同实例（纯函数见 shared/agentpool.ts） */
+    const pickWorker = createSubAgentDispatcher(pool)
+    /**
+     * 子代理的上下文预算要按它自己那个模型算，而且要按**服务端真实的**窗口算。
+     *
+     * 配置里的 contextWindow 只是「启动它时想开多大」：8081 配 16384、`/props` 实际报
+     * 8192 的时候，按配置算出来的 9830 预算会让子代理第一步就超窗 400 ——
+     * 和主流程上一轮修掉的是同一个坑，这里当时漏了。
+     *
+     * 探测结果按 provider 缓存：一批子任务不必每个都去问一遍 /props。
+     */
+    const budgetCache = new Map<string, number>()
+    const budgetFor = async (p: ProviderConfig): Promise<number> => {
+      const hit = budgetCache.get(p.id)
+      if (hit !== undefined) return hit
+      const real = await effectiveContextWindow(p).catch(() => 0)
+      const own = real > 0 ? real : Math.round(Number(p.contextWindow) || 0)
       // 子代理有自己的一套工具说明，留 40% 给输出和工具定义
-      return Math.max(1500, Math.min(Math.floor(own * 0.6), 24000))
+      const budget = own <= 0 ? ctx.budget : Math.max(1500, Math.min(Math.floor(own * 0.6), 24000))
+      budgetCache.set(p.id, budget)
+      return budget
     }
 
     const one = async (call: ToolCall) => {
       const started = Date.now()
       const task = prepare(call)
+      /**
+       * 只读探查：调用方显式写了 mode=explore 才生效。
+       * 单独取出来是因为下面「交付为空要说实话」也要用它 —— 这个模式下
+       * 子 agent 根本没有写文件的工具，没产出不是它的错，是任务派错了。
+       */
+      const exploreMode = call.args.mode === 'explore'
+      const member = pickWorker()
+      let runner = member?.provider ?? null
       task.model = runner?.model || ctx.provider.model
-      // 把「为什么用/没用工人模型」写进卡片：并行没生效时用户能立刻看到原因，
-      // 而不是看到两个子任务都卡在一个模型后面还不知道为什么
-      task.note = plan.reason
+      // 把「为什么用/没用工人模型」和「这一条派给了哪张卡」写进卡片：
+      // 并行没生效时用户能立刻看到原因，而不是看到两个子任务都卡在一个模型后面
+      task.note = member
+        ? `${plan.reason} · 本任务 → ${member.provider.device?.trim() || member.provider.name || member.provider.model}`
+        : plan.reason
+      if (call.args.mode === 'explore') {
+        task.note = `只读探查 · ${task.note}`
+      }
+      /**
+       * 工作模型窗口太小就别派给它了。
+       *
+       * 子代理一上来就要带整套工具说明（约 4900 tokens，见 LEAN_TOOLS 那段注释），
+       * 显存不够时 llama.cpp 会把 `-c` 自动降下来 —— 实测 7.4G 卡上跑 12B 只拿到 4096，
+       * 连工具表都装不下，派过去必然 400，然后走「失败重跑主模型」白等一轮。
+       * 与其让它先烧一次失败，不如当场改用主模型，并在卡片上写清楚为什么。
+       */
+      if (runner) {
+        const workerBudget = await budgetFor(runner)
+        /**
+         * 只读探查的工具表更短（9 个只读工具，约 1500 tokens），门槛可以放低：
+         * 全量模式 6000 都装不下的小窗口模型，explore 还能派过去做只读梳理。
+         * 这正是「小模型窗口不够」这个痛点的解法 —— 与其一刀切拒派，不如让它只读。
+         */
+        const isExplore = call.args.mode === 'explore'
+        const minBudget = isExplore ? 2500 : MIN_SUBAGENT_BUDGET
+        if (workerBudget < minBudget) {
+          task.note = `工作模型窗口太小（预算 ${workerBudget} tokens${
+            isExplore ? '' : '，工具说明就要约 4900'
+          }），本任务改用主模型`
+          task.model = ctx.provider.model
+          runner = null
+        }
+      }
       const refuse = (why: string) => {
         const t: SubAgentTask = { ...task, status: 'fail', error: why, summary: why, endedAt: Date.now() }
         this.emit(ctx.sessionId, { type: 'subagent_start', task: t })
@@ -3546,83 +5296,241 @@ export class AgentEngine {
         return refuse(`当前模型（${ctx.provider.model}）太小，派子 agent 效果更差，请自己用工具直接完成。`)
       }
 
-      this.emit(ctx.sessionId, { type: 'subagent_start', task })
-      const opts = {
-        id: task.id,
-        callId: call.id,
-        sessionId: ctx.sessionId,
-        description: task.description,
-        prompt: task.prompt,
-        startedAt: task.startedAt,
-        workspace: ctx.workspace,
-        // 子 agent 步数上限压到 30：再多就是在原地打转，没意义还烧时间
-        maxSteps: Math.max(6, Math.min(ctx.config.maxSteps, 30)),
-        tools: ctx.tools,
-        signal: ctx.signal,
-        web: ctx.web,
-        note: plan.reason,
-        instructions: ctx.instructions,
-        approve: (tool: string, args: Record<string, unknown>, risk: RiskInfo, preview?: ApprovalRequest['preview']) => {
-          const decision = decideApproval({
-            mode: ctx.mode ?? ctx.config.approvalMode,
-            hasRisk: true,
-            high: risk.high === true,
-            denied: risk.denied === true,
-            alwaysApprove: this.alwaysApprove.has(ctx.sessionId),
-            alwaysApproveHigh: this.alwaysApproveHigh.has(ctx.sessionId),
-            granted: this.grantedIn(ctx.workspace, tool)
-          })
-          if (decision === 'allow') return Promise.resolve(true)
-          if (decision === 'deny') return Promise.resolve(false)
-          if (ctx.nonInteractive) {
-            // 高危永不自动放行；普通操作按策略
-            return Promise.resolve(risk.high === true ? false : ctx.approvalPolicy === 'allow')
-          }
-          return this.askApproval(ctx.sessionId, tool, args, risk, preview, ctx.signal)
-        },
-        onChange: (change: FileChange) => {
-          touched.push(change.path)
-          this.emit(ctx.sessionId, { type: 'file_change', change })
-        },
-        onUpdate: (t: SubAgentTask) => this.emit(ctx.sessionId, { type: 'subagent_update', task: t })
-      }
-
-      let done = await runSubAgent({
-        ...opts,
-        provider: runner ?? ctx.provider,
-        budget: budgetFor(runner ?? ctx.provider)
-      })
-
+      // 从这里起才算「真有一个子 agent 在跑」：上面 refuse 的失败占位
+      // start/end 在同一瞬间发完，不该让侧栏多出第二枚机器人。
+      this.markSubagent(ctx.sessionId, 1)
       /**
-       * 工人模型白跑一趟时兜底：一个工具都没调用就失败，说明是请求本身没通
-       * （实例没起来、key 失效、端口错），重跑没有副作用 ——
-       * 已经改过文件的情况绝不重跑，否则会把同一处改动做两遍。
+       * 本地 worker 的写型任务加一道墙钟护栏（见 LOCAL_WORKER_WRITE_MS）。
+       * 用独立的 controller 转发父 signal：这样「用户点停止」和「护栏到点」
+       * 走同一条中止路径，不需要在两个地方各判一次。
        */
-      if (done.status === 'fail' && runner && done.tools.length === 0 && !ctx.signal.aborted) {
-        const why = done.error ?? '请求失败'
-        const retry: SubAgentTask = { ...task, status: 'running', steps: 0, summary: '', tools: [], error: undefined }
-        retry.note = `工作模型不可用（${why}），已改用主模型重跑`
-        this.emit(ctx.sessionId, { type: 'subagent_update', task: retry })
+      const capMs = writeCapMs(runner, exploreMode)
+      let capHit = false
+      let capTimer: ReturnType<typeof setTimeout> | null = null
+      let detach: (() => void) | null = null
+      let runSignal = ctx.signal
+      /** 这个子任务自己改过的文件：护栏中止时要说清楚动过哪儿 */
+      const mine = new Set<string>()
+      if (capMs > 0) {
+        const ctl = new AbortController()
+        const forward = () => ctl.abort(new Error('已取消'))
+        ctx.signal.addEventListener('abort', forward, { once: true })
+        detach = () => ctx.signal.removeEventListener('abort', forward)
+        capTimer = setTimeout(() => {
+          capHit = true
+          ctl.abort(new Error(`本地工作模型跑了 ${Math.round(capMs / 60_000)} 分钟仍未收尾`))
+        }, capMs)
+        capTimer.unref?.()
+        runSignal = ctl.signal
+      }
+      this.emit(ctx.sessionId, { type: 'subagent_start', task })
+      let done: SubAgentTask | undefined
+      try {
+        const opts = {
+          id: task.id,
+          callId: call.id,
+          sessionId: ctx.sessionId,
+          description: task.description,
+          prompt: task.prompt,
+          startedAt: task.startedAt,
+          workspace: ctx.workspace,
+          // 子 agent 步数上限压到 30：再多就是在原地打转，没意义还烧时间
+          maxSteps: Math.max(6, Math.min(ctx.config.maxSteps, 30)),
+          // lean 模式下 LSP 导航工具在父表里被收进 toolbox，而 toolbox 不在只读白名单里：
+          // 不补的话，小窗口机器上的 explore 子 agent 只能 grep，查不了定义和引用（见 withExploreNav）
+          tools: exploreMode ? withExploreNav(ctx.tools) : ctx.tools,
+          mode: (call.args.mode === 'explore' ? 'explore' : null) as 'explore' | null,
+          signal: runSignal,
+          web: ctx.web,
+          note: task.note,
+          instructions: ctx.instructions,
+          approve: (tool: string, args: Record<string, unknown>, risk: RiskInfo, preview?: ApprovalRequest['preview']) => {
+            const decision = decideApproval({
+              mode: ctx.mode ?? ctx.config.approvalMode,
+              hasRisk: true,
+              high: risk.high === true,
+              denied: risk.denied === true,
+              alwaysApprove: this.alwaysApprove.has(ctx.sessionId),
+              alwaysApproveHigh: this.alwaysApproveHigh.has(ctx.sessionId),
+              granted: this.grantedIn(ctx.workspace, tool)
+            })
+            if (decision === 'allow') return Promise.resolve(true)
+            if (decision === 'deny') return Promise.resolve(false)
+            if (ctx.nonInteractive) {
+              // 高危永不自动放行；普通操作按策略
+              return Promise.resolve(risk.high === true ? false : ctx.approvalPolicy === 'allow')
+            }
+            return this.askApproval(ctx.sessionId, tool, args, risk, preview, ctx.signal)
+          },
+          onChange: (change: FileChange) => {
+            touched.push(change.path)
+            mine.add(change.path)
+            this.emit(ctx.sessionId, { type: 'file_change', change })
+          },
+          onUpdate: (t: SubAgentTask) => this.emit(ctx.sessionId, { type: 'subagent_update', task: t })
+        }
+
         done = await runSubAgent({
           ...opts,
-          provider: ctx.provider,
-          budget: budgetFor(ctx.provider),
-          note: retry.note
+          provider: runner ?? ctx.provider,
+          budget: await budgetFor(runner ?? ctx.provider)
         })
-        done.note = retry.note
-      }
 
-      this.emit(ctx.sessionId, { type: 'subagent_end', task: done })
-      return {
-        call,
-        output: formatTaskResult(done),
-        ok: done.status === 'ok',
-        durationMs: Date.now() - started
+        /**
+         * 护栏中止：结果要能直接指导下一步，而不只是「失败了」。
+         *
+         * 写清楚三件事 —— 跑多久、烧了多少步、动过哪些文件。父 agent 据此决定
+         * 是接着修（改动都还在，写前有快照）还是拆小重派；比等进程自己崩掉好得多。
+         */
+        if (capHit) {
+          const v = localCapVerdict(capMs, done.steps, done.tools.length, [...mine])
+          done.status = 'fail'
+          done.error = v.error
+          done.summary = v.summary
+          done.note = `${task.note} · ${v.note}`
+        }
+
+        /**
+         * 工人模型白跑一趟时兜底：一个工具都没调用就失败，说明是请求本身没通
+         * （实例没起来、key 失效、端口错），重跑没有副作用 ——
+         * 已经改过文件的情况绝不重跑，否则会把同一处改动做两遍。
+         */
+        if (done.status === 'fail' && runner && done.tools.length === 0 && !ctx.signal.aborted && !capHit) {
+          const why = done.error ?? '请求失败'
+          const retry: SubAgentTask = { ...task, status: 'running', steps: 0, summary: '', tools: [], error: undefined }
+          retry.note = `工作模型不可用（${why}），已改用主模型重跑`
+          this.emit(ctx.sessionId, { type: 'subagent_update', task: retry })
+          done = await runSubAgent({
+            ...opts,
+            provider: ctx.provider,
+            budget: await budgetFor(ctx.provider),
+            note: retry.note
+          })
+          done.note = retry.note
+        }
+
+        /**
+         * 空交付不许报「已完成」。
+         *
+         * 实测（9B + gemma-4-E4B 两卡并行）：父 agent 让它「新建 snake.html」，
+         * 它却在 task 里顺手带了 mode=explore —— 子 agent 拿的是只读工具表，
+         * 读了两个文件、回了句「接下来的步骤请你执行」，而结果照样写成「已完成」。
+         * 父 agent 据此以为文件已经在磁盘上，回头 read_file 读了个空，只能从头再做。
+         *
+         * 判据不用猜语义，就看文件系统事实上有没有变化（touched 由 onChange 收集）：
+         * 一次工具调用都没改文件，就不是「做完了」。explore 模式下额外说清
+         * 「它没有写权限」，否则父 agent 会以为子 agent 偷懒。
+         */
+        if (done.status === 'ok' && !touched.length) {
+          const wantsWrite = /新建|创建|写入|写到|改成|修改|保存|落地|write|create|生成.{0,6}文件/i.test(task.prompt)
+          const head = exploreMode
+            ? `这次子任务是只读探查（mode=explore）：子 agent 只有读工具，不能写文件，所以磁盘上没有任何变化。`
+            : `子 agent 跑完了，但**没有改动任何文件**（${done.tools.length} 次工具调用全是只读），交付是空的。`
+          const tail = wantsWrite
+            ? exploreMode
+              ? '你给它的任务看起来要新建/修改文件 —— 去掉 mode 重新派一次（不填 mode 就是完整模式），或者自己用 write_file 写。'
+              : '别把它当成做完了：自己用 write_file 把那几个文件写出来，或者重新派一次，并在 prompt 里写明「必须用 write_file 落到磁盘」。'
+            : ''
+          done.summary = [head, tail, '', '它的回报：', done.summary].filter((x) => x !== '').join('\n')
+          done.note = `${done.note ?? ''}${done.note ? ' · ' : ''}${exploreMode ? '只读模式，未改文件' : '未改文件'}`
+          this.emit(ctx.sessionId, { type: 'subagent_update', task: done })
+        }
+
+        /**
+         * 子 agent 写出来的网页也要过同一道验收。
+         *
+         * 语法校验和浏览器打开验收挂在**父 agent 的循环**里（见上面的 writeTargets 那段），
+         * 子 agent 跑的是另一套循环，它调 write_file 只经过工具层的写入上限 ——
+         * 实测就是这么漏的：子 agent 交付了 ttt.html，父 agent 只 list_dir 看了一眼
+         * 就宣布完成，一次浏览器都没打开过。同一份代码，谁写的都该接受同样的检查。
+         */
+        if (done.status === 'ok' && touched.length && !ctx.signal.aborted) {
+          const abs = [...new Set(touched)].map((f) => path.resolve(ctx.workspace, f))
+          const htmls = abs.filter((f) => /\.html?$/i.test(f))
+          const jsFiles = abs.filter((f) => /\.(?:m?js|cjs)$/i.test(f))
+          const notes: string[] = []
+          if (htmls.length) {
+            const issues = await checkHtmlScripts(htmls).catch(() => [])
+            if (issues.length) {
+              notes.push(formatHtmlIssues(issues, ctx.workspace))
+              const fails = this.verifyFails.get(ctx.sessionId) ?? new Map<string, string>()
+              for (const d of issues) {
+                fails.set(path.relative(ctx.workspace, d.file).split(path.sep).join('/'), `内联脚本语法错误（第 ${d.line} 行）`)
+              }
+              this.verifyFails.set(ctx.sessionId, fails)
+            } else {
+              const pages = await checkWebPages(htmls, ctx.workspace).catch(() => [])
+              const bad = pages.filter((p) => !p.skipped && !p.ok)
+              if (bad.length) {
+                notes.push(formatWebCheck(pages, ctx.workspace))
+                const fails = this.verifyFails.get(ctx.sessionId) ?? new Map<string, string>()
+                for (const p of bad) {
+                  fails.set(
+                    path.relative(ctx.workspace, p.file).split(path.sep).join('/'),
+                    p.errors[0] ?? '打开后没有真正跑起来'
+                  )
+                }
+                this.verifyFails.set(ctx.sessionId, fails)
+              } else {
+                // 用统一报告而不是手写一句「无报错」：现在验收还看画面有没有画出来、
+                // 首屏是不是已经结算、对输入有没有反应，这些结论必须一起带给父 agent
+                const okReport = formatWebCheck(pages, ctx.workspace)
+                notes.push(
+                  okReport ||
+                    `【子 agent 产物验收】${htmls
+                      .map((f) => path.relative(ctx.workspace, f).split(path.sep).join('/'))
+                      .join('、')} 已实际打开。`
+                )
+              }
+            }
+          }
+          if (jsFiles.length) {
+            const jsIssues = await checkJsSyntax(jsFiles).catch(() => [])
+            if (jsIssues.length) {
+              notes.push(formatJsIssues(jsIssues, ctx.workspace))
+              const fails = this.verifyFails.get(ctx.sessionId) ?? new Map<string, string>()
+              for (const d of jsIssues) {
+                fails.set(path.relative(ctx.workspace, d.file).split(path.sep).join('/'), `JS 语法错误（第 ${d.line} 行）`)
+              }
+              this.verifyFails.set(ctx.sessionId, fails)
+            }
+          }
+          if (notes.length) {
+            done.summary = `${done.summary}\n\n${notes.join('\n\n')}`
+            this.emit(ctx.sessionId, { type: 'subagent_update', task: done })
+          }
+        }
+
+        return {
+          call,
+          output: formatTaskResult(done),
+          ok: done.status === 'ok',
+          durationMs: Date.now() - started
+        }
+      } finally {
+        // 护栏的定时器和父 signal 的监听都必须拆掉：一批子任务跑下来，
+        // 每个都留一个 10 分钟的 unref 定时器听着，纯属白占资源。
+        if (capTimer) clearTimeout(capTimer)
+        detach?.()
+        // 正常收工、失败重跑、用户点停止抛异常，计数都必须归位。
+        // 先减计数再发 end：侧栏收到 end 会立刻复查一次，此时查到的必须是「已经结束了」。
+        this.markSubagent(ctx.sessionId, -1)
+        if (done) this.emit(ctx.sessionId, { type: 'subagent_end', task: done })
       }
     }
 
-    // 一次最多并行 3 个：再多会把本地模型的推理服务压住，审批也会连着弹
-    const MAX = 3
+    /**
+     * 一批最多并行几个：跟着「真能接活的实例数」走。
+     *
+     * 算式只有一份（`laneCount`），系统提示和自动派发文案用的是同一个 ——
+     * 以前提示按「配了几个子智能体」说、这里按「池里几个就绪」跑，配了 1 个时
+     * 提示教它连写 3 个、这里一次只放 1 个，几路审查排队串行外带全撞限流。
+     *
+     * 池里有几个就并行几个；池子空时本地 llama 只有 1 个槽位（多放只会排队 +
+     * 各自重付 prefill），远端 API 保持 3 个。每个实例自己的槽位仍由 gate.ts
+     * 按 baseUrl 单独排队。
+     */
+    const MAX = laneCount(pool.length, isLlamaProvider(ctx.provider))
     for (let i = 0; i < calls.length; i += MAX) {
       const settled = await Promise.all(calls.slice(i, i + MAX).map(one))
       for (const r of settled) {

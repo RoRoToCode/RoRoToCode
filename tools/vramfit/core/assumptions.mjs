@@ -40,7 +40,11 @@ export const TUNING = {  /** 运行时开销：batch / 计算缓冲。RTX 2080 +
    * 8 GB 卡上已占 7.2 GB 时还推荐 64K，真跑起来并发就掉到 1.5 tok/s。
    */
   wddmFreeFactor: 0.92,
-  /** 只是物理上限（装进去不会溢出），不是「现在装得下」的预算 */
+  /**
+   * 只是物理上限（装进去不会溢出），不是「现在装得下」的预算。
+   * 静态口径（`--budget static`）直接拿它乘物理容量 —— 两种口径共用同一个系数，
+   * 换机器 / 换卡时「总容量 94%」这个物理边界不该有两套数。
+   */
   wddmTotalFactor: 0.94,
   /**
    * 读不到「已用显存」时的保守预算系数（A 卡 / 核显在 Windows 上就是这种情况）。
@@ -153,10 +157,14 @@ export const ASSUMPTIONS = [
   {
     group: ['显存上限', 'VRAM ceiling'],
     items: [
-      { k: ['Windows', 'Windows'], v: ['min(可用 × 0.92, 总显存 × 0.94)', 'min(free × 0.92, total × 0.94)'],
-        note: ['WDDM 虽可驱逐显存，但换页会让推理慢到不可用，所以只按当前可用算', 'WDDM can evict VRAM, but paging makes inference unusably slow, so only current free counts'] },
-      { k: ['Linux', 'Linux'], v: ['可用 × 0.92', 'free × 0.92'],
-        note: ['显存不可驱逐，只能按当前可用算', 'VRAM is not evictable, so only current free counts'] },
+      { k: ['Windows 静态', 'Windows static'], v: ['总显存 × 0.94', 'total × 0.94'],
+        note: ['默认静态口径：不扣当前占用，同一台机器结论可复现；`--budget auto` 才按当前可用算',
+          'Static by default: current usage is ignored, so results are reproducible; `--budget auto` uses current free'] },
+      { k: ['Windows 动态', 'Windows auto'], v: ['min(可用 × 0.92, 总显存 × 0.94)', 'min(free × 0.92, total × 0.94)'],
+        note: ['WDDM 虽可驱逐显存，但换页会让推理慢到不可用，所以只按当前可用算；读数会随别的程序开合跳',
+          'WDDM can evict VRAM, but paging makes inference unusably slow, so only current free counts; the reading swings as other apps open and close'] },
+      { k: ['Linux', 'Linux'], v: ['总显存 × 0.94；auto 时 可用 × 0.92', 'total × 0.94; free × 0.92 with auto'],
+        note: ['显存不可驱逐；auto 口径只按当前可用算', 'VRAM is not evictable; the auto basis uses current free only'] },
       { k: ['macOS 统一内存', 'macOS unified'], v: ['Metal 建议工作集 × 0.9', 'Metal working set × 0.9'],
         note: ['读不到建议工作集时按物理内存 75%', 'Falls back to 75% of physical RAM when unavailable'] },
       { k: ['没有独立显卡', 'No dGPU'], v: ['物理内存 × 0.8', 'physical RAM × 0.8'],

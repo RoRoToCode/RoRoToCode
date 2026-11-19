@@ -76,3 +76,21 @@ export function isResultFile(p: string): boolean {
 export function filterResultFiles(items: ResultFile[]): ResultFile[] {
   return [...items].sort((a, b) => b.at - a.at).filter((f) => isResultFile(f.path) && !isNoisePath(f.path))
 }
+
+/**
+ * 同一个路径写了多次时，只保留最后一次成功的那一版。
+ * 中间几版是半成品，不该出现在成果区；writes 统一归 1，界面不再显示「×N」。
+ */
+export function keepFinalWrites(items: ResultFile[]): ResultFile[] {
+  const map = new Map<string, ResultFile>()
+  for (const f of items) {
+    const old = map.get(f.path)
+    if (!old || f.at >= old.at) map.set(f.path, { ...f, writes: 1 })
+  }
+  return [...map.values()]
+}
+
+/** 成果区最终名单：在成果判定之上再排除「修改」——只留本次新建交付的文件 */
+export function finalResultFiles(items: ResultFile[]): ResultFile[] {
+  return filterResultFiles(items).filter((f) => f.action !== 'edited')
+}

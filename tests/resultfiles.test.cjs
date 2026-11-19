@@ -4,6 +4,8 @@ const {
   isResultFile,
   isNoisePath,
   filterResultFiles,
+  finalResultFiles,
+  keepFinalWrites,
   baseName,
   extOf
 } = require('../dist/shared/resultfiles.js')
@@ -47,4 +49,45 @@ test('filterResultFiles 只留成果、按时间倒序，不做纯编码兜底',
   ]
   assert.deepEqual(filterResultFiles(items).map((f) => f.path), ['new.pdf', 'old.md'])
   assert.deepEqual(filterResultFiles([{ path: 'only.py', action: 'created', at: 1, writes: 1 }]), [])
+})
+
+test('成果区最终名单：只留新建成果，修改过的和半成品都不显示', () => {
+  const items = [
+    { path: '成品.pdf', action: 'created', at: 5, writes: 1 },
+    { path: '已有报告.docx', action: 'edited', at: 9, writes: 3 },
+    { path: 'helper.py', action: 'created', at: 8, writes: 1 },
+    { path: 'tmp_x.md', action: 'created', at: 7, writes: 1 }
+  ]
+  assert.deepEqual(finalResultFiles(items).map((f) => f.path), ['成品.pdf'])
+  // 没有成果类文件时也不兜底显示脚本 —— 这正是半成品混进成果区的老毛病
+  assert.deepEqual(finalResultFiles([items[2], items[3]]), [])
+})
+
+test('keepFinalWrites：同一路径只留最后一次成功写入，不显示 ×N', () => {
+  const items = [
+    { path: 'a.md', action: 'created', at: 1, writes: 1 },
+    { path: 'b.pdf', action: 'created', at: 2, writes: 1 },
+    { path: 'a.md', action: 'created', at: 5, writes: 2 },
+    { path: 'a.md', action: 'created', at: 3, writes: 3 }
+  ]
+  const out = keepFinalWrites(items)
+  assert.equal(out.length, 2)
+  const a = out.find((f) => f.path === 'a.md')
+  assert.equal(a.at, 5)
+  assert.equal(a.writes, 1)
+  assert.equal(out.find((f) => f.path === 'b.pdf').writes, 1)
+})
+
+test('成果区管线：多次写入 + 修改 + 脚本，最终只剩最后新建的成果', () => {
+  const items = [
+    { path: '报告.docx', action: 'created', at: 1, writes: 1 },
+    { path: '报告.docx', action: 'edited', at: 2, writes: 1 },
+    { path: '报告.docx', action: 'created', at: 4, writes: 2 },
+    { path: 'make.py', action: 'created', at: 3, writes: 1 }
+  ]
+  const out = finalResultFiles(keepFinalWrites(items))
+  assert.equal(out.length, 1)
+  assert.equal(out[0].path, '报告.docx')
+  assert.equal(out[0].at, 4)
+  assert.equal(out[0].writes, 1)
 })

@@ -103,6 +103,7 @@ node check.mjs https://huggingface.co/unsloth/Qwen3-8B-GGUF/resolve/main/Qwen3-8
 | `--kv <类型>` | KV cache 精度：`f16`（默认）/ `q8_0`（省一半显存）/ `q4_0` |
 | `--vram 12` | 假装有 12 GB 显存（保留卡名和带宽），评估「换卡值不值」 |
 | `--gpu N` | 按第 N 块卡评估，双卡机器必指定；不支持跨卡切分 |
+| `--budget static\|auto` | 预算口径：`static`（默认，总显存×0.94，不看当前占用）/ `auto`（按当前空闲显存） |
 | `--mirror <地址>` | 默认 `hf-mirror.com`；写 `https://huggingface.co` 直连官方 |
 | `--lang zh\|en` | 界面语言，默认跟随系统，也可设 `VRAMFIT_LANG` |
 | `--no-color` / `--ascii` | 关颜色 / 换 ASCII 符号，重定向和老终端用 |
@@ -214,12 +215,17 @@ tok/s ≈ 带宽(GB/s) × 效率 ÷ 权重体积(GB)
 
 | 平台 | 显存从哪读 | 上限怎么算 |
 |---|---|---|
-| Windows | `nvidia-smi` / `rocm-smi`，失败退注册表 | `max(可用×0.92, 总显存×0.94)`，WDDM 能驱逐 |
-| Linux | `nvidia-smi` / `rocm-smi`，退 `/sys/class/drm` | 可用 × 0.92，显存不可驱逐 |
-| macOS | `sysctl hw.memsize`，Metal 建议工作集 | 建议工作集 × 0.9 |
+| Windows | `nvidia-smi` / `rocm-smi`，失败退注册表 | 默认 `总显存×0.94`；`--budget auto` 时 `min(可用×0.92, 总显存×0.94)` |
+| Linux | `nvidia-smi` / `rocm-smi`，退 `/sys/class/drm` | 默认 `总显存×0.94`；`auto` 时 `可用 × 0.92`（显存不可驱逐） |
+| macOS | `sysctl hw.memsize`，Metal 建议工作集 | 建议工作集 × 0.9（两种口径一致：统一内存本来就按容量算） |
 | 没有独显 | 物理内存 | × 0.8，按 CPU 推理算 |
 
 核显按共享内存一半估，同时有独显时不会被选中。上限那行会写明当前用的哪套算法。
+
+默认口径是**静态**（按物理容量，可复现、不随别的程序开合跳），代价是不扣当前占用；
+`--budget auto` 才是「此刻还剩多少」。动态读数有两个坑：一是快照会跳（同一台机器隔两分钟结论不同），
+二是它会被「释放了」骗过去 —— 别的程序退出后显存记回空闲，可那块显存已被 WDDM 换页打散，
+模型真占进去速度并不会恢复。
 
 | 格式 | 状态 |
 |---|---|

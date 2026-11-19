@@ -1,6 +1,6 @@
 const test = require('node:test')
 const assert = require('node:assert/strict')
-const { createToolCallGuard, callSignature, toolKind } = require('../dist/shared/toolguard.js')
+const { createToolCallGuard, createErrorStreakGuard, classifyToolError, callSignature, toolKind } = require('../dist/shared/toolguard.js')
 
 /** 走一遍「执行完记一笔」，返回这次 check 的结论 */
 function cycle(guard, name, args, result) {
@@ -102,4 +102,38 @@ test('签名表有上限：长时间运行不会无限涨', () => {
   assert.ok(guard.size() <= 20, `size=${guard.size()}`)
   guard.reset()
   assert.equal(guard.size(), 0)
+})
+
+test('classifyToolError 认出常见错误类别', () => {
+  assert.equal(classifyToolError("Error: ENOENT: no such file or directory, open 'F://tmp//index.html'"), 'missing')
+  assert.equal(classifyToolError("Error: Cannot find module 'C://a//check.js'"), 'missing')
+  assert.equal(classifyToolError('MODULE_NOT_FOUND'), 'missing')
+  assert.equal(classifyToolError('SyntaxError: Unexpected token'), 'syntax')
+  assert.equal(classifyToolError('路径超出工作区范围，已拒绝'), 'outside')
+  assert.equal(classifyToolError('全部通过，exit code 0'), null)
+})
+
+test('连续同类错误：换脚本名也拦得住，第三次提醒、第五次收工', () => {
+  const guard = createErrorStreakGuard({ workspace: 'C://work', warnAt: 3, haltAt: 5 })
+  const errors = [
+    "ENOENT: no such file 'F://tmp//check.py'",
+    "Cannot find module 'F://tmp//check.js'",
+    "ENOENT: open 'F://tmp//find.py'",
+    "MODULE_NOT_FOUND 'F://tmp//check.js'",
+    "FileNotFoundError: 'F://tmp//check.py'"
+  ]
+  const verdicts = errors.map((e) => guard.observe(e).verdict)
+  assert.deepEqual(verdicts, ['ok', 'ok', 'hint', 'ok', 'halt'])
+})
+
+test('错误类别切换或成功后重置连续计数', () => {
+  const guard = createErrorStreakGuard({ warnAt: 2, haltAt: 3 })
+  guard.observe('ENOENT xxx') // missing 1
+  guard.observe('Cannot find module yyy') // missing 2 → hint
+  const afterSwitch = guard.observe('SyntaxError: bad') // syntax 1 → reset
+  assert.equal(afterSwitch.verdict, 'ok')
+  assert.equal(afterSwitch.streak, 1)
+  guard.observe('执行成功') // 成功 → 全清
+  const fresh = guard.observe('ENOENT zzz')
+  assert.equal(fresh.streak, 1)
 })

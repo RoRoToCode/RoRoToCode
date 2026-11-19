@@ -1,5 +1,5 @@
 import { execFile, spawn } from 'node:child_process'
-import { promises as fs } from 'node:fs'
+import { existsSync, promises as fs } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { dialog } from 'electron'
@@ -8,6 +8,7 @@ import { downloadFromSources, headSize, humanSize } from './dl'
 import { MIRRORS } from './ghdl'
 import type { DownloadSource } from './resume'
 import { mt } from './i18n'
+import { isMac, isWin } from './platform'
 
 /**
  * 基础核心库：Node.js（含 npm）、Git for Windows、Python。
@@ -46,6 +47,8 @@ const LOCAL = process.env.LOCALAPPDATA ?? path.join(os.homedir(), 'AppData', 'Lo
 
 /** 常见 Python 安装目录（Program Files\Python3xx 与 用户目录两套） */
 async function pythonDirs(): Promise<string[]> {
+  // 只有 Windows 才有这些固定的安装目录；macOS / Linux 交给 PATH
+  if (!isWin) return []
   const out: string[] = []
   for (const base of [PF, path.join(LOCAL, 'Programs', 'Python')]) {
     try {
@@ -75,7 +78,7 @@ const SPECS: Record<BaseToolId, ToolSpec> = {
     id: 'node',
     label: 'Node.js LTS（含 npm）',
     bins: ['node'],
-    candidates: () => [path.join(PF, 'nodejs', 'node.exe')],
+    candidates: () => (isWin ? [path.join(PF, 'nodejs', 'node.exe')] : []),
     versionArgs: ['-v'],
     file: 'node-lts-x64.msi',
     // MSI 静默安装，/norestart 避免自动重启打断用户
@@ -99,7 +102,8 @@ const SPECS: Record<BaseToolId, ToolSpec> = {
     id: 'git',
     label: 'Git for Windows',
     bins: ['git'],
-    candidates: () => [path.join(PF, 'Git', 'cmd', 'git.exe'), path.join(PF86, 'Git', 'cmd', 'git.exe')],
+    candidates: () =>
+      isWin ? [path.join(PF, 'Git', 'cmd', 'git.exe'), path.join(PF86, 'Git', 'cmd', 'git.exe')] : [],
     versionArgs: ['--version'],
     file: 'git-setup-64.exe',
     // Inno Setup 的静默参数
@@ -125,7 +129,7 @@ const SPECS: Record<BaseToolId, ToolSpec> = {
   python: {
     id: 'python',
     label: 'Python 3（可选）',
-    bins: ['python'],
+    bins: isWin ? ['python', 'py'] : ['python3', 'python'],
     candidates: pythonDirs,
     versionArgs: ['--version'],
     file: 'python-setup-amd64.exe',
@@ -228,12 +232,86 @@ export function buildInstallScript(ready: Array<{ spec: ToolSpec; file: string }
   ].join('\n')
 }
 
+/**
+ * macOS / Linux 的「一键安装」。
+ *
+ * Windows 走 MSI / EXE 静默安装 + 一次 UAC 提权；macOS 用 Homebrew（免 sudo，用户级），
+ * Linux 的 apt/dnf/pacman 都要 sudo，程序不代跑提权命令，只给出可复制的指令。
+ */
+async function installToolsPosix(
+  ids: BaseToolId[],
+  onProgress: (p: ToolSetupProgress) => void
+): Promise<InstallResult> {
+  const targets = ORDER.filter((id) => ids.includes(id))
+  const formula: Record<BaseToolId, string> = { node: 'node', git: 'git', python: 'python' }
+  const pkg: Record<BaseToolId, string> = { node: 'nodejs', git: 'git', python: 'python3' }
+
+  if (!isMac) {
+    const names = targets.map((id) => pkg[id]).join(' ')
+    return {
+      ok: false,
+      message:
+        'Linux 下建议用系统包管理器安装（需要你输入密码，程序不代跑 sudo）：\n' +
+        `  Debian / Ubuntu：sudo apt-get update && sudo apt-get install -y ${names}\n` +
+        `  Fedora：sudo dnf install -y ${names}\n` +
+        `  Arch：sudo pacman -S --needed ${names}\n` +
+        '装完回来点「检测状态」即可。',
+      tools: await checkTools()
+    }
+  }
+
+  const brew = ['/opt/homebrew/bin/brew', '/usr/local/bin/brew'].find((p) => existsSync(p)) ?? 'brew'
+  const failed: Array<{ label: string; reason: string }> = []
+  for (const id of targets) {
+    const spec = SPECS[id]
+    onProgress({ id, label: spec.label, phase: 'install', receivedBytes: 0, totalBytes: 0 })
+    const code = await new Promise<number>((resolve) => {
+      const child = spawn(brew, ['install', formula[id]], { windowsHide: true })
+      const timer = setTimeout(() => {
+        child.kill()
+        resolve(-1)
+      }, 20 * 60 * 1000)
+      child.on('error', () => {
+        clearTimeout(timer)
+        resolve(-1)
+      })
+      child.on('close', (c) => {
+        clearTimeout(timer)
+        resolve(c ?? -1)
+      })
+    })
+    if (code !== 0) {
+      failed.push({
+        label: spec.label,
+        reason: `brew 退出码 ${code}（没装 Homebrew 时请先安装 https://brew.sh，或到官网手动安装）`
+      })
+    }
+  }
+  const tools = await checkTools()
+  const nowOk = tools.filter((t) => targets.includes(t.id) && t.installed)
+  return {
+    ok: nowOk.length > 0,
+    message:
+      nowOk.length > 0
+        ? `已通过 Homebrew 安装：${nowOk
+            .map((t) => `${t.label.replace(/（可选）/, '')} ${t.version ?? ''}`.trim())
+            .join('、')}。新装的环境需要重启本程序才会在终端里生效。`
+        : `Homebrew 安装没有完成：${
+            failed.map((f) => `${f.label}（${f.reason}）`).join('；') || '请检查 Homebrew 是否可用'
+          }`,
+    installed: nowOk.map((t) => t.label),
+    failed,
+    tools
+  }
+}
+
 export async function installTools(
   ids: BaseToolId[],
   onProgress: (p: ToolSetupProgress) => void
 ): Promise<InstallResult> {
   const targets = ORDER.filter((id) => ids.includes(id))
   if (targets.length === 0) return { ok: false, message: '没有需要安装的组件' }
+  if (!isWin) return installToolsPosix(ids, onProgress)
 
   // 1) 解析直链
   const plans: Array<{ spec: ToolSpec; sources: DownloadSource[]; size: number }> = []

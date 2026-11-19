@@ -46,6 +46,15 @@ export interface IdleDeps {
   stop: (key: string) => Promise<boolean>
   /** 当前的空闲阈值（ms）；每次 tick 现取，改设置立刻生效。<= 0 表示关闭 */
   ttlMs: () => number | Promise<number>
+  /**
+   * 实例 key → 组名。可选的「组保活」。
+   *
+   * 工作模型组里的 N 个实例要一起开、一起关：组内任一还在忙（或刚启动、
+   * 探不到 /slots）时，整组都不卸载。否则跑完一个子任务，其它卡会在下一轮
+   * 被逐个停掉，双卡并行静默失效 —— 而预热只在切模型时跑一次，不会自动补。
+   * 不传这个依赖时行为与单实例完全一致（老调用方与测试都不受影响）。
+   */
+  groupOf?: () => Promise<Record<string, string>>
   now?: () => number
 }
 
@@ -90,6 +99,13 @@ export function createIdleWatcher(
   unloaded: () => Array<{ key: string; model: string; at: number; idleMin: number }>
   /** 手动清掉记录（用户重新启动后调用） */
   forget: (key?: string) => void
+  /**
+   * 手动声明「这条实例还在干活」。
+   *
+   * 给「等用户」这种没有在途请求的场景用：审批弹窗一开可能就是十分钟，
+   * `/slots` 显示空闲、本地闸门里也没有活跃请求，光靠那两条判据会被当成闲置卸掉。
+   */
+  touch: (key: string) => void
 } {
   const now = deps.now ?? (() => Date.now())
   const intervalMs = Math.max(5_000, opts.intervalMs ?? 30_000)
@@ -104,14 +120,28 @@ export function createIdleWatcher(
     if (running) return []
     running = true
     const t = now()
-    const ttl = await deps.ttlMs()
+    const [ttl, groups] = await Promise.all([
+      deps.ttlMs(),
+      deps.groupOf
+        ? deps.groupOf().catch(() => ({}) as Record<string, string>)
+        : Promise.resolve({} as Record<string, string>)
+    ])
     const gone: string[] = []
     try {
+      /**
+       * 先逐个判定、不立刻停。
+       *
+       * 组里的实例必须「一起开、一起关」：组内只要有一条判定为「不卸」
+       * （在忙 / 刚启动 / 探不到状态 / 第一次见到），整组都保活并把计时
+       * 重置到这一轮。否则忙碌的那条一跑完，其它卡会在下一轮被逐个卸掉。
+       */
+      const decisions: Array<{ inst: IdleTarget; unload: boolean }> = []
       for (const inst of deps.list()) {
         const seen = lastBusy.get(inst.key)
         if (seen === undefined) {
           // 第一次见到它：以「现在」为起点，从此刻开始算空闲
           lastBusy.set(inst.key, Math.max(t, inst.startedAt))
+          decisions.push({ inst, unload: false })
           continue
         }
         const pending = deps.pending(inst.port)
@@ -121,10 +151,34 @@ export function createIdleWatcher(
 
         if (busy !== false || pending > 0) {
           lastBusy.set(inst.key, t)
+          decisions.push({ inst, unload: false })
           continue
         }
         const last = lastBusy.get(inst.key) ?? t
-        if (!shouldUnload({ now: t, startedAt: inst.startedAt, lastBusyAt: last, ttlMs: ttl, busy, pending })) {
+        decisions.push({
+          inst,
+          unload: shouldUnload({
+            now: t,
+            startedAt: inst.startedAt,
+            lastBusyAt: last,
+            ttlMs: ttl,
+            busy,
+            pending
+          })
+        })
+      }
+
+      /** 有任一成员不卸的组：整组保活 */
+      const blocked = new Set<string>()
+      for (const d of decisions) {
+        if (!d.unload && groups[d.inst.key]) blocked.add(groups[d.inst.key])
+      }
+
+      for (const { inst, unload } of decisions) {
+        if (!unload) continue
+        if (groups[inst.key] && blocked.has(groups[inst.key])) {
+          // 同组还有人在忙：这一条也留着，空闲计时从现在重新算
+          lastBusy.set(inst.key, t)
           continue
         }
         const ok = await deps.stop(inst.key).catch(() => false)
@@ -165,6 +219,11 @@ export function createIdleWatcher(
     forget(key?: string) {
       if (key) unloadedAt.delete(key)
       else unloadedAt.clear()
+    },
+    touch(key: string) {
+      // 只认当前真在跑的实例：远端供应商 / 已停掉的实例不该在计时表里留一条永不清理的记录
+      if (!deps.list().some((i) => i.key === key)) return
+      lastBusy.set(key, now())
     }
   }
 }

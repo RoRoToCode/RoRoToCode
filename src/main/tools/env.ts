@@ -37,7 +37,26 @@ const EXTRA: Array<[string, string]> = [
   ['PAGER', 'cat'],
   // 别让 npm / git 卡在交互式提示上
   ['CI', '1'],
-  ['NO_COLOR', '1']
+  ['NO_COLOR', '1'],
+  /**
+   * 不生成 `__pycache__`。
+   *
+   * 模型每次跑 `python gen.py` / `python -m pytest` 都会在交付目录旁边留下一堆
+   * `__pycache__`，实测里它们最后和成果文件混在一起。这个变量让解释器不落字节码缓存，
+   * 从源头就不产生垃圾（同时也能少写几个文件、跑得略快一点）。
+   */
+  ['PYTHONDONTWRITEBYTECODE', '1'],
+  /**
+   * Python 子进程的输出编码。
+   *
+   * Windows 下 cmd 里的 Python 默认按系统代码页（中文机器上是 GBK）输出，
+   * 而我们用 utf8 解码 stdout —— 测试断言里的中文全变成「??」，模型既读不懂
+   * 断言失败的原因，也分不清是自己写错还是编码问题。这个变量只影响
+   * stdin/stdout/stderr 的编码，不改变任何行为，也不含凭据。
+   */
+  ['PYTHONIOENCODING', 'utf-8'],
+  // 别让 pip 每 24 小时往 stderr 打一行「有新版本」，那行会被模型当成错误去追
+  ['PIP_DISABLE_PIP_VERSION_CHECK', '1']
 ]
 
 export function safeEnv(): Record<string, string> {

@@ -9,7 +9,6 @@ import type {
   ApprovalRequest,
   ChatMessage,
   FileAttachment,
-  FileChange,
   InterruptedCheckpoint,
   ProviderConfig,
   QuestionRequest,
@@ -40,7 +39,7 @@ import { ModelPicker, type ProbeInfo } from './components/ModelPicker'
 import { SkillsPanel } from './components/SkillsPanel'
 import { AgentPanel } from './components/AgentPanel'
 import { OutputPanel, collectOutputs, filterOutputs } from './components/OutputPanel'
-import type { ResultFile } from '../shared/resultfiles'
+import { keepFinalWrites, type ResultFile } from '../shared/resultfiles'
 import { DiffView } from './components/DiffView'
 import { applyFontScale } from './theme'
 
@@ -170,6 +169,42 @@ export function App() {
   /** 正在跑的子任务，按父 agent 的 callId 索引 */
   const [subTasks, setSubTasks] = useState<Record<string, SubAgentTask>>({})
   const [toast, setToast] = useState<{ text: string; kind: 'info' | 'warn' | 'error' } | null>(null)
+  /**
+   * 静默中断后的自动续跑倒计时：主进程发 auto_resume 事件时点亮，
+   * 每秒递减，归零自动从断点续跑；用户点「取消」或自己发新消息就撤掉。
+   * 倒计时放在界面而不是主进程 —— 这样「取消」是真的取消，不用跨 IPC 管 timer。
+   */
+  const [autoResume, setAutoResume] = useState<{
+    sessionId: string
+    left: number
+    reason: string
+  } | null>(null)
+  const doAutoResume = useCallback((sessionId: string) => {
+    setAutoResume(null)
+    void window.pico.chat.resume(sessionId)
+  }, [])
+  useEffect(() => {
+    if (!autoResume || autoResume.left <= 0) return
+    const id = window.setInterval(() => {
+      setAutoResume((prev) => {
+        if (!prev) return null
+        if (prev.left <= 1) {
+          // 到点自动续跑。用微任务做副作用，别在 setState 更新函数里直接调 IPC
+          const target = prev.sessionId
+          queueMicrotask(() => doAutoResume(target))
+          return null
+        }
+        return { ...prev, left: prev.left - 1 }
+      })
+    }, 1000)
+    return () => window.clearInterval(id)
+    // 只在会话切换 / 首次点亮时重建计时器，别让每秒的 left 变化反复清了又起
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoResume?.sessionId, doAutoResume])
+  // 换会话时撤掉倒计时：它属于原来那条会话，留着会误续跑
+  useEffect(() => {
+    setAutoResume(null)
+  }, [current?.id])
   /** 上次崩溃/中断未跑完的会话，启动时提示可恢复 */
   const [interrupted, setInterrupted] = useState<InterruptedCheckpoint[]>([])
   /**
@@ -238,9 +273,12 @@ export function App() {
     tps?: number
     approx?: boolean
   } | null>(null)
-  /** 本次会话的文件改动（快照），用于「变更」面板角标 */
-  const [changes, setChanges] = useState<FileChange[]>([])
-  const [changesKey, setChangesKey] = useState(0)
+  /**
+   * 这一次调用已经生成出来的量（近似 token）。
+   * 只在「模型正在吐、还没有结果」时有值：写大文件时一次调用能跑几分钟，
+   * 期间正文和用量数字都不动，界面看起来像卡死；有这个实时数字就不会误判。
+   */
+  const [liveGen, setLiveGen] = useState<number | null>(null)
   /** 命令 / 技能在工具参数之外生成的成果（run_shell 跑 Python 产出的 xlsx、pdf 等） */
   const [shellOutputs, setShellOutputs] = useState<ResultFile[]>([])
   useEffect(() => setShellOutputs([]), [current?.id])
@@ -377,7 +415,7 @@ export function App() {
 
   /**
    * 轮询本地 llama 服务，直到真的能连上（启动命令本身现在是秒回的）。
-   * 必须点名实例：双卡双模型时工人模型可能先就绪，
+   * 必须点名实例：双卡双模型时子智能体可能先就绪，
    * 不指定就会把「工人起来了」误判成「主模型起来了」，随后主模型请求撞 503。
    */
   const waitLocalReady = useCallback(async (providerId?: string, maxMs = 90000) => {
@@ -449,14 +487,14 @@ export function App() {
       setProbes((prev) => ({ ...prev, [activeId]: { state: 'checking' } }))
 
       /**
-       * 工人模型的预热与「主模型是不是本地」无关：
-       * 主模型走远端时，本地那块卡正好由工人模型独占，也要把它拉起来。
+       * 子智能体的预热与「主模型是不是本地」无关：
+       * 主模型走远端时，本地那块卡正好由子智能体独占，也要把它拉起来。
        */
       const warmWorker = () =>
         void window.pico.worker
           .warm(activeId)
           .then((w) => {
-            if (w.ok && /已启动/.test(w.message)) notify(tr("工作模型已在后台加载"))
+            if (w.ok && /已启动/.test(w.message)) notify(tr("子智能体已在后台加载"))
           })
           .catch(() => undefined)
 
@@ -489,7 +527,7 @@ export function App() {
           void refreshProbes()
           return
         }
-        // 工人模型在后台起：双卡机器上它占另一张卡，子代理才是真并行
+        // 子智能体在后台起：双卡机器上它占另一张卡，子代理才是真并行
         warmWorker()
         /**
          * 诚实告知：换到本地模型时，历史不是「无缝接续」。
@@ -500,7 +538,7 @@ export function App() {
         }
       } else {
         // 目标不是 llama.cpp：release 已经按需停掉旧进程与占显存的模型，
-        // 这里再 stop() 全停会把刚好该留着的工人模型一起杀掉
+        // 这里再 stop() 全停会把刚好该留着的子智能体一起杀掉
         warmWorker()
       }
       void refreshProbes()
@@ -558,11 +596,6 @@ export function App() {
       setTurnUsage(null)
       setUsage(session.usage ?? null)
       setMention(null)
-      // 变更记录按会话存放：切会话就把列表换成这个会话的
-      const list = await window.pico.changes.list(id).catch(() => [])
-      if (!alive()) return
-      setChanges(list)
-      setChangesKey((k) => k + 1)
 
       // 会话自带工作区：打开时把全局工作区切过去，保证模型在正确目录干活
       const target = session.workspace ?? null
@@ -611,11 +644,11 @@ export function App() {
             void refreshProbes()
           }
         }
-        // 工人模型一并预热：服务本来就在跑时也要看一眼，它是另一张卡上的独立实例
+        // 子智能体一并预热：服务本来就在跑时也要看一眼，它是另一张卡上的独立实例
         void window.pico.worker
           .warm(active!.id)
           .then((w) => {
-            if (w.ok && /已启动/.test(w.message)) notify(tr("工作模型已在后台加载"))
+            if (w.ok && /已启动/.test(w.message)) notify(tr("子智能体已在后台加载"))
           })
           .catch(() => undefined)
       }
@@ -629,7 +662,7 @@ export function App() {
           notify(tr("正在读取附件：{file}…", { file: event.file }))
           break
         case 'attach_no_vision':
-          notify(tr("当前模型（{model}）看不了图。在「模型设置 → 模型 API」换成 qwen2.5-vl / llava / gemma3 这类视觉模型，就能直接看图。", { model: event.model }), 'warn')
+          notify(tr("当前模型（{model}）看不了图。在「模型设置 → 线上模型」换成 qwen2.5-vl / llava / gemma3 这类视觉模型，就能直接看图。", { model: event.model }), 'warn')
           break
         case 'vision_switch':
           // 切视觉要重启服务（十来秒）：状态条上一直挂着，别只闪一个提示就没了
@@ -719,6 +752,8 @@ export function App() {
           // 新一段正文开始 = 上一件工具活干完了，状态条该收起来。
           // 这里不再写「模型正在回复」：正文区自己在出字，重复一遍只是噪音。
           setRunNote('')
+          // 新一轮的实时生成量从 0 起算，别把上一轮的残留数字带过来
+          setLiveGen(null)
           setCurrent((prev) =>
             prev
               ? {
@@ -735,6 +770,23 @@ export function App() {
                 }
               : prev
           )
+          break
+        case 'assistant_reset':
+          // 升档重试：这一条正文作废重发，清空已收到的 delta（不新增气泡）
+          setCurrent((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  messages: prev.messages.map((m) =>
+                    m.id === event.messageId ? { ...m, content: '', toolCalls: undefined } : m
+                  )
+                }
+              : prev
+          )
+          break
+        case 'gen_progress':
+          // 模型在吐东西（正文或工具参数）：把实时生成量显示出来
+          setLiveGen(event.completion)
           break
         case 'delta':
           setCurrent((prev) =>
@@ -797,35 +849,19 @@ export function App() {
               : prev
           )
           break
-        case 'file_change':
-          setChanges((prev) => [event.change, ...prev.filter((c) => c.id !== event.change.id)])
-          setChangesKey((k) => k + 1)
-          break
         case 'artifacts':
-          // 同一个文件被多次命令改动时合并成一行，别把成果面板刷成十几条
-          setShellOutputs((prev) => {
-            const map = new Map(prev.map((f) => [f.path, f]))
-            for (const f of event.items) {
-              const old = map.get(f.path)
-              map.set(
-                f.path,
-                old
-                  ? {
-                      path: f.path,
-                      action: old.action === 'created' || f.action === 'created' ? 'created' : 'edited',
-                      at: Math.max(old.at, f.at),
-                      writes: old.writes + f.writes
-                    }
-                  : f
-              )
-            }
-            return [...map.values()]
-          })
+          // 只留「新建的最终成果」：被改动过的已有文件（edited）不是交付物；
+          // 同一路径多次落盘只留最新一次，中间版本是半成品。
+          setShellOutputs((prev) =>
+            keepFinalWrites([...prev, ...event.items.filter((f) => f.action === 'created')])
+          )
           break
         case 'context':
           setContext({ used: event.used, window: event.window, compacted: event.compacted })
           break
         case 'usage':
+          // 这一发已经有准确用量了，实时估算的数字该退场（否则会停在旧值上）
+          setLiveGen(null)
           setUsage(event.usage)
           if (event.last) {
             const wallMs = genStartedAt.current ? Date.now() - genStartedAt.current : 0
@@ -918,6 +954,7 @@ export function App() {
           notify(event.message, 'error')
           setRunning(false)
           setRunStart(0)
+          setLiveGen(null)
           setQueuePos(0)
           // 出错多半是「中断」：checkpoint 还留着，发送键要能变成「继续」
           void refreshInterrupted()
@@ -925,6 +962,7 @@ export function App() {
         case 'done':
           setRunning(false)
           setRunStart(0)
+          setLiveGen(null)
           setQueuePos(0)
           setApprovals([])
           setQuestion(null)
@@ -946,10 +984,16 @@ export function App() {
     const off = window.pico.onEvent((payload: AgentEventEnvelope) => {
       const { sessionId, event } = payload
       if (sessionId !== currentRef.current) return
+      // 自动续跑倒计时带 sessionId，必须在这里拿到 —— handleEvent 只收 event
+      if (event.type === 'auto_resume') {
+        setAutoResume({ sessionId, left: Math.max(0, event.seconds), reason: event.reason })
+        void refreshInterrupted()
+        return
+      }
       handleEvent(event)
     })
     return off
-  }, [handleEvent])
+  }, [handleEvent, refreshInterrupted])
 
   /** 记下视口是不是贴着底：判定阈值给 56px，免得差一两行就判定为「用户翻走了」 */
   useEffect(() => {
@@ -1130,6 +1174,8 @@ export function App() {
       return
     }
 
+    // 用户自己发了新消息：不再替他自动续跑（他的新指令优先）
+    setAutoResume(null)
     setCurrent((prev) => (prev ? { ...prev, messages: [...prev.messages, userMessage] } : prev))
     setInput('')
     setAttachments([])
@@ -1764,6 +1810,45 @@ export function App() {
         onDelete={(id) => requestDeleteSession(id)}
         onDeleteWorkspace={(ws) => requestDeleteWorkspace(ws)}
         onOpenSkills={() => setShowSkills(true)}
+        onNotify={notify}
+        footActions={
+          <>
+            <button
+              className="icon-btn header-lang"
+              onClick={toggleLang}
+              title={lang === 'zh' ? '切换到英文 · Switch to English' : '切换到中文 · Switch to Chinese'}
+              aria-label={lang === 'zh' ? 'Switch to English' : 'Switch to Chinese'}
+            >
+              <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                <circle cx="8" cy="8" r="6.1" stroke="currentColor" strokeWidth="1.2" />
+                <ellipse cx="8" cy="8" rx="2.6" ry="6.1" stroke="currentColor" strokeWidth="1.2" />
+                <path d="M2 8h12" stroke="currentColor" strokeWidth="1.2" />
+              </svg>
+              <span>{lang === 'zh' ? 'EN' : '中'}</span>
+            </button>
+            <button
+              className="icon-btn header-gear"
+              onClick={() => setShowAppSettings(true)}
+              title={tr("软件设置")}
+              aria-label={tr("软件设置")}
+            >
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                <path
+                  d="M8 10.2a2.2 2.2 0 1 0 0-4.4 2.2 2.2 0 0 0 0 4.4Z"
+                  stroke="currentColor"
+                  strokeWidth="1.3"
+                />
+                <path
+                  d="M12.9 9.6a1 1 0 0 0 .2 1.1l.1.1a1.2 1.2 0 1 1-1.7 1.7l-.1-.1a1 1 0 0 0-1.1-.2 1 1 0 0 0-.6.9v.3a1.2 1.2 0 1 1-2.4 0v-.2a1 1 0 0 0-.7-.9 1 1 0 0 0-1.1.2l-.1.1a1.2 1.2 0 1 1-1.7-1.7l.1-.1a1 1 0 0 0 .2-1.1 1 1 0 0 0-.9-.6H2.8a1.2 1.2 0 1 1 0-2.4h.2a1 1 0 0 0 .9-.7 1 1 0 0 0-.2-1.1l-.1-.1a1.2 1.2 0 1 1 1.7-1.7l.1.1a1 1 0 0 0 1.1.2h.1a1 1 0 0 0 .6-.9V2.8a1.2 1.2 0 1 1 2.4 0v.2a1 1 0 0 0 .6.9 1 1 0 0 0 1.1-.2l.1-.1a1.2 1.2 0 1 1 1.7 1.7l-.1.1a1 1 0 0 0-.2 1.1v.1a1 1 0 0 0 .9.6h.3a1.2 1.2 0 1 1 0 2.4h-.2a1 1 0 0 0-.9.6Z"
+                  stroke="currentColor"
+                  strokeWidth="1.3"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                />
+              </svg>
+            </button>
+          </>
+        }
       />
 
       <main className="main">
@@ -1780,44 +1865,10 @@ export function App() {
           <button
             className="header-settings"
             onClick={() => setShowSettings(true)}
-            title={tr("模型设置：本地模型、模型 API、模型列表")}
+            title={tr("模型设置：本地模型、线上模型、模型列表")}
           >
             {tr("模型设置")}</button>
           <div className="spacer" />
-          <button
-            className="icon-btn header-lang"
-            onClick={toggleLang}
-            title={lang === 'zh' ? '切换到英文 · Switch to English' : '切换到中文 · Switch to Chinese'}
-            aria-label={lang === 'zh' ? 'Switch to English' : 'Switch to Chinese'}
-          >
-            <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-              <circle cx="8" cy="8" r="6.1" stroke="currentColor" strokeWidth="1.2" />
-              <ellipse cx="8" cy="8" rx="2.6" ry="6.1" stroke="currentColor" strokeWidth="1.2" />
-              <path d="M2 8h12" stroke="currentColor" strokeWidth="1.2" />
-            </svg>
-            <span>{lang === 'zh' ? 'EN' : '中'}</span>
-          </button>
-          <button
-            className="icon-btn header-gear"
-            onClick={() => setShowAppSettings(true)}
-            title={tr("软件设置")}
-            aria-label={tr("软件设置")}
-          >
-            <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-              <path
-                d="M8 10.2a2.2 2.2 0 1 0 0-4.4 2.2 2.2 0 0 0 0 4.4Z"
-                stroke="currentColor"
-                strokeWidth="1.3"
-              />
-              <path
-                d="M12.9 9.6a1 1 0 0 0 .2 1.1l.1.1a1.2 1.2 0 1 1-1.7 1.7l-.1-.1a1 1 0 0 0-1.1-.2 1 1 0 0 0-.6.9v.3a1.2 1.2 0 1 1-2.4 0v-.2a1 1 0 0 0-.7-.9 1 1 0 0 0-1.1.2l-.1.1a1.2 1.2 0 1 1-1.7-1.7l.1-.1a1 1 0 0 0 .2-1.1 1 1 0 0 0-.9-.6H2.8a1.2 1.2 0 1 1 0-2.4h.2a1 1 0 0 0 .9-.7 1 1 0 0 0-.2-1.1l-.1-.1a1.2 1.2 0 1 1 1.7-1.7l.1.1a1 1 0 0 0 1.1.2h.1a1 1 0 0 0 .6-.9V2.8a1.2 1.2 0 1 1 2.4 0v.2a1 1 0 0 0 .6.9 1 1 0 0 0 1.1-.2l.1-.1a1.2 1.2 0 1 1 1.7 1.7l-.1.1a1 1 0 0 0-.2 1.1v.1a1 1 0 0 0 .9.6h.3a1.2 1.2 0 1 1 0 2.4h-.2a1 1 0 0 0-.9.6Z"
-                stroke="currentColor"
-                strokeWidth="1.3"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-              />
-            </svg>
-          </button>
         </header>
         {/* 标题栏以下才分左右两栏：左边对话 + 输入框，右边成果面板。
             成果面板从标题栏下方开始，不再盖住窗口右上角的最小 / 最大 / 关闭。 */}
@@ -1945,6 +1996,25 @@ export function App() {
               )}
             </div>
 
+            {autoResume && (
+              <div className="resume-banner auto-resume-banner">
+                <div className="resume-banner-text">
+                  <strong>
+                    {tr("连接中断 · {n} 秒后自动从断点续跑", { n: autoResume.left })}
+                  </strong>
+                  <span>{autoResume.reason}</span>
+                </div>
+                <div className="resume-banner-actions">
+                  <button className="btn primary" onClick={() => doAutoResume(autoResume.sessionId)}>
+                    {tr("立即续跑")}
+                  </button>
+                  <button className="btn" onClick={() => setAutoResume(null)}>
+                    {tr("取消")}
+                  </button>
+                </div>
+              </div>
+            )}
+
             {interrupted.length > 0 && (
               <div className="resume-banner">
                 <div className="resume-banner-text">
@@ -1974,7 +2044,7 @@ export function App() {
               {(running || context) && (
                 <div className="composer-status">
                   <div className="composer-status-left">
-                    {running && <RunStatus note={runNote} startedAt={runStart} queued={queuePos > 0} />}
+                    {running && <RunStatus note={runNote} startedAt={runStart} queued={queuePos > 0} generated={liveGen} />}
                   </div>
                   {context && (
                     <div
@@ -2141,32 +2211,33 @@ export function App() {
                     分两行会让发送键在窄窗口下被挤到另一排，这里用 nowrap 的独立行管住它 */}
                 <div className="composer-actions">
                   <button
-                    className="foot-pill attach-btn"
+                    className="foot-pill attach-btn icon-only"
                     onClick={pickFiles}
                     disabled={attachBusy}
                     title={tr("添加文件：PDF、图片、文档、表格、代码")}
+                    aria-label={tr("添加文件：PDF、图片、文档、表格、代码")}
                   >
-                    <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
                       <path
                         d="M8 3.2v9.6M3.2 8h9.6"
                         stroke="currentColor"
-                        strokeWidth="1.3"
+                        strokeWidth="1.5"
                         strokeLinecap="round"
                       />
                     </svg>
-                    {attachBusy ? tr("添加中…") : tr("添加文件")}
                   </button>
                   <button
-                    className="foot-pill attach-btn"
+                    className="foot-pill attach-btn icon-only"
                     onClick={captureScreen}
                     disabled={attachBusy}
                     title={tr("截取当前屏幕作为图片附件（需要视觉模型）")}
+                    aria-label={tr("截取当前屏幕作为图片附件（需要视觉模型）")}
                   >
-                    <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-                      <rect x="2.2" y="3.6" width="11.6" height="8.4" rx="1.6" stroke="currentColor" strokeWidth="1.2" />
-                      <circle cx="8" cy="7.8" r="1.9" stroke="currentColor" strokeWidth="1.2" />
+                    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                      <circle cx="4.2" cy="4.2" r="2" stroke="currentColor" strokeWidth="1.2" />
+                      <circle cx="4.2" cy="11.8" r="2" stroke="currentColor" strokeWidth="1.2" />
+                      <path d="M5.8 5.6 13 12.2M5.8 10.4 13 3.8" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" />
                     </svg>
-                    {tr("截屏")}
                   </button>
                   <button
                     className={`foot-pill ws-chip ${config?.workspace ? '' : 'unset'}`}
@@ -2184,76 +2255,53 @@ export function App() {
                     <span className="ws-chip-text">{workspaceLabel}</span>
                   </button>
                   <span className="spacer" />
-                  {usage && (usage.prompt > 0 || usage.completion > 0) && (
-                    <span
-                      className="foot-pill usage-pill"
-                      title={
-                        usage.costUsd === undefined
-                          ? tr("本会话：输入 {in}、输出 {out} tokens（不计花费）", {
-                              in: String(usage.prompt),
-                              out: String(usage.completion)
-                            })
-                          : tr("本会话：输入 {in}、输出 {out} tokens，约 {cost}", {
-                              in: String(usage.prompt),
-                              out: String(usage.completion),
-                              cost: fmtCost(usage.costUsd)
-                            })
-                      }
-                    >
-                      <span className="foot-label">{tr("用量")}</span>
-                      <span className="usage-num">
-                        ↑{fmtTokens(usage.prompt)} ↓{fmtTokens(usage.completion)}
+                  {/* 用量合并成一个框：累计输入/输出 + 本轮缓存命中率与生成速度；
+                      本轮的输入输出 token 和命中缓存绝对数不重复展示 */}
+                  {(() => {
+                    const hasUsage = Boolean(usage && (usage.prompt > 0 || usage.completion > 0))
+                    const rate = turnUsage && turnUsage.promptN !== undefined && turnUsage.promptN > 0 && turnUsage.prompt > 0
+                      ? Math.round((1 - turnUsage.promptN / turnUsage.prompt) * 100)
+                      : null
+                    if (!hasUsage && rate === null && !turnUsage?.tps) return null
+                    const tips: string[] = []
+                    if (hasUsage && usage) {
+                      tips.push(usage.costUsd === undefined
+                        ? tr("本会话：输入 {in}、输出 {out} tokens（不计花费）", {
+                            in: String(usage.prompt), out: String(usage.completion)
+                          })
+                        : tr("本会话：输入 {in}、输出 {out} tokens，约 {cost}", {
+                            in: String(usage.prompt), out: String(usage.completion), cost: fmtCost(usage.costUsd)
+                          }))
+                    }
+                    if (turnUsage && rate !== null) {
+                      tips.push(tr("前缀缓存命中率：输入 {prompt} tokens，实际 prefill 仅 {promptN} tokens", {
+                        prompt: String(turnUsage.prompt), promptN: String(turnUsage.promptN)
+                      }))
+                    }
+                    if (turnUsage?.tps) {
+                      tips.push(turnUsage.approx
+                        ? tr("端到端估算：含排队、预填充与等待，通常低于纯生成速度")
+                        : tr("按推理引擎上报的实际解码耗时计算，不含等待与预填充"))
+                    }
+                    return (
+                      <span className="foot-pill usage-pill" title={tips.join('\n')}>
+                        {hasUsage && usage && (
+                          <span className="usage-num">
+                            ↑{fmtTokens(usage.prompt)} ↓{fmtTokens(usage.completion)}
+                          </span>
+                        )}
+                        {hasUsage && usage && usage.costUsd !== undefined && (
+                          <span className="usage-cost">{fmtCost(usage.costUsd)}</span>
+                        )}
+                        {rate !== null && <span className="turn-cached">⚡{rate}%</span>}
+                        {turnUsage?.tps && (
+                          <span className="turn-tps">
+                            {turnUsage.approx ? '≈' : ''}{turnUsage.tps.toFixed(0)} t/s
+                          </span>
+                        )}
                       </span>
-                      {usage.costUsd !== undefined && <span className="usage-cost">{fmtCost(usage.costUsd)}</span>}
-                    </span>
-                  )}
-                  {/* 本轮用量：和「本会话累计」分开，调小模型时最常看的是这一轮到底烧了多少、快不快 */}
-                  {turnUsage && (
-                    <span
-                      className="foot-pill turn-pill"
-                      title={tr("这一轮：输入 {in}、输出 {out} tokens，其中 {cached} 命中缓存{tps}", {
-                        in: String(turnUsage.prompt),
-                        out: String(turnUsage.completion),
-                        cached: String(turnUsage.cached ?? 0),
-                        tps: turnUsage.tps
-                          ? turnUsage.approx
-                            ? tr("，端到端约 {tps} tokens/秒（含首字延迟与等待，不是纯生成速度）", { tps: turnUsage.tps.toFixed(1) })
-                            : tr("，生成 {tps} tokens/秒（引擎实测解码速度）", { tps: turnUsage.tps.toFixed(1) })
-                          : ''
-                      })}
-                    >
-                      <span className="foot-label">{tr("本轮")}</span>
-                      <span className="usage-num">
-                        ↑{fmtTokens(turnUsage.prompt)} ↓{fmtTokens(turnUsage.completion)}
-                      </span>
-                      {turnUsage.cached ? (
-                        <span className="turn-cached" title={tr("命中前缀缓存，这部分没有重新计算")}>
-                          ⚡{fmtTokens(turnUsage.cached)}
-                        </span>
-                      ) : null}
-                      {turnUsage.promptN !== undefined && turnUsage.promptN > 0 && turnUsage.prompt > 0 ? (
-                        <span
-                          className="turn-cached"
-                          title={tr("前缀缓存命中率：输入 {prompt} tokens，实际 prefill 仅 {promptN} tokens", {
-                            prompt: String(turnUsage.prompt),
-                            promptN: String(turnUsage.promptN)
-                          })}
-                        >
-                          ⚡{Math.round((1 - turnUsage.promptN / turnUsage.prompt) * 100)}%
-                        </span>
-                      ) : null}
-                      {turnUsage.tps ? (
-                        <span
-                          className="turn-tps"
-                          title={turnUsage.approx
-                            ? tr("端到端估算：含排队、预填充与等待，通常低于纯生成速度")
-                            : tr("按推理引擎上报的实际解码耗时计算，不含等待与预填充")}
-                        >
-                          {turnUsage.approx ? '≈' : ''}{turnUsage.tps.toFixed(0)} t/s
-                        </span>
-                      ) : null}
-                    </span>
-                  )}
+                    )
+                  })()}
                   {running ? (
                     <>
                       {/* 运行中还能说话：这句话表示「停一下，改成这样」，不是再排一个任务 */}
@@ -2316,17 +2364,7 @@ export function App() {
           <OutputPanel
             files={outputs}
             workspace={config?.workspace ?? null}
-            sessionId={current?.id ?? null}
-            changeCount={changes.length}
-            changesKey={changesKey}
             onNotify={notify}
-            onReverted={() => {
-              if (!current) return
-              void window.pico.changes
-                .list(current.id)
-                .then((list) => setChanges(list))
-                .catch(() => undefined)
-            }}
           />
         </div>
       </main>
@@ -2399,7 +2437,21 @@ export function App() {
             const freed = await window.pico.local.release(saved.activeId ?? null).catch(() => null)
             if (freed?.freed.length) notify(tr("已释放显存：{0}", { "0": freed.freed.join('；') }))
             if (saved.activeId) {
-              void activateModel(saved.activeId, saved, { showLoading: activeChanged })
+              const t = saved.providers.find((p) => p.id === saved.activeId)
+              if (t && isLlamaProvider(t)) {
+                /**
+                 * 本地模型不再「保存即启动」。
+                 *
+                 * 启动只留在「④ 模型列表」的「启动」按钮上：一个模型一个启动入口，
+                 * 才不会再出现两处各自 spawn、最终起出两个 llama-server 的情况。
+                 * 保存只负责落盘并把它设为当前使用，服务什么时候拉起由用户决定。
+                 */
+                modelSwitchSeq.current += 1
+                setModelLoading(null)
+                void refreshProbes()
+              } else {
+                void activateModel(saved.activeId, saved, { showLoading: activeChanged })
+              }
             } else {
               // 没有当前模型了：别让上一次切换的加载横幅一直挂着
               modelSwitchSeq.current += 1

@@ -24,6 +24,41 @@ export function clipSafePlain(text: string, max: number): string {
 }
 
 /**
+ * 从**尾部**取 max 个 code unit，同样不切断代理对。
+ *
+ * `slice(-n)` 的坑和头部相反：切点落在低代理之前时，留下的开头是个孤立低代理
+ * （`\uDE00`），JSON 里同样是非法字符。折叠工具输出时「留结尾」用得很频繁，
+ * 以前每处都写 `slice(-320)`，遇到 emoji 就悄悄坏一次。
+ */
+export function clipTailSafe(text: string, max: number, ellipsis = ''): string {
+  if (max <= 0) return ''
+  if (text.length <= max) return text
+  let start = text.length - max
+  const ch = text.charCodeAt(start)
+  // 起点正好是低代理：说明它属于切点前那个高位代理，整体往后挪一个
+  if (ch >= 0xdc00 && ch <= 0xdfff) start += 1
+  return ellipsis + text.slice(start)
+}
+
+/**
+ * 掐头留尾：返回 head / tail 两段与被省略的字符数。
+ *
+ * 单独抽出来是因为「中间省略」的文案要精确知道少了多少 —— 以前各处用
+ * `content.length - 1120` 反推，改了 head/tail 长度就得同步改这个数，
+ * 漏改一次提示里的数字就是错的。
+ */
+export function splitHeadTail(
+  text: string,
+  head: number,
+  tail: number
+): { head: string; tail: string; omitted: number } {
+  if (text.length <= head + tail) return { head: text, tail: '', omitted: 0 }
+  const h = clipSafePlain(text, head)
+  const t = clipTailSafe(text, tail)
+  return { head: h, tail: t, omitted: Math.max(0, text.length - h.length - t.length) }
+}
+
+/**
  * 只替换第一处，用切片实现而不是 String.replace。
  *
  * String.replace 的替换值是字符串时会展开 `$&` `$'` `` $` `` `$$` ——

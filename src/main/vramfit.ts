@@ -1,5 +1,6 @@
 import { app } from 'electron'
 import { spawn } from 'node:child_process'
+import { gpuUsedMiB } from './vramprobe'
 import { existsSync, promises as fs } from 'node:fs'
 import path from 'node:path'
 import type { AgentHeadroom, VramfitReport, VramfitResult } from '../shared/types'
@@ -49,7 +50,13 @@ export function agentHeadroomOf(
  * 但 Electron 自己就是 Node，这样打包后也不用用户另外装 Node。
  */
 
-/** 结果缓存：同一个文件（大小 + 修改时间没变）不重复读盘 */
+/**
+ * 结果缓存：同一个文件（大小 + 修改时间没变）不重复读盘。
+ *
+ * 静态口径让这份缓存变成「真缓存」：结论只由文件、卡号、KV 精度、卡组容量决定，
+ * 和此刻显存被谁占着无关。动态口径时代它是有害的 —— 空载测一次就把结论钉住，
+ * 之后开游戏再点「重算」拿到的还是旧报告，看起来像测量不准。
+ */
 const cache = new Map<string, { key: string; report: VramfitReport }>()
 /** 同一文件并发请求合并成一次，避免连点按钮起一堆进程 */
 const inflight = new Map<string, Promise<VramfitResult>>()
@@ -112,19 +119,45 @@ interface RunOut {
 /** KV 精度档：和 llama.cpp 启动参数一一对应，决定体检算出来的 KV 有多大 */
 export type VramfitKv = 'f16' | 'q8_0' | 'q4_0' | 'k8v16'
 
+/**
+ * 预算口径：按显卡**物理总容量**静态估算，不看「此刻还剩多少空闲显存」。
+ *
+ * 为什么不跟动态口径：
+ * - 动态口径是一次快照，同一台机器上开个游戏 / 关个浏览器，同一份报告就在
+ *   「装得下 32K」和「一档都装不下」之间跳，用户没法据此做决定；
+ * - 更关键的是那个读数会骗人：程序退出后显存记回空闲，可那块显存已被 WDDM
+ *   换页打散，模型真占进去照样掉到 1.x tok/s。「空闲变大」并不等于「变快了」。
+ *
+ * 静态口径回答的是「这张卡的容量决定它最多能开到哪一档」，可复现、可对比；
+ * 代价是不扣当前占用，所以报告里必须写明口径，启动时也要按真实余量再收一次
+ * （见 llama.ts 调档那段的 budgetMiB）。
+ */
+const BUDGET_MODE = 'static' as const
+
 function runJson(
   script: string,
   file: string,
   timeoutMs: number,
   gpuIndex = 0,
   kv: VramfitKv = 'f16',
-  mmproj: string | null = null
+  mmproj: string | null = null,
+  /**
+   * 合并多卡时的「假设显存池」（GB）。
+   *
+   * vramfit 只认单张卡，没有跨卡切分的概念。合并模式要报的是「这几张卡加起来
+   * 装不装得下」，所以用它的 `--vram` 假设题入口把**容量之和**喂进去。
+   * 静态口径下 `--vram` 就是「物理上有这么多」，预算再乘 0.94 —— 和单卡同一套系数。
+   */
+  manualVramGb: number | null = null
 ): Promise<RunOut> {
   return new Promise((resolve) => {
     const args = [script, '--json']
+    // 口径固定为静态：见 BUDGET_MODE 的说明
+    args.push('--budget', BUDGET_MODE)
     // 双卡机器上「这个模型跑不跑得动」要按它实际绑的那张卡算，
     // 不指定的话 vramfit 只看第一块，第二个模型永远拿到错结论。
     if (gpuIndex > 0) args.push('--gpu', String(gpuIndex))
+    if (manualVramGb && manualVramGb > 0) args.push('--vram', manualVramGb.toFixed(2))
     /**
      * KV 精度必须跟着真正启动时用的参数走。
      *
@@ -190,7 +223,9 @@ export async function checkModel(
   gpuIndex = 0,
   kv: VramfitKv = 'f16',
   /** 这个模型的视觉投影器（一旦发图片就会挂上）：有就必须算进预算 */
-  mmproj?: string | null
+  mmproj?: string | null,
+  /** 合并多卡：按这组卡的**容量**之和当预算（GB）；单卡模式传 null */
+  manualVramGb?: number | null
 ): Promise<VramfitResult> {
   const file = resolveModel(input)
   if (!file) return { ok: false, message: '没有指定模型文件' }
@@ -208,11 +243,14 @@ export async function checkModel(
   const mmPath = mmStat?.isFile() ? mm : null
 
   const card = Math.max(0, Math.round(Number(gpuIndex) || 0))
+  // 合并模式的预算也跟着卡组走：同一文件「单卡 8G」和「双卡合计 16G」结论完全不同，
+  // 缓存键少一项就会把单卡的结论喂给合并模式（反过来也一样）
+  const pool = manualVramGb && manualVramGb > 0 ? Math.round(manualVramGb * 100) / 100 : 0
   // 投影器换了（同名不同量化、重新下载）结论也会变，所以它的体积和 mtime 必须进缓存键
   const mmKey = mmPath ? `${path.basename(mmPath)}:${mmStat?.size ?? 0}:${Math.round(mmStat?.mtimeMs ?? 0)}` : ''
   const key = `${st.size}:${Math.round(st.mtimeMs)}:${kv}:${mmKey}`
-  // 同一个文件在两块卡上的结论不一样（可用显存不同），缓存与并发合并都得带上卡号和 KV 精度
-  const slot = `${file}|gpu${card}|kv${kv}|mm${mmKey}`
+  // 同一个文件在两块卡上的结论不一样（容量不同），缓存与并发合并都得带上卡号和 KV 精度
+  const slot = `${file}|gpu${card}|kv${kv}|mm${mmKey}|vram${pool}|budget${BUDGET_MODE}`
   const hit = cache.get(slot)
   if (hit && hit.key === key) return { ok: true, report: hit.report }
 
@@ -223,7 +261,7 @@ export async function checkModel(
     const script = vramfitScript()
     if (!script) return { ok: false, message: '未找到 vramfit，无法体检（缺 tools/vramfit/check.mjs）' }
 
-    const out = await runJson(script, file, 90_000, card, kv, mmPath)
+    const out = await runJson(script, file, 90_000, card, kv, mmPath, pool || null)
     if (out.timedOut) return { ok: false, message: '体检超时（90 秒），文件可能太大或磁盘繁忙' }
 
     const text = out.stdout.trim()
@@ -239,11 +277,17 @@ export async function checkModel(
       return { ok: false, message: '体检输出不是合法 JSON，可能是 vramfit 版本不匹配' }
     }
     const rows = Array.isArray(parsed) ? (parsed as Array<VramfitReport | { file?: string; error?: string }>) : []
-    const first = rows[0]
-    if (!first) return { ok: false, message: '体检没有返回结果' }
-    if ('error' in first && first.error) return { ok: false, message: `读不懂这个 GGUF：${first.error}` }
+    if (!rows.length) return { ok: false, message: '体检没有返回结果' }
+    /**
+     * 只传一个文件，正常只有一行。但老版本 vramfit 不认 `--budget`：它会把
+     * `static` 当成第二个目标文件，额外报一行「不是 GGUF」。这种时候要取真正的
+     * 那一行再下结论 —— 否则「工具版本旧」会被报成「你的模型文件坏了」，
+     * 而用户手上的文件一点问题都没有。
+     */
+    const row = rows.find((r) => !('error' in r && r.error)) ?? rows[0]
+    if ('error' in row && row.error) return { ok: false, message: `读不懂这个 GGUF：${row.error}` }
 
-    const report = first as VramfitReport
+    const report = row as VramfitReport
     if (typeof report.verdict !== 'string' || !Array.isArray(report.tiers)) {
       return { ok: false, message: '体检结果字段不全，可能是 vramfit 版本不匹配' }
     }
@@ -274,7 +318,14 @@ export async function fitForLaunch(
   gpuIndex = 0,
   kv: VramfitKv = 'f16',
   /** 这个模型的视觉投影器：有就按「会挂投影器」算，避免发图片时才发现装不下 */
-  mmproj?: string | null
+  mmproj?: string | null,
+  /**
+   * 合并多卡：这组卡的容量之和（GB）。
+   * 传了就按它当预算，不再看单张卡 —— 「16G 够不够」和「8G 够不够」是两个问题。
+   * 注意静态口径下这里应当传**容量**之和不传空闲之和：口径必须和单卡分支一致，
+   * 一半按容量、一半按空闲，合并模式就成了「卡越多结论越悲观」。
+   */
+  poolVramGb?: number | null
 ): Promise<{
   verdict: VramfitReport['verdict']
   recommendedCtx: number | null
@@ -283,14 +334,19 @@ export async function fitForLaunch(
   summary: string
   /** 扣掉系统提示与工具定义后还能跑几轮：决定「够不够用」的是它，不是 ctxMax */
   agentRounds: number | null
-  /** 显存预算上限（MiB）：实测调档时拿它当边界 */
+  /**
+   * 显存预算上限（MiB）：静态口径下是「物理容量 × 0.94」。
+   *
+   * 它不是「此刻还剩多少」，所以不能直接当调档边界 —— 启动时用真实余量
+   * （总量 − 启动前已用）再收一次，取两者的小值（见 llama.ts 的 budgetMiB）。
+   */
   limitMiB: number | null
   /**
    * 显卡总显存（MiB）。
    *
-   * 和 limitMiB 不是一回事：limit 是「这次能用多少」（已经扣掉桌面占用），
+   * 和 limitMiB 不是一回事：limit 是预算（静态口径下已经乘过系数），
    * total 是物理容量。小卡判定（`--fit-target` 的留白比例）只能用 total，
-   * 用 limit 会把 8 GB 卡上的 6.3 GB 预算当成 6 GB 卡。
+   * 用 limit 会把 8 GB 卡上的 7.5 GB 预算当成 8 GB 卡。
    */
   totalMiB: number | null
   /**
@@ -317,12 +373,22 @@ export async function fitForLaunch(
    * 体检算了、单测也覆盖了，但调用方根本没往下传，等于从没生效过。
    */
   tightAtStart: boolean
+  /**
+   * 启动那一刻这张卡真正空出来的显存（MiB）：总量 − 已用。
+   *
+   * 报告用静态口径（稳定、可复现），但「点下启动」这件事必须尊重现实：
+   * 桌上压着 7 GB 的游戏时，按容量的 7.5 GB 去全量上卡只会分配失败或疯狂换页。
+   * 调用方拿它做**硬门槛**（模型文件比它还大就先分层），而不是拿它改报告数字 ——
+   * 门槛只会在「确实腾不出来」时生效，不会因为别的程序开合把结论改来改去。
+   * 合并多卡模式拿不到单卡读数（要为每张卡分别采样），返回 null 表示不设门槛。
+   */
+  freeMiB: number | null
 } | null> {
-  const r = await checkModel(input, gpuIndex, kv, mmproj).catch(() => null)
+  const r = await checkModel(input, gpuIndex, kv, mmproj, poolVramGb ?? null).catch(() => null)
   if (!r?.ok) return null
   const rep = r.report
   const fits = rep.verdict !== 'not-recommended' && rep.verdict !== 'unknown'
-  const gpu = rep.gpu ? `${rep.gpu.name}（${(rep.budget.limitBytes / 1024 ** 3).toFixed(1)} GB 可用）` : 'CPU 推理'
+  const gpu = rep.gpu ? `${rep.gpu.name}（静态预算 ${(rep.budget.limitBytes / 1024 ** 3).toFixed(1)} GB）` : 'CPU 推理'
   const ctx = rep.recommendedCtx
   const rounds = rep.agent?.rounds ?? null
   const roundsNote = rounds !== null && fits ? `，装下系统提示后约 ${rounds} 轮` : ''
@@ -336,11 +402,19 @@ export async function fitForLaunch(
         ? `，那时建议 ${Math.round(rep.vision.recommendedCtx / 1024)}K`
         : '，那时一档都装不下（会退回纯文本或按层分担）')
     : ''
+  /**
+   * 口径必须写在结论里。
+   *
+   * 静态口径不扣当前占用，所以「建议 32K」的含义是「这张卡最多能开到 32K」，
+   * 而不是「现在点下去一定能跑」—— 桌上压着游戏的时候，同一份结论仍会掉速。
+   * 不写明这一点，用户会把「按容量算得下」当成「此刻跑得动」，然后怪测量不准。
+   */
+  const basisNote = rep.budget.basis === 'static' ? '（按显卡总容量静态估算，未扣当前占用）' : ''
   const summary = fits
-    ? `装得下：建议上下文 ${ctx ? `${Math.round(ctx / 1024)}K` : '未知'}，参考速度约 ${rep.genTokPerSec ?? rep.genTokPerSecOnCpu ?? '?'} tok/s（零上下文理论上限，非实测）${roundsNote}${visionNote}`
+    ? `装得下：建议上下文 ${ctx ? `${Math.round(ctx / 1024)}K` : '未知'}${basisNote}，参考速度约 ${rep.genTokPerSec ?? rep.genTokPerSecOnCpu ?? '?'} tok/s（零上下文理论上限，非实测）${roundsNote}${visionNote}`
     : rep.verdict === 'unknown'
       ? '元数据不全，算不出上下文'
-      : `装不下：权重本身就超过可用显存${visionNote}`
+      : `装不下：权重本身就超过可用显存${basisNote}${visionNote}`
 
   // KV 斜率：取最高两个算得出体积的档位。高处的斜率才代表「再往上开一档」的真实代价，
   // 滑窗架构在低档位上 KV 被窗口截断，用低档位的差值会高估。
@@ -353,6 +427,15 @@ export async function fitForLaunch(
     if (delta > 0 && hi.ctx > lo.ctx) kvMiBPerKToken = (delta / (hi.ctx - lo.ctx)) * 1000 / (1024 * 1024)
   }
 
+  /**
+   * 启动门槛：这张卡现在真正空出来多少。
+   * 单卡才采（合并模式要为每张卡分别采，交给调用方自己的设备清单）；
+   * 拿不到就读成 null —— 不设门槛，退回纯静态判断，绝不凭空编一个数。
+   */
+  const freeMiB = rep.gpu && !poolVramGb
+    ? await gpuUsedMiB(gpuIndex).then((u) => (u ? Math.max(0, u.totalMiB - u.usedMiB) : null)).catch(() => null)
+    : null
+
   return {
     verdict: rep.verdict,
     recommendedCtx: ctx,
@@ -362,6 +445,7 @@ export async function fitForLaunch(
     agentRounds: rounds,
     limitMiB: rep.gpu ? Math.round(rep.budget.limitBytes / (1024 * 1024)) : null,
     totalMiB: rep.gpu?.totalBytes ? Math.round(rep.gpu.totalBytes / (1024 * 1024)) : null,
+    freeMiB,
     kvMiBPerKToken,
     nativeCtx: rep.nativeContext ?? null,
     // 切视觉重启时按这个档定上下文，不能用纯文本的 recommendedCtx

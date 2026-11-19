@@ -1,5 +1,6 @@
 import type { ChatMessage, ProviderConfig, TokenUsage, ToolCall } from '../../shared/types'
 import type { ToolSpec } from '../tools/spec'
+import { log } from '../log'
 
 export interface StreamOptions {
   provider: ProviderConfig
@@ -7,6 +8,28 @@ export interface StreamOptions {
   tools: ToolSpec[]
   signal: AbortSignal
   onText: (text: string) => void
+  /**
+   * 已经生成出来的量（近似 token 数），随流式帧持续回调。
+   *
+   * 为什么需要它：模型写大文件时，一整次调用可能吐七八千 token、跑几分钟，
+   * 而这期间**既没有正文 delta、也没有 usage**，界面上的用量数字一动不动 ——
+   * 看起来就像卡死了。把生成量实时报上去，界面才能显示「正在生成 · 已 3.2K」。
+   *
+   * 含工具参数的帧也算：写文件的耗时全在参数里，只数正文会一直是 0。
+   * 引擎不要求精确，界面按「约」展示即可。
+   */
+  onProgress?: (generated: number) => void
+  /**
+   * 「还一个字都没拿到」期间的定期上报（毫秒）。
+   *
+   * 本地大提示的预填充可能几分钟，这期间没有任何 delta。没有这个回调，界面
+   * 从「发出去」到「第一个字」之间是完全静默的，用户只能看到一个不动的计时器。
+   */
+  onWait?: (info: { waitedMs: number; promptTokens: number }) => void
+  /** 这一发是「撞到输出上限后的升档重试」：把输出预算抬到该模型能给的最大值。
+   * 由引擎决定何时升（只升一次），供应商只负责按新预算发。
+   */
+  escalate?: boolean
 }
 
 export interface StreamResult {
@@ -101,32 +124,108 @@ export function requestSignal(
 }
 
 /**
+ * 看门狗的两段时限，按「请求打到哪儿」分级。
+ *
+ * 首字前那一段的含义是「多久没动静就该判死」：本地 llama.cpp 要先做 prompt eval，
+ * 弱卡上三十分钟上下文几分钟不出字是正常的，所以给足 10 分钟；而云端网关正常情况下
+ * 10 秒内就吐第一个字，10 分钟一个字没有基本等于连接死了 —— 现场就出现过一次
+ * 20 分钟的单请求挂起（14:41 到 15:01 没有任何消息，最后由总超时收尾）。
+ * 云端给 150 秒：既容得下网关排队与长提示 prefill，又不会让人对着转圈等十分钟。
+ *
+ * 首字后那一段两边一致：90 秒没有新帧，流基本已经断了。
+ */
+export function guardLimits(provider: ProviderConfig): {
+  firstMs: number
+  idleMs: number
+  local: boolean
+} {
+  const local = isLoopbackUrl(provider.baseUrl)
+  return {
+    firstMs: local ? 10 * 60 * 1000 : 150_000,
+    idleMs: 90_000,
+    local
+  }
+}
+
+/** 把毫秒说成人话：150000 → 「2.5 分钟」，30000 → 「30 秒」 */
+function span(ms: number): string {
+  if (ms < 60_000) return `${Math.round(ms / 1000)} 秒`
+  const min = ms / 60_000
+  return `${Number.isInteger(min) ? min : min.toFixed(1)} 分钟`
+}
+
+/**
  * 空闲看门狗。分两段，因为它们失败的含义不同：
  *
- * - 首字前：本地 server 收到请求后要先做 prompt eval，30K 上下文在弱卡上可能一两分钟
- *   才吐出第一帧；这段时间「没输出」是正常的。给 6 分钟，只为兜住「排队排到天荒地老」。
+ * - 首字前：本地 server 收到请求后要先做 prompt eval，30K 上下文在弱卡上可能几分钟
+ *   才吐出第一帧；这段时间「没输出」是正常的。
  * - 首字后：已经在流式输出了，突然 90 秒没有新帧，基本就是进程僵住或连接断了。
  *
  * 总超时 10 分钟兜底；这两段只是让用户更早看到真实原因，而不是在「生成中」干等。
+ *
+ * **`touch()` 只能在真的拿到内容时调用。** 这一条是被实测逼出来的：llama.cpp 在做
+ * prefill 之前会先发一个只有 role、没有内容的帧（keep-alive）。以前收到任何一帧都
+ * `touch()`，于是刚进 prefill 就被当成「已经在流式输出」，接着 90 秒没帧 → 判「生成中断」
+ * → 上层重试 → 重新 prefill 又超时。现场表现就是「请求反复重启、decoded 停在 40、
+ * 十几分钟一声不响」。空帧必须只更新心跳，不改变段位。
+ *
+ * `onWait` 用来把「还没出第一帧」这件事定期告诉界面：本地长上下文预填充本来就慢，
+ * 用户看到的应该是「在读了 90 秒」，而不是一个转圈的计时器。
  */
 export function idleGuard(
   abort: (reason: string) => void,
-  opts: { firstMs?: number; idleMs?: number } = {}
+  opts: {
+    firstMs?: number
+    idleMs?: number
+    /** 本机服务：首字超时的原因说明要指向「预填充」，而不是「网关」。不传按本机算 */
+    local?: boolean
+    /** 首字前，每隔一段时间回调一次「已经等了多久」 */
+    onWait?: (waitedMs: number) => void
+    /** 上报间隔，默认 20 秒 */
+    waitEveryMs?: number
+    /** 看门狗的检查间隔，默认 2 秒（调小只为让单测跑得快，生产不必改） */
+    tickMs?: number
+    /**
+     * 真的掐断时回调一次（不会重复）。
+     * 只用于观测 —— 现场那次 20 分钟挂起，日志里只有一句「请求超时」，
+     * 看不出它到底是总超时还是看门狗，等于断掉了一半线索。
+     */
+    onTrip?: (info: { phase: 'first' | 'idle'; waitedMs: number; reason: string }) => void
+  } = {}
 ): { touch: () => void; stop: () => void } {
-  const firstMs = opts.firstMs ?? 6 * 60 * 1000
+  const firstMs = opts.firstMs ?? 10 * 60 * 1000
   const idleMs = opts.idleMs ?? 90_000
+  const waitEveryMs = opts.waitEveryMs ?? 20_000
+  const tickMs = opts.tickMs ?? 2_000
+  const startedAt = Date.now()
   let last = Date.now()
   let streaming = false
+  let lastWaitAt = 0
   const timer = setInterval(() => {
+    const elapsed = Date.now() - last
+    if (!streaming && opts.onWait && elapsed >= waitEveryMs && Date.now() - lastWaitAt >= waitEveryMs) {
+      lastWaitAt = Date.now()
+      opts.onWait(Date.now() - startedAt)
+    }
     const limit = streaming ? idleMs : firstMs
-    if (Date.now() - last <= limit) return
-    abort(
-      streaming
-        ? `生成中断：${Math.round(idleMs / 1000)} 秒没有收到新内容，连接可能已断开。`
-        : `本地模型 ${Math.round(firstMs / 60_000)} 分钟没有任何输出：可能在排队（同时只处理一个请求），` +
-            '或者进程已经僵死。可以到「本地模型」看状态，必要时停掉后重试。'
-    )
-  }, 2_000)
+    if (elapsed <= limit) return
+    /**
+     * 掐一次就收手。
+     *
+     * 以前这里不停表：controller 已经 abort 了，定时器还每 2 秒再调一次 abort，
+     * 单测里能连打九次。现在加了 onTrip，不停表就会刷出一串重复日志。
+     */
+    clearInterval(timer)
+    const reason = streaming
+      ? `生成中断：${span(idleMs)}没有收到新内容，连接可能已断开。`
+      : (opts.local ?? true)
+        ? `等了 ${span(firstMs)}仍然没有拿到第一个字：本地模型多半卡在预填充上` +
+          '（提示太长、显存不够，或进程僵死 / 在排队）。这一轮已终止，不会再自动重发同一份请求。'
+        : `等了 ${span(firstMs)}仍然没有拿到第一个字：云端服务没有响应` +
+          '（网关排队、限流，或连接已经断在半路）。这一轮已终止，不会再自动重发同一份请求。'
+    opts.onTrip?.({ phase: streaming ? 'idle' : 'first', waitedMs: elapsed, reason })
+    abort(reason)
+  }, tickMs)
   timer.unref?.()
   return {
     touch: () => {
@@ -135,6 +234,33 @@ export function idleGuard(
     },
     stop: () => clearInterval(timer)
   }
+}
+
+/**
+ * 按 provider 建一个带日志的看门狗。
+ *
+ * 三条流式路径（openai / ollama / anthropic）都从这里拿，避免又出现
+ * 「三条路各写一套阈值」—— 之前就是这样：云端首字等 10 分钟，跟总超时一样长，
+ * 谁先到全看运气，日志里只剩一句「请求超时」。
+ */
+export function guardFor(
+  provider: ProviderConfig,
+  abort: (reason: string) => void,
+  extra: { onWait?: (waitedMs: number) => void } = {}
+): { touch: () => void; stop: () => void } {
+  const limits = guardLimits(provider)
+  return idleGuard(abort, {
+    ...limits,
+    onWait: extra.onWait,
+    onTrip: (info) => {
+      log(
+        'warn',
+        'provider',
+        `${provider.name}｜${provider.model}：看门狗掐断（${info.phase === 'first' ? '首字前' : '流式中'}，` +
+          `静默 ${Math.round(info.waitedMs / 1000)} 秒）${info.reason.split('：')[0]}`
+      )
+    }
+  })
 }
 
 export async function* sseLines(body: ReadableStream<Uint8Array>): AsyncGenerator<string> {
@@ -200,6 +326,38 @@ export async function readError(res: Response): Promise<string> {
 }
 
 /**
+ * 给一次模型调用的失败打上「是哪个模型」的标签。
+ *
+ * 现场问题：配置里同时躺着好几条模型（本地 llama.cpp、若干云端 NIM/中转），
+ * 失败冒泡到界面时只剩一句裸的 `HTTP 401 Unauthorized` —— 到底是哪家、哪个 Key
+ * 出问题，用户得自己一条条试。这里在错误最外层补上供应商名 + 模型名。
+ *
+ * 两条硬约束：
+ *  1. 原文必须完整保留在最末尾。agent 的 switchReason / retryable / isWarmingUp
+ *     全靠消息里的 `HTTP 401` 这类子串判断，改一个字就会让自动切换/重试失灵。
+ *  2. 幂等。chatWithFallback 可能对同一个错误做两次包装（换模型前 + 抛出前），
+ *     重复调用不能把标签越叠越长。
+ */
+export function modelError(provider: ProviderConfig, err: unknown): Error {
+  const src = err instanceof Error ? err : new Error(String(err ?? '未知错误'))
+  const msg = src.message || '未知错误'
+  const label = `「${provider.name}${provider.model ? ` · ${provider.model}` : ''}」`
+  if (msg.startsWith(label)) return src
+
+  // 401/403 给出可操作的下一步：这两类几乎都是 Key 的问题，值得直接说破。
+  let advice = ''
+  const status = msg.match(/\bHTTP\s+(401|403)\b/)
+  if (status) {
+    const keyKind = /anthropic/i.test(provider.kind ?? '') ? 'Anthropic API Key' : 'API Key'
+    advice = `。多半是这条模型的 ${keyKind} 无效或已过期，到设置里更新后再试`
+  }
+
+  const out = new Error(`${label}${msg}${advice}`)
+  out.cause = src
+  return out
+}
+
+/**
  * 探一下服务还在不在。
  *
  * 只问「有没有 HTTP 响应」，不关心状态码：llama.cpp 的 `/` 会 404，
@@ -241,7 +399,11 @@ export async function explainStreamFailure(
     const own =
       (signal.reason as Error | undefined)?.message ??
       (err instanceof Error ? err.message : String(err ?? ''))
-    return /已取消|超时|中断|僵死|排队/.test(own) ? own : '已取消'
+    /**
+     * 「第一个字」必须在这个白名单里：首字超时那句话里没有「超时 / 中断」字样，
+     * 漏掉它就退化成一句「已取消」，用户会以为是自己点了停止。
+     */
+    return /已取消|超时|中断|僵死|排队|第一个字/.test(own) ? own : '已取消'
   }
   const msg = err instanceof Error ? err.message : String(err ?? '')
   const cause = (err as { cause?: { message?: string; code?: string } } | null)?.cause

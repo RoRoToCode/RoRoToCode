@@ -4,6 +4,7 @@ import path from 'node:path'
 import { spawn, type ChildProcess } from 'node:child_process'
 import crypto from 'node:crypto'
 import { safeEnv } from './env'
+import { killTree, shellArgs, shellBin, shellNeedsVerbatim } from '../platform'
 
 /**
  * 后台命令：解决「长任务一次收 stdout 必超时」这个实际问题。
@@ -31,17 +32,7 @@ function logDir(): string {
   return path.join(app.getPath('userData'), 'logs', 'shell')
 }
 
-function shellBin(shell: string): string {
-  if (shell === 'powershell') return 'powershell.exe'
-  if (shell === 'bash') return 'bash.exe'
-  return process.env.ComSpec || 'cmd.exe'
-}
-
-function argvFor(shell: string, command: string): string[] {
-  if (shell === 'powershell') return ['-NoProfile', '-Command', command]
-  if (shell === 'bash') return ['-lc', command]
-  return ['/d', '/s', '/c', command]
-}
+// shell 选择与参数由 platform.ts 统一提供，Windows / macOS / Linux 走各自的默认 shell
 
 export async function startBackground(
   root: string,
@@ -53,9 +44,11 @@ export async function startBackground(
   const logPath = path.join(logDir(), `${id}.log`)
   const bin = shellBin(shell)
 
-  const child = spawn(bin, argvFor(shell, command), {
+  const child = spawn(bin, shellArgs(shell, command), {
     cwd: root,
     windowsHide: true,
+    // 和 run_shell 同一套：cmd.exe 需要原样传参，否则内层双引号会被吃掉
+    windowsVerbatimArguments: shellNeedsVerbatim(shell),
     env: safeEnv()
   })
   children.set(id, child)
@@ -124,12 +117,8 @@ export function killJob(id: string): string {
   if (job.status !== 'running') return `任务 ${id} 早就结束了（退出码 ${job.exitCode ?? 'null'}）`
   const child = children.get(id)
   if (child?.pid) {
-    // Windows 上 child.kill 杀不掉子进程树，构建脚本会留一堆 node.exe
-    try {
-      spawn('taskkill', ['/pid', String(child.pid), '/t', '/f'], { windowsHide: true })
-    } catch {
-      child.kill()
-    }
+    // 子进程树：Windows 走 taskkill /T，POSIX 递归 kill
+    killTree(child.pid)
   }
   job.status = 'exited'
   return `已结束任务 ${id}`

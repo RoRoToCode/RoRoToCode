@@ -75,6 +75,34 @@ test('repoindex：建索引跳过 node_modules，且能增量复用', async () =
   fs.rmSync(root, { recursive: true, force: true })
 })
 
+test('repoindex：符号块带行号（大文件切块检索的依据）', () => {
+  const src = [
+    '/** 文件头说明 */',
+    'export function alpha() {}',
+    '',
+    'export class Beta {}',
+    '',
+    'export const gamma = 1'
+  ].join('\n')
+  const r = repoindex.extractSymbols(src, 'a.ts')
+  // symbols 保持纯名字，向后兼容
+  assert.ok(r.symbols.includes('alpha'))
+  assert.ok(r.symbols.includes('Beta'))
+  // blocks 带行号（1 起）
+  const alpha = r.blocks.find((b) => b.name === 'alpha')
+  const beta = r.blocks.find((b) => b.name === 'Beta')
+  const gamma = r.blocks.find((b) => b.name === 'gamma')
+  assert.equal(alpha.line, 2)
+  assert.equal(beta.line, 4)
+  assert.equal(gamma.line, 6)
+})
+
+test('repoindex：非源码 / 无符号文件 blocks 为空数组', () => {
+  const r = repoindex.extractSymbols('just some text', 'notes.md')
+  assert.deepEqual(r.blocks, [])
+  assert.deepEqual(r.symbols, [])
+})
+
 test('repoindex：query 同时匹配路径与符号', async () => {
   const root = tmpdir('roro-idx2-')
   write(root, 'src/parser.ts', 'export function parseThing() {}\n')

@@ -1,3 +1,5 @@
+import { cutInsideString } from './toolargs'
+
 /**
  * 工具调用护栏：模型卡在「同一个动作反复做」上时，光靠提示词是劝不住的。
  *
@@ -67,6 +69,34 @@ export function toolKind(name: string): ToolKind {
   if (WRITE_TOOLS.has(n)) return 'write'
   if (SHELL_TOOLS.has(n)) return 'shell'
   return 'read'
+}
+
+/**
+ * 这条写类工具调用，是不是「输出被 max_tokens 切断之后、由容错层补出来的半截参数」。
+ *
+ * 截断的后果不只是「代码没写完」：挂在回复里的工具调用参数也只生成到一半，
+ * 非法 JSON 被容错层补成合法对象之后，半截内容照样会执行。
+ * 真实复现：6580 字符的 `flappy_bird.js` 被一次 **137 字符**的截断写入覆盖成残废，
+ * 模型读回来发现内容没了只能从头重写 —— 89 次写盘只落下 8 个文件，全卡在这。
+ *
+ * 判据分两条，优先级不同：
+ * 1. 服务端明说 `finish_reason=length` + `argRepair` 有值（原文不是合法 JSON，是被补出来的）
+ *    + 写类工具 —— 只读工具拿到半截参数最多查不到，不会毁文件；
+ * 2. 服务端没说 length 也要能兜住：中转网关、部分 Ollama 版本、某些 chat template 会返回
+ *    `stop` 甚至不给这个字段，那时的半截参数一样会被容错层补成合法对象然后覆盖文件。
+ *    这种情况只认「断在字符串中间」这个硬证据，语法类修复（尾逗号、单引号）是完整的，
+ *    不该拦 —— 拦了只会白让模型重写一遍。
+ */
+export function isTruncatedWrite(
+  finishReason: string | undefined,
+  name: string,
+  argRepair: string | undefined,
+  raw?: string
+): boolean {
+  if (!argRepair) return false
+  if (toolKind(name) !== 'write') return false
+  if (finishReason === 'length') return true
+  return typeof raw === 'string' && cutInsideString(raw)
 }
 
 /** FNV-1a：只用来做等值比较，不要求抗碰撞强度 */
@@ -140,6 +170,222 @@ export interface ToolCallGuard {
   /** 已记住的签名数（测试用） */
   size(): number
   reset(): void
+}
+
+/**
+ * 临时脚本护栏，和上面的签名护栏分工不同。
+ *
+ * 签名护栏判的是「同一个调用重放」：参数一改就是新签名，永远拦不到。
+ * 真实复现：9B 模型做一个 HTML 小游戏，89 次写盘里 47 次是 `_tmp_fix.js`（23 次）、
+ * `_tmp_inspect.js`（12 次）、`_tmp_check.py`（9 次）——每次换个名字、内容改几行，
+ * 签名次次不同，护栏一次都没触发；真实文件却只动了 8 个。
+ *
+ * 所以这里按**目录**计数而不是按文件名：换名字正是它绕过护栏的方式。
+ * 同一目录允许写一个临时脚本（真要验证时确实需要一个），第二个直接拦，
+ * 并把「已有的那一个」写进说明里，让它去改那一个或直接改真实文件。
+ */
+
+/** 脚本类扩展名：只有这类文件才值得当「临时调试脚本」管 */
+const SCRIPT_EXT = /\.(?:js|mjs|cjs|ts|tsx|jsx|py|sh|ps1|bat|cmd|rb|lua)$/i
+
+/**
+ * 名字像临时脚本：`_tmp_fix.js`、`tmp.py`、`temp_check.sh`、`scratch.js`。
+ * 刻意不把 `debug.js` 这类常见正名算进来 —— 项目里本来就可能有，误拦比漏拦更烦人。
+ */
+const SCRATCH_NAME = /^(?:[._-]?tmp|temp|scratch)(?:[._-]|$)/i
+
+/** 只有单文件写工具才有「这条路径」可判；patch 可能一次改多个文件，不在此列 */
+const SINGLE_WRITE_TOOLS = new Set(['write_file', 'edit_file'])
+
+function baseName(file: string): string {
+  const norm = String(file || '').replace(/\\/g, '/')
+  return norm.slice(norm.lastIndexOf('/') + 1)
+}
+
+/** 目录键：同一目录下不同写法（`a\b` 与 `a/b`）必须算同一处 */
+export function dirKey(file: string): string {
+  const norm = String(file || '').replace(/\\/g, '/').toLowerCase()
+  const at = norm.lastIndexOf('/')
+  return at < 0 ? '' : norm.slice(0, at)
+}
+
+export function isScratchScript(file: string): boolean {
+  const base = baseName(file)
+  return SCRIPT_EXT.test(base) && SCRATCH_NAME.test(base)
+}
+
+export interface ScratchDecision {  verdict: 'ok' | 'block'
+  /** 该目录下先前写过、且名字不同的那个临时脚本 */
+  previous: string
+  note: string
+}
+
+export interface ScratchGuard {
+  /** 执行前问一句：这次还要不要新建脚本 */
+  check(tool: string, args: Record<string, unknown>): ScratchDecision
+  /** 执行后记一笔 */
+  record(tool: string, args: Record<string, unknown>): void
+  /** 已记住的目录数（测试用） */
+  size(): number
+  reset(): void
+}
+
+export function createScratchGuard(opts: { perDir?: number } = {}): ScratchGuard {
+  const limit = Math.max(1, opts.perDir ?? 1)
+  const byDir = new Map<string, string[]>()
+  const ok: ScratchDecision = { verdict: 'ok', previous: '', note: '' }
+
+  const target = (tool: string, args: Record<string, unknown>): string => {
+    if (!SINGLE_WRITE_TOOLS.has(String(tool || '').toLowerCase())) return ''
+    const file = String(args.path ?? args.file_path ?? '').trim()
+    return isScratchScript(file) ? file : ''
+  }
+
+  return {
+    check(tool, args) {
+      const file = target(tool, args)
+      if (!file) return ok
+      const list = byDir.get(dirKey(file)) ?? []
+      // 同名再写是「改自己刚写的那个」，不是又新建一个：这条交给签名护栏判更有意义
+      if (!list.length || list.includes(baseName(file).toLowerCase())) return ok
+      if (list.length < limit) return ok
+      const prev = list[0]
+      return {
+        verdict: 'block',
+        previous: prev,
+        note:
+          `[临时脚本·已拦截] 这个目录里已经有临时脚本「${prev}」，不再新建「${baseName(file)}」。\n` +
+          '新建脚本解决不了问题：真实文件一个都没动，时间全花在脚本之间来回改。\n' +
+          `要往前推进只有两条路：① 直接用 edit_file 改真实文件；② 确实需要跑脚本，就 edit_file 改已有的「${prev}」，不要再起新的。`
+      }
+    },
+
+    record(tool, args) {
+      const file = target(tool, args)
+      if (!file) return
+      const dir = dirKey(file)
+      const list = byDir.get(dir) ?? []
+      const base = baseName(file).toLowerCase()
+      if (!list.includes(base)) list.push(base)
+      byDir.set(dir, list)
+    },
+
+    size() {
+      return byDir.size
+    },
+
+    reset() {
+      byDir.clear()
+    }
+  }
+}
+
+/**
+ * 工具结果的「错误类别」——按类别而不是精确文本聚合。
+ *
+ * 真实的死循环长这样：模型写 `check.py` → ENOENT → 改名 `check.js` →
+ * MODULE_NOT_FOUND → 换 `find.py` → 又是找不到文件……脚本名、参数、错误文本每次都不
+ * 一样，签名护栏（按调用参数）和临时脚本护栏（按 tmp 前缀命名）全都漏掉，
+ * 但**错误类别始终是「文件/模块找不到」**。按类别计数才拦得住这种换皮重试。
+ */
+export type ErrorKind =
+  | 'missing' // ENOENT / No such file / Cannot find module / 找不到文件
+  | 'syntax' // SyntaxError / 语法错误
+  | 'outside' // 工作区越界
+  | 'other'
+
+/** 从工具结果里认出错误类别；认不出来返回 null（成功或普通输出） */
+export function classifyToolError(result: string): ErrorKind | null {
+  const t = String(result ?? '')
+  if (/路径超出工作区|outside workspace/i.test(t)) return 'outside'
+  if (
+    /ENOENT|No such file or directory|Cannot find module|MODULE_NOT_FOUND|FileNotFoundError|找不到文件|没有那个文件或目录|can't open file|Could not open|is not recognized|command not found/i.test(
+      t
+    )
+  ) {
+    return 'missing'
+  }
+  if (/SyntaxError|语法错误|unexpected token|invalid syntax/i.test(t)) return 'syntax'
+  return null
+}
+
+export interface ErrorStreakDecision {
+  /** ok=不处理；hint=追加提醒；halt=建议收工（连续多次提醒仍不停） */
+  verdict: 'ok' | 'hint' | 'halt'
+  kind: ErrorKind | null
+  streak: number
+  note: string
+}
+
+export interface ErrorStreakGuard {
+  observe(result: string): ErrorStreakDecision
+  reset(): void
+}
+
+const ERROR_LABEL: Record<ErrorKind, string> = {
+  missing: '文件/模块找不到（ENOENT）',
+  syntax: '语法错误',
+  outside: '路径越界',
+  other: '执行失败'
+}
+
+/**
+ * 连续同类错误护栏。和 createToolCallGuard 互补：
+ * 后者盯「同一个调用重放」，这里盯「换了名字/参数但一直在犯同一类错」。
+ *
+ * 命中时返回给模型的提示会点破两件事：① 换脚本名重试无效；② 用相对路径、直接
+ * 操作真实文件。workspace 由调用方塞进提示，让模型明确工作目录在哪。
+ */
+export function createErrorStreakGuard(
+  opts: { warnAt?: number; haltAt?: number; workspace?: string } = {}
+): ErrorStreakGuard {
+  const warnAt = Math.max(2, opts.warnAt ?? 3)
+  const haltAt = Math.max(warnAt + 1, opts.haltAt ?? 5)
+  const ws = opts.workspace ?? ''
+  let last: ErrorKind | null = null
+  let streak = 0
+  let hinted = false
+
+  const note = (kind: ErrorKind, times: number, halt: boolean): string => {
+    const lead = halt
+      ? `[连续失败·请停止] 已经连续 ${times} 次「${ERROR_LABEL[kind]}」。`
+      : `[连续失败] 已经连续 ${times} 次「${ERROR_LABEL[kind]}」。`
+    return (
+      lead +
+      '换脚本名、换扩展名、重写检查脚本都解决不了——错的一直是同一件事。\n' +
+      (ws ? `工作目录是 ${ws}，所有相对路径都以它为基准。\n` : '') +
+      '请停止重试：① 不要再把脚本写到工作区之外（如 /tmp、F:\\tmp），那不是工作目录；' +
+      '② 直接用相对路径操作真实文件（如 index.html）；' +
+      '③ 若确实卡住，把当前报错原样告诉用户，不要自己反复试。'
+    )
+  }
+
+  return {
+    observe(result) {
+      const kind = classifyToolError(result)
+      if (!kind) {
+        last = null
+        streak = 0
+        hinted = false
+        return { verdict: 'ok', kind: null, streak: 0, note: '' }
+      }
+      streak = kind === last ? streak + 1 : 1
+      last = kind
+      if (streak >= haltAt) {
+        return { verdict: 'halt', kind, streak, note: note(kind, streak, true) }
+      }
+      if (streak >= warnAt && !hinted) {
+        hinted = true
+        return { verdict: 'hint', kind, streak, note: note(kind, streak, false) }
+      }
+      return { verdict: 'ok', kind, streak, note: '' }
+    },
+    reset() {
+      last = null
+      streak = 0
+      hinted = false
+    }
+  }
 }
 
 export function createToolCallGuard(opts: { maxEntries?: number } = {}): ToolCallGuard {

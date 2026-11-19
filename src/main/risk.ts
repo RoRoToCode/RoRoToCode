@@ -127,6 +127,41 @@ export function applyCustomRules(
 const NETWORK_RE =
   /(\bcurl\b|\bwget\b|\biwr\b|\birm\b|\bInvoke-WebRequest\b|\bInvoke-RestMethod\b|\bftp\b|\bscp\b|\bssh\b|\btelnet\b|\bping\b|https?:\/\/|git\s+(clone|fetch|pull|push|remote)|npm\s+(install|i|publish)|pnpm\s+(add|install)|yarn\s+(add|install)|pip\s+install|docker\s+(pull|push)|winget\s+install|choco\s+install)/i
 
+/**
+ * 从命令里提取「要连到哪个主机」的提示，供审批弹窗展示。
+ *
+ * 这不是安全边界（正则永远猜不干净，真正的防线仍是「网络命令强制单独确认」），
+ * 只是让用户在点「允许」前能一眼看到目标：一条裸的 `curl xxx` 和 `curl api.example.com`
+ * 给人的警觉度完全不同。提取不到（比如 `npm install` 这种没有显式主机的）就返回空串。
+ *
+ * 覆盖两类：
+ *  - 显式 URL（https?://、git@、scp/ssh 的 host、curl 的裸域名）；
+ *  - 包管理器/远程命令里的仓库前缀（`git clone https://github.com/...` 已经命中 URL，
+ *    但 `pip install -i https://...`、`npm --registry=...` 也值得抓）。
+ */
+export function networkTargetHint(command: string): string {
+  const cmd = String(command ?? '')
+  const found = new Set<string>()
+  // 显式 URL：https?://host(:port)/。带 user:pass@ 时去掉前面那截，只留主机
+  for (const m of cmd.matchAll(/https?:\/\/([^\s"'`<>\\/]+)/gi)) {
+    const h = m[1].replace(/^[^@]*@/, '').replace(/:(\d+)$/, '')
+    if (h && !/^\d+$/.test(h)) found.add(h)
+  }
+  for (const m of cmd.matchAll(/(?:git|ssh|scp|rsync)@([^\s"'`<>\\/:]+)/gi)) found.add(m[1])
+  // ssh/scp/rsync 的目标主机：`ssh user@host`（可无命令）、`scp a b host:path`
+  const ssh = /\b(?:ssh|scp|rsync)\b[^;&|]*?(?:@([a-zA-Z0-9.-]+)|([a-zA-Z0-9.-]+):[^\s"'`]+)/.exec(cmd)
+  if (ssh) {
+    const host = ssh[1] ?? ssh[2]
+    if (host && !/^(http|https)$/i.test(host)) found.add(host)
+  }
+  // 包管理器里的镜像/源：--registry= 后面跟 URL 时已在上面抓到，这里补 host 裸写
+  const reg = /--registry\s*=\s*https?:\/\/([^\s"'`<>\\/]+)/i.exec(cmd)
+  if (reg) found.add(reg[1].replace(/:(\d+)$/, ''))
+
+  const hosts = [...found].slice(0, 3)
+  return hosts.length ? hosts.join('、') : ''
+}
+
 // 删除文件的命令特征
 const DELETE_RE =
   /(\brm\b|\brmdir\b|\bdel\b|\berase\b|\brd\b|\bRemove-Item\b|\bgit\s+clean\b|\bgit\s+reset\s+--hard\b|shutil\.rmtree|\btruncate\b)/i
@@ -169,6 +204,28 @@ const PATH_CMDS: Array<{ re: RegExp; group: number }> = [
   { re: /\b(?:rm|del|erase|rd|rmdir)\s+(?:-[a-z]+\s+)*([^\s;&|]+(?:\s+[^\s;&|]+)*)/i, group: 1 },
   { re: /\b(?:Remove-Item)\s+(?:-[A-Za-z]+\s+\S+\s+)*([^\s;&|]+)/i, group: 1 }
 ]
+
+/**
+ * 从任意命令里提取「看起来是绝对路径」的片段，供越界判定。
+ *
+ * 为什么这里比 commandPaths 更宽：删除/移动命令有专门的提取逻辑（它们只对
+ * 路径型命令负责），但一条普通命令也能动到工作区之外 —— `copy C:\secret.txt D:\out\`、
+ * `type C:\Users\admin\id_rsa`、`python C:\outside\script.py`。这些以前都只判
+ * `high:false`（普通确认），和「写文件工具越界会判高危」完全不一致。
+ *
+ * 判据只认「明确的盘符绝对路径」（C:\... / C:/...）和 UNC（\\host\...），
+ * 不认 POSIX 根风格（/tmp/x）——那类按 resolveToolPath 的约定算工作区内相对路径。
+ */
+function absolutePathFragments(command: string): string[] {
+  const out: string[] = []
+  // C:\... 或 C:/...（Windows 盘符），以及 \\host\share（UNC）
+  const re = /(?:[A-Za-z]:[\\/][^\s"'`;&|<>]*|\\\\(?:[^\s"'`;&|<>]+)\\(?:[^\s"'`;&|<>]*))/g
+  for (const m of command.matchAll(re)) {
+    const p = m[0]
+    if (p && !out.includes(p)) out.push(p)
+  }
+  return out
+}
 
 /** 按 shell 习惯切参数：引号内的空格算路径的一部分，遇到 && / | 就停 */
 function splitArgs(input: string): string[] {
@@ -214,9 +271,36 @@ export function commandPaths(command: string): string[] {
   return out
 }
 
+/**
+ * POSIX 根目录风格的伪绝对路径：`/tmp/x`、`/var/y`、或反斜杠写法 `\tmp\x`。
+ *
+ * Windows 的 `path.isAbsolute('/tmp/check.py')` 返回 **true**，于是 `path.resolve`
+ * 把它接到「当前盘符的根」——进程在 F 盘启动就变成 `F:\tmp\check.py`。模型（尤其
+ * 本地小模型）写临时脚本时极易带出这种 Linux 习惯，结果脚本落在工作区外，读取
+ * 工作区内的文件时全线 ENOENT，还会反向误导它「工作区是 F:\tmp」。
+ *
+ * 判据：以 `/` 或 `\` 开头，但不是 Windows 盘符（`C:\...`）也不是 UNC（`\\host\...`）。
+ * 这类一律按「相对工作区」处理，把前导斜杠去掉后接到 root 下。
+ */
+function isPosixRootStyle(raw: string): boolean {
+  if (!/^[\\/]/.test(raw)) return false
+  // C:\... / C:/...：盘符路径，保持原样
+  if (/^[A-Za-z]:[\\/]/.test(raw)) return false
+  // \\host\share：UNC，保持原样
+  if (/^[\\/]{2}/.test(raw)) return false
+  return true
+}
+
+/** 把工具参数里的路径解析成绝对路径；POSIX 根风格按相对工作区处理 */
+export function resolveToolPath(root: string, p: string): string {
+  let raw = String(p ?? '').trim()
+  if (isPosixRootStyle(raw)) raw = raw.replace(/^[\\/]+/, '')
+  return path.isAbsolute(raw) ? path.resolve(raw) : path.resolve(root, raw)
+}
+
 export function isOutside(root: string, p: string): boolean {
   if (!p) return false
-  const abs = path.isAbsolute(p) ? path.resolve(p) : path.resolve(root, p)
+  const abs = resolveToolPath(root, p)
   const rel = path.relative(root, abs)
   return rel.startsWith('..') || path.isAbsolute(rel)
 }
@@ -246,7 +330,23 @@ export function classifyRisk(
       }
       return { kind: 'delete', reason: '删除文件或目录', high: true }
     }
-    if (NETWORK_RE.test(cmd)) return { kind: 'network', reason: '访问网络 / 下载依赖', high: true }
+    if (NETWORK_RE.test(cmd)) {
+      const host = networkTargetHint(cmd)
+      return {
+        kind: 'network',
+        reason: host ? `访问网络 / 下载依赖 · 目标主机：${host}` : '访问网络 / 下载依赖',
+        high: true
+      }
+    }
+    // 路径越界：命令里出现了指向工作区之外的明确绝对路径（盘符/UNC）。
+    // 与写文件工具的 isOutside 检查对齐 —— 读写工作区外文件都该单独确认，
+    // 否则「沙箱」对 run_shell 形同虚设（copy / move / type / python 都能越界）。
+    // 放在纯读取判断之前：`type C:\Users\...\id_rsa` 这种读工作区外文件的命令，
+    // 只读≠安全，仍要单独确认。
+    const outsidePath = absolutePathFragments(cmd).find((p) => isOutside(workspace, p))
+    if (outsidePath) {
+      return { kind: 'outside', reason: `命令访问了工作区之外的路径 ${outsidePath}`, high: true }
+    }
     // 纯读取命令（无串联/重定向）不算风险，只读模式也允许
     if (READONLY_RE.test(cmd) && !CHAIN_RE.test(cmd)) return null
     // 普通命令：若被 allow 显式信任则放行，否则按普通命令确认

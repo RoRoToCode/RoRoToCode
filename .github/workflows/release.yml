@@ -2,7 +2,7 @@ name: Release
 
 # 为什么要有这个文件：v0.1.2 是手工打包、手工上传 Release、手工写 SHA256，
 # 结果文案里的哈希和真实文件对不上，winget 清单也会因为哈希错误被 CI 打回。
-# 这里把「版本 → 构建 → 打包 → 算哈希 → 写 Release 文案 → 出 winget 清单」串成一条链，
+# 这里把「版本 → 三平台构建 → 打包 → 算哈希 → 写 Release 文案 → 出 winget 清单 → 发布」串成一条链，
 # 哈希一律从真实产物现算，不再由人手抄。
 #
 # 触发：push 一个 v* tag；或在 Actions 里手动跑 workflow_dispatch（用 package.json 的版本）。
@@ -20,9 +20,46 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  release:
-    runs-on: windows-latest
-    timeout-minutes: 40
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        shell: bash
+        run: |
+          pkg=$(node -p "require('./package.json').version")
+          tag="${GITHUB_REF_NAME}"
+          if [[ "$tag" == v* ]]; then
+            ver="${tag#v}"
+            if [ "$ver" != "$pkg" ]; then
+              echo "tag $tag 与 package.json $pkg 不一致，先改版本再打 tag" >&2
+              exit 1
+            fi
+          else
+            ver="$pkg"
+          fi
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          echo "发布版本 v$ver"
+
+  build:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: win
+          - os: ubuntu-latest
+            platform: linux
+          - os: macos-latest
+            platform: mac
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    env:
+      # CI 没有签名证书：跳过自动发现证书，产出未签名包（正式分发需在 secrets 里配证书并去掉这一行）
+      CSC_IDENTITY_AUTO_DISCOVERY: false
 
     steps:
       - uses: actions/checkout@v4
@@ -32,25 +69,8 @@ jobs:
           node-version: 22
           cache: npm
 
-      - name: 版本一致性
-        shell: pwsh
-        run: |
-          $pkg = (Get-Content package.json -Raw | ConvertFrom-Json).version
-          $tag = "${{ github.ref_name }}"
-          if ($tag -like 'v*') {
-            $ver = $tag.TrimStart('v')
-            if ($ver -ne $pkg) { throw "tag $tag 与 package.json $pkg 不一致，先改版本再打 tag" }
-          } else {
-            $ver = $pkg
-          }
-          "VERSION=$ver" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          Write-Host "发布版本 v$ver"
-
       - name: 安装依赖
         run: npm ci
-
-      - name: 单测
-        run: npm test
 
       - name: 类型检查
         run: npm run typecheck
@@ -58,70 +78,96 @@ jobs:
       - name: Lint
         run: npm run lint
 
-      - name: 打便携版（同时产出 .sha256）
-        run: npm run dist
+      - name: 单测（Windows 全量）
+        if: matrix.platform == 'win'
+        run: npm test
 
-      - name: 打 NSIS 安装器
-        # NSIS 是可选产物（winget 清单用的是 portable 那一个）。这一步在 2026-11-14 的
-        # v0.1.3 运行里失败过，把后面「生成文案 / 上传资产」全带偏了，最后一个 Release
-        # 只能手工补建、正文为空。改成不阻塞：装不出来就跳过，portable 照常发布。
-        continue-on-error: true
-        run: npm run dist:installer
+      - name: 打包
+        shell: bash
+        run: |
+          if [ "${{ matrix.platform }}" = "win" ]; then
+            npm run dist
+            npm run dist:installer || echo "NSIS 打包失败，portable 照常发布"
+          elif [ "${{ matrix.platform }}" = "mac" ]; then
+            npm run dist:mac
+          else
+            npm run dist:linux
+          fi
 
-      - name: 生成 Release 文案与 winget 清单
+      - name: 计算 SHA256
+        shell: bash
+        run: |
+          cd release
+          shopt -s nullglob
+          for f in *.exe *.dmg *.zip *.AppImage *.deb; do
+            [ -f "$f" ] || continue
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "$f" > "$f.sha256"
+            else
+              shasum -a 256 "$f" > "$f.sha256"
+            fi
+          done
+          ls -la *.exe *.dmg *.zip *.AppImage *.deb *.sha256 2>/dev/null || true
+
+      - name: 生成 Release 文案与 winget 清单（Windows）
+        if: matrix.platform == 'win'
         shell: pwsh
         run: |
-          node packaging/make-release-notes.mjs --version $env:VERSION
-          node packaging/winget/render.mjs --version $env:VERSION
+          node packaging/make-release-notes.mjs --version ${{ needs.version.outputs.version }}
+          node packaging/winget/render.mjs --version ${{ needs.version.outputs.version }}
 
-      - name: 校验 winget 清单
-        shell: pwsh
-        # runner 上不一定装了 App Installer（winget）。校验是加分项，不该因为它缺
-        # 就把已经打包好的发布流程卡死，所以先探测再决定是否强制。
-        run: |
-          $m = "packaging/winget/$env:VERSION"
-          if (-not (Test-Path $m)) { throw "清单目录不存在：$m" }
-          if (Get-Command winget -ErrorAction SilentlyContinue) {
-            winget validate --manifest $m
-            if ($LASTEXITCODE -ne 0) { throw "winget validate 失败（exit $LASTEXITCODE）" }
-          } else {
-            Write-Warning "runner 上没有 winget，跳过 validate；请在本地跑 winget validate --manifest $m"
-          }
-
-      - name: 创建或更新 Release
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          # 幂等：Release 已存在就覆盖资产 + 刷新文案，而不是直接报
-          # "a release with the same tag name already exists"。这样重跑 workflow 是安全操作。
-          # 只用自己生成的文案：--generate-notes 会把英文自动日志混进中文说明里。
-          $tag = "v$env:VERSION"
-          $files = @(Get-ChildItem release -File |
-            Where-Object { $_.Extension -in '.exe', '.sha256' } |
-            ForEach-Object { $_.FullName })
-          if ($files.Count -eq 0) { throw "release/ 下没有 exe 或 .sha256，先确认打包步骤是否成功" }
-          $files | ForEach-Object { Write-Host "  资产 $($_ | Split-Path -Leaf)" }
-
-          gh release view $tag --json tagName 2>$null | Out-Null
-          if ($LASTEXITCODE -eq 0) {
-            Write-Host "Release $tag 已存在，覆盖资产并刷新文案"
-            gh release upload $tag @files --clobber
-            if ($LASTEXITCODE -ne 0) { throw "gh release upload 失败" }
-            gh release edit $tag --title $tag --notes-file release/RELEASE_NOTES.md
-            if ($LASTEXITCODE -ne 0) { throw "gh release edit 失败" }
-          } else {
-            gh release create $tag @files --title $tag --notes-file release/RELEASE_NOTES.md
-            if ($LASTEXITCODE -ne 0) { throw "gh release create 失败" }
-          }
-
-      - name: 归档 winget 清单
+      - name: 上传构建产物
         uses: actions/upload-artifact@v4
         with:
-          name: winget-manifests-${{ env.VERSION }}
-          path: packaging/winget/${{ env.VERSION }}/
+          name: dist-${{ matrix.platform }}
+          path: |
+            release/*.exe
+            release/*.dmg
+            release/*.zip
+            release/*.AppImage
+            release/*.deb
+            release/*.sha256
+            release/RELEASE_NOTES.md
+          if-no-files-found: error
 
-      # 自动向 microsoft/winget-pkgs 开 PR 需要：
-      #   1) 首个版本已经手工提 PR 并合并（winget-releaser 只能更新已有包）
-      #   2) 一个 classic PAT（public_repo）放在 secrets.WINGET_TOKEN，以及 fork 所在账号
-      # 见 packaging/GITHUB-UPDATE.md。默认不启用，避免没有 token 时把发布流程搞红。
+      - name: 上传 winget 清单（Windows）
+        if: matrix.platform == 'win'
+        uses: actions/upload-artifact@v4
+        with:
+          name: winget-manifests-${{ needs.version.outputs.version }}
+          path: packaging/winget/${{ needs.version.outputs.version }}/
+          if-no-files-found: warn
+
+  publish:
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: 汇总产物
+        run: |
+          mkdir -p out
+          find dist -type f \( -name '*.exe' -o -name '*.dmg' -o -name '*.zip' \
+            -o -name '*.AppImage' -o -name '*.deb' -o -name '*.sha256' \) -exec cp {} out/ \;
+          ls -la out
+
+      - name: 创建或更新 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          tag="v${{ needs.version.outputs.version }}"
+          notes=$(find dist -name 'RELEASE_NOTES.md' | head -1)
+          if [ -z "$notes" ]; then
+            echo '暂无 Release 文案' > /tmp/notes.md
+            notes=/tmp/notes.md
+          fi
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json tagName >/dev/null 2>&1; then
+            echo "Release $tag 已存在，覆盖资产并刷新文案"
+            gh release upload "$tag" out/* --clobber --repo "$GITHUB_REPOSITORY"
+            gh release edit "$tag" --title "$tag" --notes-file "$notes" --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$tag" out/* --title "$tag" --notes-file "$notes" --repo "$GITHUB_REPOSITORY"
+          fi

@@ -1,7 +1,9 @@
 import type { ArgRepair, ChatMessage, ProviderConfig, TokenUsage, ToolCall } from '../../shared/types'
 import { parseArgs, RAW_ARG_KEY } from '../../shared/toolargs'
 import { imageDataUrl } from '../vision'
-import { explainStreamFailure, idleGuard, joinUrl, readError, requestSignal } from './base'
+import { explainStreamFailure, guardFor, joinUrl, readError, requestSignal } from './base'
+import { outputBudget } from './budget'
+import { requestTokens } from '../../shared/tokens'
 import type { StreamOptions, StreamResult } from './base'
 
 /**
@@ -194,9 +196,20 @@ export async function streamOllama(opts: StreamOptions): Promise<StreamResult> {
   const { provider, messages, tools, onText } = opts
   const root = nativeRoot(provider)
   const { signal, abort, done } = requestSignal(opts.signal, 10 * 60 * 1000)
-  // Ollama 也是单模型排队：一直没输出时，3 分钟就明说，别让人干等 10 分钟
-  const guard = idleGuard(abort)
+  // Ollama 也是单模型排队：一直没输出时就明说，别让人干等（时限按本机/远端分级）
+  const guard = guardFor(provider, abort, {
+    onWait: opts.onWait
+      ? (ms) => opts.onWait?.({ waitedMs: ms, promptTokens: requestTokens(messages, tools) })
+      : undefined
+  })
   const numCtx = await ollamaNumCtx(provider)
+  /**
+   * 必须显式给 num_predict。不给的话 Ollama 会一直生成到把窗口塞满，
+   * 而且 `done_reason` 报的是 `stop` —— 引擎看不出这是被窗口挤断的，
+   * 只会当成「模型自己说完了」。带上预算后它才会回 `length`，
+   * 后续的续写/升档才有据可依。
+   */
+  const maxOut = outputBudget({ ...provider, contextWindow: numCtx }, requestTokens(messages, tools), opts.escalate)
 
   const body: Record<string, unknown> = {
     model: provider.model,
@@ -204,7 +217,8 @@ export async function streamOllama(opts: StreamOptions): Promise<StreamResult> {
     stream: true,
     options: {
       temperature: provider.temperature ?? 0.2,
-      num_ctx: numCtx
+      num_ctx: numCtx,
+      num_predict: maxOut
     }
   }
   if (tools.length) {
@@ -245,6 +259,8 @@ export async function streamOllama(opts: StreamOptions): Promise<StreamResult> {
 
   let text = ''
   const toolCalls: ToolCall[] = []
+  /** 近似生成 token 数，用于界面实时进度（Ollama 也是一帧一 token） */
+  let genUnits = 0
   const stamp = Date.now().toString(36)
   let usage: TokenUsage | undefined
   let genMs: number | undefined
@@ -253,7 +269,6 @@ export async function streamOllama(opts: StreamOptions): Promise<StreamResult> {
 
   try {
     for await (const line of jsonLines(res.body)) {
-      guard.touch()
       let chunk: NativeChunk
       try {
         chunk = JSON.parse(line) as NativeChunk
@@ -273,11 +288,14 @@ export async function streamOllama(opts: StreamOptions): Promise<StreamResult> {
       const msg = chunk.message
       if (msg?.content) {
         text += msg.content
+        guard.touch()
         onText(msg.content)
+        genUnits++
       }
       for (const tc of msg?.tool_calls ?? []) {
         const name = tc.function?.name
         if (!name) continue
+        guard.touch()
         let args: Record<string, unknown> = {}
         let repair: ArgRepair | undefined
         const raw = tc.function?.arguments
@@ -296,6 +314,7 @@ export async function streamOllama(opts: StreamOptions): Promise<StreamResult> {
           ...(repair ? { argRepair: repair } : {})
         })
       }
+      if (genUnits > 0) opts.onProgress?.(genUnits)
       if (chunk.done) break
     }
   } catch (err) {

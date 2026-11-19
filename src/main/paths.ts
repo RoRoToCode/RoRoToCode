@@ -1,5 +1,6 @@
 import { app } from 'electron'
 import os from 'node:os'
+import path from 'node:path'
 
 /**
  * 用户主目录。
@@ -16,4 +17,20 @@ export function homeDir(): string {
     // 不在 Electron 里
   }
   return os.homedir()
+}
+
+/**
+ * 应用数据目录（Electron 的 userData）。
+ *
+ * agent.ts 刻意不 import electron —— 它要能被单测和命令行自检直接跑。
+ * 需要落盘缓存的地方（比如工具输出溢出）从这里拿路径，兜底到 ~/.roroto。
+ */
+export function userDataDir(): string {
+  try {
+    const d = app?.getPath?.('userData')
+    if (d) return d
+  } catch {
+    // 不在 Electron 里
+  }
+  return path.join(os.homedir(), '.roroto')
 }

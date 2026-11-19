@@ -103,6 +103,7 @@ Recursive scanning matches LM Studio's `models/<publisher>/<repo>/x.gguf` layout
 | `--kv <type>` | KV cache precision: `f16` (default) / `q8_0` (halves it) / `q4_0` |
 | `--vram 12` | pretend you have 12 GB (keeps GPU name and bandwidth) to price an upgrade |
 | `--gpu N` | evaluate the Nth GPU; required on multi-GPU machines, no tensor parallelism |
+| `--budget static\|auto` | budget basis: `static` (default, total VRAM×0.94, ignores current usage) / `auto` (current free VRAM) |
 | `--mirror <url>` | default `hf-mirror.com`; `https://huggingface.co` goes direct |
 | `--lang zh\|en` | UI language, defaults to the system; `VRAMFIT_LANG` also works |
 | `--no-color` / `--ascii` | colour off / ASCII glyphs, for redirects and old terminals |
@@ -214,12 +215,17 @@ In one line: **VRAM decides how many tokens of context fit, bandwidth decides ho
 
 | Platform | VRAM from | Ceiling |
 |---|---|---|
-| Windows | `nvidia-smi` / `rocm-smi`, registry fallback | `max(free×0.92, total×0.94)`, WDDM can evict |
-| Linux | `nvidia-smi` / `rocm-smi`, `/sys/class/drm` fallback | free × 0.92, not evictable |
-| macOS | `sysctl hw.memsize`, Metal working set | working set × 0.9 |
+| Windows | `nvidia-smi` / `rocm-smi`, registry fallback | `total×0.94` by default; with `--budget auto`, `min(free×0.92, total×0.94)` |
+| Linux | `nvidia-smi` / `rocm-smi`, `/sys/class/drm` fallback | `total×0.94` by default; `auto` uses `free × 0.92` (not evictable) |
+| macOS | `sysctl hw.memsize`, Metal working set | working set × 0.9 (identical in both modes — unified memory is already capacity-based) |
 | No dGPU | physical RAM | × 0.8, CPU inference |
 
 iGPUs count as half of shared memory and are skipped when a discrete GPU exists. The report states which rule was used.
+
+The default basis is **static** (physical capacity: reproducible, does not swing as other apps open and close),
+at the cost of ignoring current usage; `--budget auto` means "how much is free right now". The free reading has two
+traps: it is a single snapshot, and it is fooled by "released" memory — after another app exits the pages are
+recorded as free but have been scattered by WDDM paging, so throughput does not actually come back.
 
 | Format | Status |
 |---|---|

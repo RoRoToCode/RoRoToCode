@@ -1,6 +1,6 @@
 {
   "name": "vramfit",
-  "version": "1.0.2",
+  "version": "1.0.4",
   "description": "Will this GGUF model fit in your VRAM? Check fit, context size, tok/s and agent-readiness before downloading — reads only the file header, zero dependencies. 零依赖显存体检：只读文件头，判断本地大模型在你机器上跑不跑得动、能开多大上下文、能不能当 coding agent 用。",
   "type": "module",
   "license": "MIT",

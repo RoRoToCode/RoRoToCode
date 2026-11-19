@@ -24,14 +24,36 @@ import { t } from './i18n.mjs'
  *
  * platform 不再默认读 process.platform —— core 要能在浏览器里跑，
  * 调用方必须显式告诉这里"是哪套规则"。
+ *
+ * `budget` 决定要不要看「当前已用显存」：
+ *
+ * - `auto`（默认）：按上面那套「现在真正空闲多少」的规则算。
+ * - `static`：只按物理容量算（total × 0.94），与此刻谁占着显存无关。
+ *
+ * 为什么要留 `static`：动态口径虽然更贴实际，但它是**一次快照**，读数会随同一张卡上
+ * 任何程序的开合而跳 —— 用户看到的是「同一台机器、同一个模型，隔两分钟结论变了」。
+ * 更糟的是 WDDM 下这个读数会被"释放了"骗过去：游戏退出、显存记到空闲里，可那块显存
+ * 早被换页打散，模型真占进去照样掉到 1.x tok/s。也就是说 free 变大并不等于变快，
+ * 拿它当预算会把「物理上装得下、实际跑不动」算成「装得下」。
+ * 静态口径给出的是「这张卡的容量决定了它最多能开到哪一档」，可复现、可对比，
+ * 代价是不扣桌面占用 —— 所以它必须由调用方**显式**选，报告里也要写清口径。
  */
-export function vramCeiling({ totalBytes = 0, usedBytes = 0, unified = false, maxWorkingSetBytes = 0, platform = '', usedUnknown = false } = {}) {
+export function vramCeiling({ totalBytes = 0, usedBytes = 0, unified = false, maxWorkingSetBytes = 0, platform = '', usedUnknown = false, budget = 'auto' } = {}) {
   const total = Math.max(0, Number(totalBytes) || 0)
   if (unified && total > 0) {
     const cap = maxWorkingSetBytes > 0
       ? Math.min(maxWorkingSetBytes, total)
       : total * TUNING.unifiedDefaultFactor
     return { limit: cap * TUNING.unifiedReserve, basis: 'unified', reclaimable: 0 }
+  }
+  /**
+   * 静态口径：预算 = 物理容量 × 0.94，不再减 usedBytes。
+   * 0.94 不是「预留系统 6%」那么精确，它只是「装进物理容量不留零头会直接分配失败」
+   * 这条硬边界 —— 真正的系统占用要用户自己保证（关掉占显存的程序再启动模型）。
+   * usedUnknown 在这里没有意义：本来就不读 used。
+   */
+  if (budget === 'static' && total > 0) {
+    return { limit: total * TUNING.wddmTotalFactor, basis: 'static', reclaimable: 0 }
   }
   const free = Math.max(0, total - (Number(usedBytes) || 0))
   if (platform === 'win32' && total > 0) {
@@ -193,6 +215,7 @@ export function assess(meta, hw, opts = {}) {
 
   // 上限怎么取，各平台不是一回事：Windows 能驱逐别人的显存，Linux/macOS 不能。
   // 没有可用显卡时退化成「CPU 推理」，按内存算 —— 不能直接给 0，那会让所有模型都判装不下。
+  // budget='static' 时按物理容量算，不看当前占用（口径由 CLI 的 --budget 决定）。
   const ceiling = gpu
     ? vramCeiling({
       totalBytes: gpu.totalBytes,
@@ -200,7 +223,8 @@ export function assess(meta, hw, opts = {}) {
       usedUnknown: gpu.usedUnknown === true,
       unified: gpu.unified,
       maxWorkingSetBytes: gpu.maxWorkingSetBytes,
-      platform: hw.osPlatform ?? hw.platform ?? ''
+      platform: hw.osPlatform ?? hw.platform ?? '',
+      budget: opts.budget ?? 'auto'
     })
     : { limit: (hw.ramBytes ?? 0) * TUNING.ramFactor, basis: 'ram', reclaimable: 0 }
   const limit = ceiling.limit

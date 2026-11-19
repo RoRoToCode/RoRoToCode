@@ -692,6 +692,19 @@ export function AppSettings({ config, onSave, onClose, notify, onOpenAgents }: P
             <label className="aset-check">
               <input
                 type="checkbox"
+                checked={draft.autoDelegate !== false}
+                onChange={(e) => setDraft((d) => ({ ...d, autoDelegate: e.target.checked }))}
+              />
+              <span className="aset-check-main">
+                <b>{tr("自动派发子智能体")}</b>
+                <span>
+                  {tr("任务看起来要翻很多文件、或者你只是让它「检查」时，主动派一个只读子智能体先去摸底/审查。只读不写文件，也不会弹审批；派几个仍由助手判断。")}</span>
+              </span>
+            </label>
+
+            <label className="aset-check">
+              <input
+                type="checkbox"
                 checked={draft.trustWorkspaceHooks === true}
                 onChange={(e) => setDraft((d) => ({ ...d, trustWorkspaceHooks: e.target.checked }))}
               />

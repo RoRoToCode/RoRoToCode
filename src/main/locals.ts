@@ -14,8 +14,10 @@ import type {
 } from '../shared/types'
 import { parseOllamaLogDevices } from '../shared/ollamagpu'
 import { isLlamaProvider, isLoopbackUrl, runtimeKindOf } from '../shared/providers'
+import { subAgentProviders } from '../shared/agentpool'
 import { loadConfig, saveConfig } from './config'
 import { headSize } from './dl'
+import { isMac, isWin, killTreeSync, listPidsNamed } from './platform'
 import { modelfileTemplate, readGgufMeta } from './gguf'
 import { localGgufFiles, releaseUnpinnedLlama, stopLlamaExcept } from './llama'
 import { scanOllamaDisk, isGgufFile, ollamaModelsRoot } from './ollamadir'
@@ -386,7 +388,8 @@ function ollamaLogPath(): string | null {
     return base ? path.join(base, 'Ollama', 'server.log') : null
   }
   if (process.platform === 'darwin') return path.join(os.homedir(), '.ollama', 'logs', 'server.log')
-  return null
+  // 部分 Linux 发行版也会写这个文件；读不到时界面退回「只显示显存占用」
+  return path.join(os.homedir(), '.ollama', 'logs', 'server.log')
 }
 
 /** 只读文件尾部：日志可能有几十 MB，全读进来是浪费 */
@@ -499,7 +502,7 @@ const normModel = (s?: string): string => (s ?? '').trim().toLowerCase().replace
 /**
  * 本地服务「装了但没起来」。
  *
- * 这种情形该报黄灯（可用未启动），而不是红叉：一键启动就能用，
+ * 这种情形该报黄灯（可用未启动），而不是红叉：到模型列表点「启动」就能用，
  * 红叉要留给真的坏了（没装、模型不存在、端口被占）。
  */
 export async function localServiceIdle(provider: ProviderConfig): Promise<boolean> {
@@ -563,7 +566,7 @@ export function scheduleRuntimeRelease(keepId: string | null): void {
 /**
  * 「启动并使用」等同于切模型：把别的本地运行时让出的显存收回来。
  *
- * 为什么不能只靠渲染层调 `local:release`：从「本地模型」页一键启动 llama.cpp
+ * 为什么不能只靠渲染层调 `local:release`：从「模型列表」页启动 llama.cpp
  * 走的是 `llama:start(activate)`，它只改 activeId，不会经过顶栏那条切换路径 ——
  * 于是 Ollama 里上一个模型继续占着 6 GB 显存，界面上两个都亮绿灯。
  */
@@ -593,10 +596,12 @@ export async function releaseIdleRuntimes(keepId: string | null): Promise<string
   const keepKind = keep ? runtimeKindOf(keep) : null
   const keepLocalLlama = keep ? isLlamaProvider(keep) : false
 
-  // 切到远端模型：本地主模型该让出显存，但工人模型要留着给子代理用
+  // 切到远端模型：本地主模型该让出显存，但子智能体那几条实例要留着。
+  // 只留 find() 的第一条会把其余卡上的实例一起停掉，下次派活才发现并行没了。
   if (keep && !keepLocalLlama && !keepKind) {
-    const worker = config.providers.find((p) => p.role === 'worker' && p.model)
-    const keepKeys = worker && isLlamaProvider(worker) ? [worker.id] : []
+    const keepKeys = subAgentProviders(config.providers, keep.id)
+      .filter((p) => isLlamaProvider(p))
+      .map((p) => p.id)
     const r = await stopLlamaExcept(keepKeys).catch(() => null)
     if (r?.stopped.length) freed.push(`llama.cpp 已停止 ${r.stopped.join('、')}，显存已释放`)
   } else {
@@ -796,9 +801,79 @@ export async function startLocal(
 }
 
 /**
+ * 停掉本地服务（和 startLocal 成对，界面上是同一个按钮的另一半）。
+ *
+ * - **LM Studio**：`lms server stop` 是官方命令，直接停服务（主程序不退出，
+ *   只是把 HTTP server 关了，模型跟着从显存里掉出来）。
+ * - **Ollama**：没有「停服务」命令，只能两步走 —— 先 `ollama stop <模型>`
+ *   把显存还回去，再结束进程。Windows 上光杀 `ollama.exe` 没用：托盘程序
+ *   `ollama app.exe` 会立刻把它拉回来，所以托盘必须一起收，否则界面刚显示
+ *   「已停止」，两秒后探活又变回运行中。
+ *
+ * 不做「停止」的判定预处理：没在跑就直接返回成功，界面按钮本来就不该点它。
+ */
+export async function stopLocal(
+  kind: LocalRuntimeKind
+): Promise<{ ok: boolean; freed: string[]; message: string }> {
+  const spec = SPECS[kind]
+  if (!spec) return { ok: false, freed: [], message: '不支持的本地服务' }
+
+  const freed: string[] = []
+  try {
+    const before = await probe(spec)
+    if (!before.ok) return { ok: true, freed, message: `${spec.label} 本来就没在运行` }
+
+    const loaded = await loadedModels(kind).catch(() => [] as string[])
+    const cli = await findCli(spec)
+
+    if (kind === 'lmstudio') {
+      if (!cli) return { ok: false, freed, message: '找不到 lms 命令，无法停止 LM Studio 服务' }
+      const run = await runCli(cli, ['server', 'stop'], 45000)
+      if (run.code !== 0) {
+        const why = tailOf(run.out) || run.error || ''
+        return { ok: false, freed, message: `停止 LM Studio 失败${why ? `：${why}` : ''}` }
+      }
+    } else {
+      // 先卸模型：走它自己的卸载协议，进程随后被杀也不会留下「显存还占着」的假象
+      if (cli) {
+        for (const m of loaded) {
+          const r = await runCli(cli, ['stop', m], 30000).catch(() => null)
+          if (r && r.code === 0) freed.push(m)
+        }
+      }
+      // 再结束进程：托盘在前，服务在后 —— 反过来会先被托盘拉起来一次
+      for (const name of ['ollama app', 'ollama']) {
+        for (const pid of listPidsNamed(name)) killTreeSync(pid)
+      }
+    }
+
+    // 停止是异步生效的：等端口真的不响应再回报，别让界面写「已停止」而请求还能通
+    for (let i = 0; i < 20; i++) {
+      await sleep(500)
+      if (!(await probe(spec, { skipCli: true })).ok) {
+        originCache.delete(kind)
+        return {
+          ok: true,
+          freed,
+          message: `${spec.label} 服务已停止${freed.length ? `，已释放显存：${freed.join('、')}` : ''}`
+        }
+      }
+    }
+    const now = await probe(spec, { skipCli: true })
+    return {
+      ok: false,
+      freed,
+      message: `${spec.label} 还在响应（端口 ${now.port}）：可能有别的程序或系统服务在托管它，需要手动结束`
+    }
+  } catch (err) {
+    return { ok: false, freed, message: `停止 ${spec.label} 失败：${(err as Error).message}` }
+  }
+}
+
+/**
  * 写入（或新建）对应供应商配置。
  *
- * `activate` 默认 true（一键启动 = 使用并设为当前）；「自动配置」这类
+ * `activate` 默认 true（保存并设为当前）；「自动配置」这类
  * 只写配置的动作要显式传 false，否则会顺手把用户正在用的模型换掉。
  */
 export async function configureLocal(
@@ -919,7 +994,13 @@ const OLLAMA_GH_SETUP = 'https://github.com/ollama/ollama/releases/latest/downlo
  * LM Studio 现在的安装包叫 Bionic，且没有单独的 `installers.../latest` 入口了。
  * 这条 latest 会 302 到当前版本的 CDN 直链（实测 783 MB），永远指向最新版。
  */
-const LMSTUDIO_LATEST = 'https://lmstudio.ai/download/bionic/latest/win32/x64'
+function lmstudioLatest(): string {
+  if (isWin) return 'https://lmstudio.ai/download/bionic/latest/win32/x64'
+  if (isMac) {
+    return `https://lmstudio.ai/download/bionic/latest/darwin/${process.arch === 'arm64' ? 'arm64' : 'x64'}`
+  }
+  return 'https://lmstudio.ai/download/bionic/latest/linux/x64'
+}
 
 /** 跟一次 302，拿到带版本号的直链；失败就算了，不影响主流程 */
 async function followOnce(url: string): Promise<string | null> {
@@ -979,29 +1060,55 @@ function wingetInstall(id: string): Promise<{ ok: boolean; message: string }> {
   })
 }
 
-const SETUP: Record<LocalRuntimeKind, SetupPlan> = {
-  ollama: {
-    file: 'OllamaSetup.exe',
-    page: 'https://ollama.com/download/windows',
-    urls: [
-      { label: '官方直链', url: 'https://ollama.com/download/OllamaSetup.exe' },
-      { label: 'gh-proxy 镜像', url: `https://gh-proxy.com/${OLLAMA_GH_SETUP}` },
-      { label: 'ghproxy.net 镜像', url: `https://ghproxy.net/${OLLAMA_GH_SETUP}` }
-    ]
-  },
-  lmstudio: {
-    file: 'LM-Studio-Setup.exe',
+function ollamaSetup(): SetupPlan {
+  if (isWin) {
+    return {
+      file: 'OllamaSetup.exe',
+      page: 'https://ollama.com/download/windows',
+      urls: [
+        { label: '官方直链', url: 'https://ollama.com/download/OllamaSetup.exe' },
+        { label: 'gh-proxy 镜像', url: `https://gh-proxy.com/${OLLAMA_GH_SETUP}` },
+        { label: 'ghproxy.net 镜像', url: `https://ghproxy.net/${OLLAMA_GH_SETUP}` }
+      ]
+    }
+  }
+  if (isMac) {
+    return {
+      file: 'Ollama-darwin.zip',
+      page: 'https://ollama.com/download/mac',
+      urls: [{ label: '官方直链', url: 'https://ollama.com/download/Ollama-darwin.zip' }]
+    }
+  }
+  // Linux 的官方包是 tar.gz + install.sh（需要 sudo 注册 systemd 服务），
+  // 程序不代跑提权脚本，直接引导到官方下载页
+  return {
+    file: 'ollama-linux-amd64.tgz',
+    page: 'https://ollama.com/download/linux',
+    urls: []
+  }
+}
+
+function lmstudioSetup(): SetupPlan {
+  const latest = lmstudioLatest()
+  const file = isWin ? 'LM-Studio-Setup.exe' : isMac ? 'LM-Studio.dmg' : 'LM-Studio.AppImage'
+  return {
+    file,
     page: 'https://lmstudio.ai/download',
-    urls: [{ label: '官方直链（最新版）', url: LMSTUDIO_LATEST }],
+    urls: [{ label: '官方直链（最新版）', url: latest }],
     resolve: async () => {
-      const list = [{ label: '官方直链（最新版）', url: LMSTUDIO_LATEST }]
-      const direct = await followOnce(LMSTUDIO_LATEST)
-      if (direct && direct !== LMSTUDIO_LATEST) {
+      const list = [{ label: '官方直链（最新版）', url: latest }]
+      const direct = await followOnce(latest)
+      if (direct && direct !== latest) {
         list.push({ label: '官方 CDN 直链', url: direct })
       }
       return list
     }
   }
+}
+
+const SETUP: Record<LocalRuntimeKind, SetupPlan> = {
+  ollama: ollamaSetup(),
+  lmstudio: lmstudioSetup()
 }
 
 /** 当前正在下载的安装包，用于「取消下载」 */
@@ -1162,20 +1269,25 @@ export async function installLocal(
       message: '所有下载源都失败'
     })
 
-    // 官方 CDN 下不动时，winget 走的是另一条链路，值得试一把
+    // 官方 CDN 下不动时，Windows 还有 winget 这条链路；macOS / Linux 走官网手动下载
+    const buttons = isWin
+      ? [mt('用 winget 自动安装'), mt('打开官网'), mt('取消')]
+      : [mt('打开官网'), mt('取消')]
     const alt = await dialog.showMessageBox({
       type: 'warning',
-      buttons: [mt('用 winget 自动安装'), mt('打开官网'), mt('取消')],
+      buttons,
       defaultId: 0,
-      cancelId: 2,
+      cancelId: buttons.length - 1,
       noLink: true,
       title: mt('{label} 下载失败', { label: spec.label }),
       message: mt('安装包没下下来'),
       detail:
         `${failures.join('\n')}\n\n` +
-        mt('可以改用 winget 自动安装（系统自带，会自己下载，但不显示进度），或者打开官网手动下载。')
+        (isWin
+          ? mt('可以改用 winget 自动安装（系统自带，会自己下载，但不显示进度），或者打开官网手动下载。')
+          : mt('可以打开官网手动下载安装。'))
     })
-    if (alt.response === 0) {
+    if (isWin && alt.response === 0) {
       emit({
         kind,
         receivedBytes: 0,
@@ -1199,6 +1311,9 @@ export async function installLocal(
           : `winget 也没成功（${r.message}），已打开官网，可手动下载安装。`
       }
     }
+    if ((isWin && alt.response === 2) || (!isWin && alt.response === 1)) {
+      return { ok: false, message: '已取消安装' }
+    }
     await shell.openExternal(setup.page).catch(() => undefined)
     return {
       ok: false,
@@ -1208,6 +1323,10 @@ export async function installLocal(
 
   emit({ kind, receivedBytes: 0, totalBytes: 0, state: 'done' })
 
+  // Linux 的 AppImage 需要可执行位，否则 openPath 会被系统拒绝
+  if (!isWin && !isMac && /\.AppImage$/i.test(target)) {
+    await fs.chmod(target, 0o755).catch(() => undefined)
+  }
   // 安装包落在了系统临时目录，启动它按向导装
   const openErr = await shell.openPath(target)
   if (openErr) {

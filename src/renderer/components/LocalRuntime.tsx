@@ -66,6 +66,8 @@ export function LocalRuntime({
   const [open, toggle] = useCollapse(`rt-${kind}`, false)
   const [msg, setMsg] = useState('')
   const [picked, setPicked] = useState('')
+  /** 模型列表默认只露 3 个，点「展开」才显示所有 */
+  const [modelsExpanded, setModelsExpanded] = useState(false)
   const [pullName, setPullName] = useState('')
   /** 本程序 models/ 里已下载的 GGUF：可直接导入，不用在 Ollama / LM Studio 里再下一遍 */
   const [ggufs, setGgufs] = useState<LocalGgufFile[]>([])
@@ -213,7 +215,7 @@ export function LocalRuntime({
   }, [models, currentModel])
 
   /** 自动配置：写模型配置 + 顺手报服务状态（原「检测状态」按钮已删，并到这里）
-   *  只写配置，不抢当前模型 —— 「设为当前使用」是「一键启动」的语义 */
+   *  只写配置，不抢当前模型 —— 「设为当前使用」是「保存到列表」的语义 */
   async function configOnly() {
     if (busy) return
     setBusy('config')
@@ -233,27 +235,22 @@ export function LocalRuntime({
     }
   }
 
-  /** 一键启动：确保服务在跑 → 用选中模型写配置 → 设为当前使用 */
-  async function startAll() {
+  /** 保存到列表：只用选中模型写配置并设为当前使用，不启动服务（这一页只配置） */
+  async function saveToList() {
     if (busy) return
     setBusy('apply')
-    setMsg(tr("正在启动 {title} 并应用模型…", { title: title }))
+    setMsg(tr("正在保存模型配置…"))
     try {
-      const s = await window.pico.local.start(kind)
-      if (!alive.current) return
-      if (!s.ok) {
-        setMsg(s.message)
-        return
-      }
-      // activate：一键启动 = 「使用这个模型」，要把当前模型切过来，
+      // 这一页只配置、不启动；启动统一到「④ 模型列表」做。
+      // activate：保存到列表 = 「使用这个模型」，要把当前模型切过来，
       // 否则回到对话界面还是上一个（顶栏与发消息都按 activeId 走）
       const c = await window.pico.local.configure(kind, picked || undefined, { activate: true })
       if (!alive.current) return
-      setMsg(`${s.message}\n${c.message}`)
+      setMsg(c.message)
       if (c.ok) await onConfigChanged?.()
       await refresh()
     } catch (err) {
-      if (alive.current) setMsg(tr("启动失败：{0}", { "0": (err as Error).message }))
+      if (alive.current) setMsg(tr("保存失败：{0}", { "0": (err as Error).message }))
     } finally {
       if (alive.current) setBusy(null)
     }
@@ -363,21 +360,21 @@ export function LocalRuntime({
         >
           {busy === 'config' ? tr("配置中…") : tr("自动配置")}
         </button>
-        {/* 启动服务与检测状态都并进了「一键启动」和「自动配置」：
-            服务没起来时一键启动会先拉起来，再写配置并设为当前使用 */}
+        {/* 这一页只配置、不启动：启动统一到「④ 模型列表」做。
+            「保存到列表」写配置并设为当前使用，「自动配置」只写配置不抢当前 */}
         <button
           className="btn primary"
           disabled={!!busy || !installed}
-          onClick={() => void startAll()}
+          onClick={() => void saveToList()}
           title={
             !installed
               ? tr("还没装 {title}，先点左边的「一键安装 / 下载」", { title: title })
               : picked
-                ? tr("使用并设为当前：{picked}", { picked: picked })
-                : tr("先拉起服务，再从已装模型里挑一个设为当前")
+                ? tr("保存并设为当前：{picked}", { picked: picked })
+                : tr("从已装模型里挑一个，保存到列表并设为当前")
           }
         >
-          {busy === 'apply' ? tr("应用中…") : tr("一键启动")}
+          {busy === 'apply' ? tr("保存中…") : tr("保存到列表")}
         </button>
       </div>
       {setup && (
@@ -397,7 +394,7 @@ export function LocalRuntime({
             <span className="guide-pick-hint">{tr("共")}{models.length} {tr("个，点一下选中")}</span>
           </div>
           <div className="guide-models">
-            {models.map((m) => {
+            {(modelsExpanded ? models : models.slice(0, 3)).map((m) => {
               const on = sameModel(m, picked)
               const active = sameModel(m, currentModel)
               const gpu = gpuTagOf(m)
@@ -424,10 +421,39 @@ export function LocalRuntime({
               )
             })}
           </div>
+          {models.length > 3 && (
+            <button
+              type="button"
+              className="guide-models-more"
+              onClick={() => setModelsExpanded((v) => !v)}
+              title={
+                modelsExpanded
+                  ? tr('收起模型列表，只显示前 3 个')
+                  : tr('展开全部 {length} 个本地模型', { length: models.length })
+              }
+            >
+              {modelsExpanded ? tr('收起') : tr('展开全部 {length} 个', { length: models.length })}
+              <svg
+                className={modelsExpanded ? 'up' : ''}
+                width="9"
+                height="9"
+                viewBox="0 0 10 10"
+                aria-hidden="true"
+              >
+                <path
+                  d="M2 4l3 3 3-3"
+                  stroke="currentColor"
+                  strokeWidth="1.4"
+                  fill="none"
+                  strokeLinecap="round"
+                />
+              </svg>
+            </button>
+          )}
           {picked && (
             <div className="guide-pick-picked">
               {tr("将使用")}<b>{picked}</b>
-              {running ? tr("（点「一键启动」写入配置并设为当前使用）") : tr("（会先启动服务）")}
+              {tr("（点「保存到列表」写入配置并设为当前使用）")}
             </div>
           )}
         </div>
@@ -492,7 +518,7 @@ export function LocalRuntime({
       )}
 
       <p className="guide-note">
-        {tr("端口")}{livePort}{tr("。一键启动会自动新建「")}{title} {tr("本地」并设为当前使用。")}</p>
+        {tr("端口")}{livePort}{tr("。保存到列表会自动新建「")}{title} {tr("本地」并设为当前使用。")}</p>
     </div>
   )
 }

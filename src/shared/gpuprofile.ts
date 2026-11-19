@@ -60,7 +60,7 @@ export interface GpuProfile {
   /** 策略提示：为什么这么判（写进启动日志给用户看） */
   reason: string
   /** 生成此档位的依据标签，供 smoke/诊断断言 */
-  tier: 'cuda-fa' | 'cuda-nofa' | 'vulkan' | 'vulkan-fa' | 'cpu' | 'unknown'
+  tier: 'cuda-fa' | 'cuda-nofa' | 'vulkan' | 'vulkan-fa' | 'metal' | 'metal-fa' | 'cpu' | 'unknown'
 }
 
 /** 分档决策的输入（探测结果 + 覆盖开关） */
@@ -70,7 +70,7 @@ export interface GpuProfileInput {
   /** 主显卡 CUDA compute capability（2080=7.5，3080=8.6）；查不到为 null */
   cc: number | null
   /** 后端偏好（gpuplan 探测结果） */
-  pref: 'cuda' | 'vulkan' | 'cpu'
+  pref: 'cuda' | 'vulkan' | 'metal' | 'cpu'
   /** ROROTO_LLAMA_NO_FA=1：全关 */
   noFa: boolean
   /** ROROTO_LLAMA_FORCE_FA=1：即使算力不足也强开 FA */
@@ -117,6 +117,17 @@ export function resolveGpuProfile(input: GpuProfileInput): GpuProfile {
       reason:
         'Vulkan 后端：默认不加 FA / KV 量化（各驱动 kernel 差异大，开错会首次生成就崩）；' +
         `确认自己的卡稳定后，设 ROROTO_LLAMA_VULKAN_PERF=1 可开启（需 build ≥ ${VULKAN_PERF_MIN_BUILD}）`
+    }
+  }
+  // macOS：Metal 是系统内置后端，官方包默认编入，FA / KV 量化支持稳定
+  if (pref === 'metal') {
+    return {
+      fa: true,
+      ctk: true,
+      ctv: true,
+      ub: 1024,
+      tier: 'metal-fa',
+      reason: `Metal 后端 + build ${build}：FA + KV 量化全开`
     }
   }
   if (pref === 'cpu') {

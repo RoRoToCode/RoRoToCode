@@ -58,7 +58,6 @@ export const EN: Record<string, string> = {
   "{0} · MCP {1}": "{0} · MCP {1}",
   "{0} · {1}": "{0} · {1}",
   "{0} 分 {1} 秒": "{0} min {1} s",
-  "{0} 未启动：点「启动服务」，或到「② 本地模型」一键启动。": "{0} is not running — start it here or in Local models.",
   "{0} 条会话": "{0} chats",
   "{0} 运行中（端口 {1}）· {length} 个模型；保存后即用所选模型。": "{0} running (port {1}) · {length} models; saving uses the selected one.",
   "{0} 运行中（端口 {1}）；先点「使用」再保存。": "{0} running (port {1}); click Use before saving.",
@@ -85,7 +84,7 @@ export const EN: Record<string, string> = {
   "…还有": "…and ",
   "① 基础核心": "① Core",
   "② 本地模型": "② Local models",
-  "③ 模型 API": "③ Model API",
+  "③ 线上模型": "③ Online models",
   "④ 模型列表": "④ Model list",
   "简易核心": "Quick core",
   "未完成": "Not finished",
@@ -103,13 +102,13 @@ export const EN: Record<string, string> = {
   "　到「④ 模型列表」点「使用」就能切到它对话。": " — click Use in ④ Model list to chat with it.",
   "✓ 验证通过": "✓ Verification passed",
   "✗ 验证未通过": "✗ Verification failed",
-  "。一键启动会自动新建「": ". One-click start will create a new \"",
+  "。保存到列表会自动新建「": ". Save to list will create a new \"",
   "「{from}」不可用（{reason}），已自动切到「{to}」": "\"{from}\" is unavailable ({reason}); switched to \"{to}\" automatically",
   "「刷新」": "\"Refresh\"",
   "一份": "one copy",
   "一句话说明": "One-line description",
   "一次提问最多连续做多少步（读文件、改代码、跑命令），5～100。": "Max steps per request (reads, edits, commands), 5–100.",
-  "一键启动": "One-click start",
+  "正在保存模型配置…": "Saving model config…",
   "一键安装": "One-click install",
   "一键安装 / 下载": "One-click install / download",
   "一键安装（{missingCount} 项）": "One-click install ({missingCount} items)",
@@ -117,6 +116,8 @@ export const EN: Record<string, string> = {
   "三项都已经装好了，不需要再装。": "All three are already installed; nothing to do.",
   "上下文": "Context",
   "上下文窗口（tokens）": "Context window (tokens)",
+  "单次输出上限（tokens）": "Max output per reply (tokens)",
+  "留空自动（本地 16384 / 云端 8192）": "Auto if empty (local 16384 / cloud 8192)",
   "上下文长度": "Context length",
   "即可识别。": "and they are picked up.",
   "下的": " under ",
@@ -208,7 +209,7 @@ export const EN: Record<string, string> = {
   "云端模型只要 Base URL 和 API Key：点「添加」新增一条，填地址与 Key → 拉取模型 → 保存。这里不预置任何服务商，接口全部由你自己添加。":
     "Cloud models only need a Base URL and API key: click Add, fill both in, fetch models, then save. No providers are preconfigured — add every endpoint yourself.",
   "使用哪个本地模型": "Which local model to use",
-  "使用并设为当前：{picked}": "Use and set active: {picked}",
+  "保存并设为当前：{picked}": "Save and set active: {picked}",
   "例如：": "e.g. ",
   "例如：接口压测": "e.g. API load test",
   "保存": "Save",
@@ -267,6 +268,9 @@ export const EN: Record<string, string> = {
   "删除失败：{0}": "Delete failed: {0}",
   "删除工作区": "Delete workspace",
   "删除工作区 {label}": "Delete workspace {label}",
+  "打开文件夹": "Open folder",
+  "新建对话": "New chat",
+  "打不开文件夹 {0}：{1}": "Can't open folder {0}: {1}",
   "删除文件": "Delete files",
   "刷新": "Refresh",
   "刷新中…": "Refreshing…",
@@ -415,7 +419,7 @@ export const EN: Record<string, string> = {
   "当前 CPU 版：不占显存但慢；重装可换 CUDA 版。": "CPU build: no VRAM but slower; reinstall for the CUDA build.",
   "还没装 llama.cpp：点下面「一键安装 / 下载」即可。": "llama.cpp is not installed — use Install below.",
   "当前模型看不了图（": "The current model can't see images (",
-  "当前模型（{model}）看不了图。在「模型设置 → 模型 API」换成 qwen2.5-vl / llava / gemma3 这类视觉模型，就能直接看图。": "The current model ({model}) can't see images. Switch to a vision model such as qwen2.5-vl / llava / gemma3 under \"Model settings → Model API\" to use images.",
+  "当前模型（{model}）看不了图。在「模型设置 → 线上模型」换成 qwen2.5-vl / llava / gemma3 这类视觉模型，就能直接看图。": "The current model ({model}) can't see images. Switch to a vision model such as qwen2.5-vl / llava / gemma3 under \"Model settings → Online models\" to use images.",
   "当前模型：": "Current model: ",
   "待切换": "Pending switch",
   "必装": "Required",
@@ -458,7 +462,7 @@ export const EN: Record<string, string> = {
   "规则按顺序匹配，写在 roroto.json 的 permissions 里。": "Rules match in order, stored under permissions in roroto.json.",
   "指令内容": "Prompt content",
   "按": "Press ",
-  "按列表顺序依次尝试勾了「备用」的供应商；已输出一半时不切换。": "Tries providers marked backup in list order; never switches mid-reply.",
+  "按列表顺序自动尝试其它本地供应商；已输出一半时不切换。": "Automatically tries other local providers in list order; never switches mid-reply.",
   "按本机显存 / 内存挑选跑得动的模型，量化建议选": "Picks models that fit this machine's VRAM / RAM; for quantization, start with ",
   "接口类型": "API type",
   "推荐": "Recommended",
@@ -511,6 +515,7 @@ export const EN: Record<string, string> = {
   "未配置模型": "No model configured",
   "本地」并设为当前使用。": "local\" and set it as active.",
   "本地模型": "Local models",
+  "线上模型": "Online models",
   "本地模型 · 线上 API": "Local models · Online API",
   "本地模型已就绪：{0}": "Local model ready: {0}",
   "（已设为当前使用）": " (set as current)",
@@ -518,6 +523,8 @@ export const EN: Record<string, string> = {
   "本机内置": "Built into this app",
   "本机基础环境": "Local prerequisites",
   "本次会话产出的成果，点名字直接打开": "Results produced in this chat — click a name to open it",
+  "本次会话新建的成果，点名字直接打开": "Files created in this chat — click a name to open it",
+  "本次会话新建的成果文件会列在这里，点文件名打开，点「目录」定位。": "Files created in this chat show up here; click a name to open, the folder icon to locate.",
   "本次会话改了 {length} 处": "{length} changes in this chat",
   "本次会话还没有产出成果文件": "No result files in this chat yet",
   "本次会话还没有文件改动": "No file changes in this chat yet",
@@ -535,7 +542,7 @@ export const EN: Record<string, string> = {
   "写入本地模型配置，并顺手报一次服务状态": "Write the local model config and report the service status in one go",
   "写入模型配置，并顺手报一次服务状态": "Write the model config and report the service status in one go",
   "还没装 {title}，先点左边的「一键安装 / 下载」": "{title} is not installed yet — use \"One-click install / download\" first",
-  "先拉起服务，再从已装模型里挑一个设为当前": "Start the service first, then pick one of the installed models as current",
+  "从已装模型里挑一个，保存到列表并设为当前": "Pick an installed model, save to list and set it active",
   "检测状态": "Check status",
   "模型不支持原生工具调用（改用文本协议）": "Model has no native tool calling (using text protocol)",
   "模型加载中…": "Model loading…",
@@ -544,7 +551,7 @@ export const EN: Record<string, string> = {
   "模型正在回复": "Model is replying",
   "每次改文件前都留快照，改坏了点撤销。": "Every edit leaves a snapshot; undo it if something breaks.",
   "模型设置": "Model settings",
-  "模型设置：本地模型、模型 API、模型列表": "Model settings: local models, model API, model list",
+  "模型设置：本地模型、线上模型、模型列表": "Model settings: local models, online models, model list",
   "模型请求执行": "Model wants to run ",
   "模型选择": "Model",
   "次工具调用": " tool calls",
@@ -566,6 +573,8 @@ export const EN: Record<string, string> = {
   "正在启动 {title} 服务…": "Starting {title} service…",
   "正在启动本地模型…": "Starting local model…",
   "正在导入到 {title}…大模型要写一份文件，可能需要一两分钟": "Importing into {title}… large models need a file written, which can take a minute or two",
+  "已生成": "Generated",
+  "这一次调用已经生成的内容量（约等于 token 数）": "How much this call has generated so far (roughly tokens)",
   "正在思考，请稍等": "Thinking, please wait",
   "正在执行 {tool}": "Running {tool}",
   "正在扫描本地 .gguf 模型…": "Scanning local .gguf models…",
@@ -597,7 +606,7 @@ export const EN: Record<string, string> = {
   "没有差异": "No differences",
   "没有扫描到本地模型：先到「② 本地模型」页下载或导入一个": "No local models found: download or import one on the \"② Local models\" tab first",
   "没有读到技能": "No skills found",
-  "没装就先「一键安装 / 下载」，再点「一键启动」。": "Install first, then click Start.",
+  "没装就先「一键安装 / 下载」，再点「保存到列表」。": "Install first, then click \"Save to list\".",
   "添加": "Add",
   "添加中…": "Adding…",
   "添加技能": "Add skill",
@@ -690,7 +699,7 @@ export const EN: Record<string, string> = {
     "Incrementally type-check every TypeScript file right after writing it, feeding errors back immediately instead of waiting for the end of the turn.",
   "自动验证结果": "Auto-verify result",
   "自定义": "Custom",
-  "自带 Local Server：装好后点「一键启动」即可。": "Ships a Local Server; install, then click Start.",
+  "自带 Local Server：装好后点「保存到列表」即可。": "Ships a Local Server; install, then click \"Save to list\".",
   "获取中…": "Fetching…",
   "获取可用模型": "Get available models",
   "获取失败": "Fetch failed",
@@ -732,6 +741,7 @@ export const EN: Record<string, string> = {
   "还没有技能，点下面「新建技能」加一个": "No skills yet — click \"New skill\" below to add one",
   "还没拉列表：点「拉取模型列表」，或直接手输模型名。": "No model list yet — click Fetch models, or type a name.",
   "还没有本地模型：点顶部「获取模型」下载，或放进 models/。": "No local models yet — click Get models, or drop files into models/.",
+  "还没有本地模型：到「② 本地模型」页点「获取模型」下载，或放进 models/。": "No local models yet — get one from \u201c② Local models\u201d, or drop files into models/.",
   "还没有模型 · 点这里添加": "No models · click here to add",
   "还没有选择工作区": "No workspace selected",
   "还没有配置服务": "No services configured",
@@ -780,22 +790,20 @@ export const EN: Record<string, string> = {
   "默认": "Default",
   "默认 workspace": "Default workspace",
   "默认目录": "Default folder",
-  "（会先启动服务）": " (starts the service first)",
   "（共 {length} 个，下拉选择）": " ({length} total, pick from the dropdown)",
   "（已拉取 {length} 个，可下拉选取）": " ({length} fetched, pick from the dropdown)",
   "（未设置，默认用软件目录下的 workspace/）": " (not set; defaults to workspace/ in the app folder)",
   "（未选择模型）": " (no model selected)",
   "（本机）": " (local)",
   "（没有差异内容）": " (no differences)",
-  "（点「一键启动」会自动停掉当前服务再加载它）": " (\"One-click start\" stops the current service before loading it)",
-  "（点「一键启动」写入配置并设为当前使用）": " (\"One-click start\" writes the config and sets it active)",
+  "；会先停掉正在跑的 {0}": "; stops {0} first",
+  "（点「保存到列表」写入配置并设为当前使用）": " (\"Save to list\" writes the config and sets it active)",
   "（点右侧按钮扫描 models/ 与 llama.cpp/）": " (click the button on the right to scan models/ and llama.cpp/)",
   "（点右侧按钮检测 {0}）": " (click the button on the right to check {0})",
   "（自定义 {mine}）": " (custom {mine})",
   "（见附件）": " (see attachment)",
   "（部分本地模型工具需要）——": " (needed by some local model tools) —",
   "）。只能收到文字说明；看图请换视觉模型。": "). The model only receives text; switch to a vision model to see images.",
-  "，再「一键启动」即可使用。": ", then click \"One-click start\" to use it.",
   "，匹配 {length} 个": ", {length} matches",
   "，模型如": ", models like ",
   "，用本机 GGUF 模型启动服务。": ", starting the service with a local GGUF model.",
@@ -812,7 +820,7 @@ export const EN: Record<string, string> = {
   "llama.cpp 下载地址（官方 + 4 条镜像）": "llama.cpp downloads (official + 4 mirrors)",
   "官方包在 GitHub 上，内地经常连不上或断流。任意一条能打开就行，下完解压到软件根目录的 llama.cpp/ 里，或直接点「一键安装 / 下载」让它自己挑一条通的。": "Official builds are on GitHub, which is often blocked or unstable in China. Any working link is fine — unzip into llama.cpp/ in the app folder, or click \"One-click install / download\" and let it pick one.",
   "GitHub 官方 Releases（推荐海外）": "GitHub official Releases (best outside China)",
-  "页面里找 llama-b<版本号>-bin-win-cuda-12.4-x64.zip（N 卡）或 -bin-win-cpu-x64.zip（纯 CPU）": "Look for llama-b<version>-bin-win-cuda-12.4-x64.zip (NVIDIA GPU) or -bin-win-cpu-x64.zip (CPU only)",
+  "页面里找 llama-b<版本号>-bin-win-cuda-12.4-x64.zip（N 卡）或 -bin-win-cpu-x64.zip（纯 CPU）": "Look for llama-b<version>-bin-win-cuda-…-x64.zip (NVIDIA on Windows), -bin-ubuntu-cuda-…-x64.tar.gz (NVIDIA on Linux), or -bin-macos-arm64.tar.gz (Apple Silicon)",
   "gh-proxy 镜像（推荐内地）": "gh-proxy mirror (best in China)",
   "和官方页面完全一样，下载走加速；一键安装优先用它": "Same page as official, downloads accelerated; one-click install tries this first",
   "ghproxy.net 镜像": "ghproxy.net mirror",
@@ -889,9 +897,12 @@ export const EN: Record<string, string> = {
   "荐": "★",
   " · 上下文 {0}": " · context {0}",
   "一档上下文都装不下，建议换更小的模型或更低的量化。": "Not even the smallest context fits — use a smaller model or lower quantization.",
-  "静态推算，实际以加载一次为准": "Static estimate — confirm by loading it once",
+  "（静态口径：按显卡总容量的 94% 估算，不看当前谁占着显存）":
+    "(static: 94% of total VRAM — current usage is ignored)",
+  "重新体检（按显卡容量静态估算，与当前占用无关；改过文件或 KV 精度才需要）":
+    "Re-check (static estimate from GPU capacity, independent of current usage; only needed after changing the file or KV precision)",
 
-  // ── 模型 API：同接口沿用 Key ──
+  // ── 线上模型：同接口沿用 Key ──
   "已加入「{name}」，沿用同一接口的 Key（默认备用）。": "Added {name} with the same endpoint key (backup by default).",
   "已加入「{name}」，沿用了同一接口已填的 API Key": "Added \"{name}\" and reused the API key already set for this endpoint",
 
@@ -905,8 +916,7 @@ export const EN: Record<string, string> = {
   "工作模型（子代理）": "Worker (subagents)",
   "子代理用它干活：双卡时各占一张卡，才是真并行。全局只设一个。": "Sub-agents run on it; with two GPUs each takes one for real parallelism. One per app.",
   "留空自动": "Auto (blank)",
-  "工作模型已在后台加载": "Worker model is loading in the background",
-  "检查能否并行": "Check parallelism",
+  "子智能体已在后台加载": "Sub-agent models are loading in the background",
   "实测中…（可能几分钟）": "Testing… (may take minutes)",
   "实测多槽并发": "Measure real parallelism",
   "开多个槽到底有没有用：先发一个长请求，再并发两个，看上下文会不会被挤掉。":
@@ -914,8 +924,6 @@ export const EN: Record<string, string> = {
   "实测失败：{0}": "Measurement failed: {0}",
   "检查中…": "Checking…",
   "先选择一个对话模型": "Pick a chat model first",
-  "检查失败：{0}": "Check failed: {0}",
-  "点「检查能否并行」看它和当前对话模型能不能同时驻留。": "Click “Check parallelism” to see whether it can stay resident alongside the current chat model.",
   "留空 = 自动探测空闲端口；当前使用 {port}": "Blank = auto-detect a free port; currently using {port}",
   "留空 = 自动探测空闲端口（默认 8080）": "Blank = auto-detect a free port (8080 by default)",
   "留空自动探测空闲端口；填了就锁定，被占用会报错。": "Leave blank to auto-pick a free port; a set port is locked and errors if busy.",
@@ -993,6 +1001,9 @@ export const EN: Record<string, string> = {
   "已跳过": "Skipped",
   "还没排期": "Not scheduled",
   "已保存「{0}」": "Saved \"{0}\"",
+  "已保存到模型列表": "Saved to the model list",
+  "保存到列表": "Save to list",
+  "把这份配置写入磁盘，然后到「④ 模型列表」管理它": "Write this config to disk, then manage it in \u201c④ Models\u201d",
   "已删除「{0}」": "Deleted \"{0}\"",
   "任务已保存": "Task saved",
   "任务已删除": "Task deleted",
@@ -1075,6 +1086,9 @@ export const EN: Record<string, string> = {
   "这个工作区有会话在排队": "A chat in this workspace is queued",
   "这条会话正在工作": "This session is working",
   "这条会话在排队等模型": "This session is queued for the model",
+  "这条会话有子 agent 在独立工作": "A sub-agent is working independently in this session",
+  "子 agent 正在工作": "Sub-agent working",
+  "这个工作区有子 agent 在工作": "A sub-agent is working in this workspace",
   "当前显卡：{0}": "GPU in use: {0}",
   " · 显卡 {0}": " · GPU {0}",
   "由 llama.cpp 自动选择": "Chosen automatically by llama.cpp",
@@ -1110,7 +1124,7 @@ export const EN: Record<string, string> = {
   "管理 Agent 档案": "Manage agent profiles",
   "{n} 个档案": "{n} profiles",
 
-  /* 模型 API：不预置服务商 */
+  /* 线上模型：不预置服务商 */
   "API Key 仅保存在本机配置文件中，不会上传；也不要把 Key 提交到代码仓库或分享给他人。":
     "API keys are stored only in the local config file and never uploaded. Don't commit them to a repo or share them.",
 
@@ -1193,22 +1207,7 @@ export const EN: Record<string, string> = {
   "正在停止 llama-server…": "Stopping llama-server…",
   "立刻停掉本机 llama-server 并释放显存。下次发消息会自动重新加载，上下文档位保持不变。":
     "Stop the local llama-server now and free VRAM. The next message reloads it automatically with the same context tier.",
-  "从磁盘删除这个模型（含配套投影器），不能恢复":
-    "Delete this model from disk (projector included). This cannot be undone.",
   "占磁盘 {0}": "Uses {0} on disk",
-  "{0} 个模型，共占磁盘 {1}": "{0} models, {1} on disk",
-  "共 {0} 个模型": "{0} models",
-  "清理未使用": "Clean unused",
-  "删掉没有被任何供应商引用的模型（配套投影器一起删），删前后都有确认":
-    "Delete models not referenced by any provider (projectors included). You'll be asked to confirm.",
-  "删除「{0}」？\n文件会从磁盘移除，不能恢复。正在运行时请先点「停止服务」。":
-    'Delete "{0}"?\nThe file is removed from disk and cannot be recovered. If it is running, stop the server first.',
-  "没有可清理的模型：目录里每个都被某个供应商用着":
-    "Nothing to clean: every model in the folder is used by a provider",
-  "将删除 {0} 个没有被任何供应商使用的模型，共 {1}：\n{2}\n\n删除后不能恢复。":
-    "This will delete {0} model(s) not used by any provider, {1} total:\n{2}\n\nThis cannot be undone.",
-  "已释放 {0}，但有 {1} 个没删掉：\n{2}": "Freed {0}, but {1} could not be deleted:\n{2}",
-  "已清理 {0} 个模型，释放 {1}": "Cleaned {0} model(s), freed {1}",
 
   /* 采样参数与结构化输出 */
   "Top P（留空用服务端默认）": "Top P (blank = server default)",
@@ -1228,4 +1227,190 @@ export const EN: Record<string, string> = {
     'Keep only what fits. Items marked "slow" still show — they can run with partial offload',
   "已隐藏 {0} 个装不下的模型": "{0} models that don't fit are hidden",
   "校验": "Verify",
+
+  /* ② 本地模型：一卡一模型（不再是「工作组」），主 / 子在 ④ 模型列表里设定 */
+  "合成": "Merged",
+  "合成：多张显卡一起跑这一个模型": "Merged: multiple GPUs running one model together",
+  "收起模型列表，只显示前 3 个": "Collapse the list (show first 3 only)",
+  "展开全部 {length} 个": "Show all {length}",
+  "展开全部 {length} 个本地模型": "Show all {length} local models",
+  "当前：合并模式 {0} GB": "Current: merged mode, {0} GB",
+  "当前：一卡一模型 · {0} 张卡": "Current: one model per GPU · {0} GPUs",
+  "拆回一卡一模型：每个实例各占一张卡，主 / 子在「④ 模型列表」里逐条设定":
+    "Back to one model per GPU: each instance owns one card; set main / sub per entry in ④ Model list",
+  "一卡一模型：共 {0} 张，点一张为它选模型；主 / 子在「④ 模型列表」里设定":
+    "{0} GPUs, one card per model. Click a card to pick its model; set main / sub in ④ Model list",
+  "共 {0} 张，点一张为它选模型": "{0} GPUs; click one to pick a model",
+  "合并模式：这几张卡一起跑同一个模型":
+    "Merged mode: all these GPUs run one model",
+  "工作组未启用：当前是合并多卡模式，所有卡一起跑同一个模型；在「② 本地模型」页点模式按钮可恢复。":
+    "Worker group off: GPUs are merged into one VRAM pool. Switch back with the mode button in Local Models.",
+  "工作模型": "Worker",
+  "处理中…": "Working…",
+  "停止失败：{0}": "Failed to stop: {0}",
+  "未就绪": "Not ready",
+  "远端": "Remote",
+  /* 旧版「工作组」折叠行的文案已不再使用，保留只为兼容历史会话里的提示 */
+  "工作组（{n} 卡）· {model}": "Worker group ({n} GPUs) · {model}",
+  "工作组（主 + 子）": "Worker group (chat + subagents)",
+  "{n} 张卡 · 1 主 + {m} 工作": "{n} GPUs · 1 chat + {m} workers",
+  "{n} 张卡 · {m} 个工作模型": "{n} GPUs · {m} workers",
+  "{n} 卡": "{n} GPUs",
+  "{m}/{n} 就绪": "{m}/{n} ready",
+  "工作组：主模型和各卡上的子代理一起起停；配置和起停在「② 本地模型」页":
+    "Worker group: the chat model and all GPU subagents start and stop together. Configure and control them in Local Models",
+  "组内每张卡各跑一个模型": "One model per GPU in this group",
+  "{n} 张卡 · 1 主 + {m} 工作 · {r} 就绪": "{n} GPUs · 1 chat + {m} workers · {r} ready",
+  "{n} 张卡 · {m} 个工作模型 · {r} 就绪": "{n} GPUs · {m} workers · {r} ready",
+  "{r}/{n} 就绪": "{r}/{n} ready",
+  "整组 = 主模型 + 各卡上的子代理：一起起停、一起保活。成员、角色、起停在「② 本地模型」页配置；下面只改主模型的基础参数。":
+    "The whole group (chat model + per-GPU subagents) starts, stops and stays alive together. Manage members and roles in Local Models; only the chat model's basic settings are edited here.",
+  "主模型": "Chat model",
+  /* 工作组是整体：删除也是整组删 */
+  "删除整组": "Delete group",
+  "删除这条配置": "Delete this entry",
+  "删除整个工作组：主模型和各卡上的工作模型一起移除":
+    "Delete the whole worker group: the chat model and every GPU worker are removed together",
+  "删除整个工作组？这会一起移除主模型和各卡上的工作模型，共 {n} 条本地实例。":
+    "Delete the whole worker group? This removes the chat model and all GPU workers — {n} local instances in total.",
+  // 「② 本地模型」只做配置、启停搬到「④ 模型列表」之后新增的文案
+  "把这份配置写入磁盘，然后到「④ 模型列表」启动它":
+    "Write this config to disk, then start it in ④ Model list",
+  "上下文档位": "Context size",
+  "点一档写进配置，保存后生效；绿=装得下、灰虚框=装不下":
+    "Pick a size to save into the config; it applies after saving. Green = fits, dashed = won't fit",
+  "运行中 {0}": "Running {0}",
+  "体检没出来，仍可直接选一档写进配置": "No fit report yet — you can still pick a size to save",
+  "按体检建议把 {0} 写进配置（保存后生效）":
+    "Save the recommended {0} into the config (applies after saving)",
+  "还没有可用档位：等体检算出来，或直接点下面某一档":
+    "No size available yet — wait for the fit report, or pick one below",
+  "把 {0}（{1} tokens）写进配置：以后启动都按这一档，不再自动调档":
+    "Save {0} ({1} tokens) into the config: future starts reuse this size and stop auto-tuning",
+  "按体检算出的上下文写进配置并锁定该档：{0}":
+    "Save the fit report's context size and lock it: {0}",
+  "体检判断 {0} 装不下（需要 {1} / 预算 {2}）：保存这档后，启动时会按显存逐层分配，一部分层留在 CPU/内存，能跑但明显变慢":
+    "The fit report says {0} won't fit (needs {1} / budget {2}): once saved, starts offload layers to CPU/RAM — it runs, but noticeably slower",
+  "整模型装不下：把 {0} 写进配置，启动时交给 llama.cpp 逐层分配，一部分层会留在 CPU，能跑但明显变慢":
+    "The whole model won't fit: save {0} and let llama.cpp offload layers to the CPU — it runs, but noticeably slower",
+  "已开启合并：{0} 一起跑同一个模型（约 {1} GB），到「④ 模型列表」点「启动」生效{2}":
+    "Merge enabled: {0} run one model together (~{1} GB). Click Start in ④ Model list to apply{2}",
+  "{0} 未启动：点卡片右上角的「启动」。": "{0} is not running — click Start at the top right of the card.",
+  "{0} 运行中（端口 {1}）；点「停止」再「启动」可把它设为当前使用。":
+    "{0} is running (port {1}) — click Stop, then Start, to make it the current model.",
+  "启动 {0} 服务并使用它": "Start the {0} service and switch to it",
+  "正在停止 {0} 服务…": "Stopping the {0} service…",
+  "停掉 {0} 服务并释放显存；下次发消息会自动重新启动":
+    "Stop the {0} service and free VRAM; it starts again automatically on the next message",
+  "，点「保存到列表」，再到「④ 模型列表」点「启动」即可使用。":
+    ", click Save to list, then click Start in ④ Model list.",
+  "启动这个实例并使用它（只会在这里启动）":
+    "Start this instance and switch to it (the only place to start)",
+  "这条还没选模型：先选一个再启动": "No model selected on this entry — pick one first",
+  "启动": "Start",
+  "重新加载": "Reload",
+  "停掉这个实例并释放显存；下次发消息会自动重新加载":
+    "Stop this instance and free VRAM; it reloads automatically on the next message",
+  "保存只写配置；要加载这个模型，点卡片右上角的「启动」。":
+    "Save only writes the config; click Start at the top right of the card to load this model.",
+  "正在跑的是 {served}：要换成所选模型，先点「停止」再「启动」，约几十秒。":
+    "Currently serving {served} — click Stop, then Start, to switch to the selected model (takes a few dozen seconds).",
+  "这条不是当前使用的：点右上角「启动」会把它设为当前使用并加载。":
+    "This entry is not in use — click Start at the top right to make it the current model and load it.",
+  /* 工作组：每条实例后面的主 / 子 */
+  "主模型 = 对话走的那一条，其余卡是子代理":
+    "Main model = the one the chat uses; the other cards are sub-agents",
+  "主": "Main",
+  "子": "Sub",
+  "设为主模型": "Make main",
+  "对话已经在走这张卡": "The chat is already using this card",
+  "让这张卡跑主对话，{0} 继续当子代理":
+    "Run the main chat on this card; {0} stays a sub-agent",
+  "{0} 已设为主模型：对话马上走这张卡":
+    "{0} is now the main model — the chat uses this card from now on",
+  "{0} 已设为主模型，但它还没启动 —— 点卡片上的「启动」拉起来":
+    "{0} is now the main model but is not running yet — click Start on the card",
+  "{0} 已在 {1} 上启动，作为子代理；主模型不变":
+    "{0} is running on {1} as a sub-agent; the main model is unchanged",
+  "工作组：主模型和各卡上的子代理一起起停；主 / 子与起停在「④ 模型列表」":
+    "Work group: the main model and the per-card sub-agents start and stop together; switch main/sub and start them in Model list",
+  "整组 = 主模型 + 各卡上的子代理：一起起停、一起保活。成员、起停在「② 本地模型」页配置，主 / 子在卡片上方每条实例后面切换；下面只改主模型的基础参数。":
+    "The group = main model + per-card sub-agents, started, stopped and kept alive together. Configure members and starting on the Local models page; switch main/sub on each row above; the fields below only change the main model.",
+
+  /* 线上模型：主 agent / 子 agent 互斥切换（主 + 子 模式） */
+  "主agent": "Main agent",
+  "子agent": "Sub agent",
+  "设为主agent": "Set as main agent",
+  "启用子agent": "Enable sub-agents",
+  "关闭子agent": "Disable sub-agents",
+  "多智能体": "Multi-agent",
+
+  /* 主 / 子智能体：④ 模型列表里每条模型后面一个两段开关，本地和线上同一套 */
+  "主 / 子": "Main / Sub",
+  "主智能体：对话正在用它": "Main agent: the chat is using it",
+  "子智能体：给子代理干活": "Sub agent: runs subagent tasks",
+  "子智能体：主 agent 派 task 时会用它干活":
+    "Sub agent: used by the main agent when it dispatches tasks",
+  "这条是子智能体，给子代理干活": "This entry is a sub agent",
+  "当前主智能体：对话正在用它": "Current main agent: the chat is using it",
+  "设为主智能体：对话切到这条，原主自动变子":
+    "Set as main agent: the chat switches to this entry; the previous main becomes a sub",
+  "这条还没选模型：先选一个再设为主": "Pick a model first, then set it as main",
+  "主智能体不能同时是子：先把别的模型设为主，这条会自动变子":
+    "The main agent cannot also be a sub: make another entry main and this one becomes a sub",
+  "已经是子智能体：派 task 时会把活分给它":
+    "Already a sub agent: tasks get dispatched to it",
+  "设子智能体：进池给子代理干活，可以有多条":
+    "Set as sub agent: joins the pool and runs subagent tasks; you can have several",
+  "这条还没选模型：先选一个再设为子": "Pick a model first, then set it as sub",
+  "还没有配置模型": "No model configured yet",
+  "关闭多智能体": "Disable multi-agent",
+  "一键启用多智能体": "Enable multi-agent",
+  "关闭多智能体：清空所有模型的「子」角色":
+    "Disable multi-agent: clears the sub role on every model",
+  "启用多智能体：把主以外的模型都设为子，供主 agent 派活":
+    "Enable multi-agent: mark every non-main model as sub for the main agent to dispatch to",
+  "现在只有主智能体：task 子代理会沿用主模型（也有独立上下文，只是不换模型）。想让它用别的模型干活，把某条设为「子」。":
+    "Only a main agent right now: task subagents reuse the main model (they still get their own context). To run them on another model, mark that entry as Sub.",
+  "至少需要第二条配好模型的条目才能设子智能体":
+    "You need a second entry with a model before setting a sub agent",
+  "多智能体已启用：主以外的 {0} 个模型都成了子智能体":
+    "Multi-agent enabled: {0} non-main models are now sub agents",
+  "多智能体已关闭：子代理不再换模型，统一用主模型":
+    "Multi-agent disabled: subagents no longer switch models and use the main model",
+  "已切换主智能体：{0}": "Main agent switched to {0}",
+  "切换主智能体失败：{0}": "Failed to switch the main agent: {0}",
+  "{0} 已设为子智能体：派 task 时会分给它":
+    "{0} is now a sub agent: tasks will be dispatched to it",
+  "设置子智能体失败：{0}": "Failed to set the sub agent: {0}",
+  "{0} 已在 {1} 上启动，作为子智能体；主模型不变":
+    "{0} is running on {1} as a sub agent; the main model is unchanged",
+
+  "设为主": "Set as main",
+  "当前主 agent：主对话正在使用这个线上模型":
+    "Current main agent: the main chat is using this online model",
+  "子 agent：点击切换为唯一的主 agent，其余自动降级为子 agent":
+    "Sub agent: click to make it the only main agent; the rest become sub agents automatically",
+  "设为主 agent：主对话将使用这个线上模型":
+    "Set as main agent: the main chat will use this online model",
+  "点击关闭子 agent：清空所有线上模型的子 agent 角色":
+    "Click to disable sub-agents: clear the sub-agent role from all online models",
+  "点击启用子 agent：其余线上模型自动成为子 agent，供主 agent 调用":
+    "Click to enable sub-agents: the other online models become sub agents for the main agent to call",
+  "至少需要两个线上模型才能启用子 agent":
+    "At least two online models are required to enable sub-agents",
+  "子 agent 已启用：其余 {0} 个线上模型自动成为子 agent":
+    "Sub-agents enabled: the other {0} online models are now sub agents",
+  "子 agent 已关闭：线上模型不再作为子 agent 被调用":
+    "Sub-agents disabled: online models will no longer be called as sub agents",
+  "已切换主 agent：{0}（其余线上模型自动成为子 agent）":
+    "Main agent switched to {0} (the other online models are now sub agents)",
+  "切换主 agent 失败：{0}": "Failed to switch main agent: {0}",
+  "设置子 agent 失败：{0}": "Failed to set sub agent: {0}",
+  "连接中断 · {n} 秒后自动从断点续跑":
+    "Connection interrupted · auto-resuming from checkpoint in {n}s",
+  "立即续跑": "Resume now",
+  "生成中断：连接长时间没有返回内容": "Generation interrupted: no response for a long time",
+  "请求超时：服务端没有在时限内响应": "Request timed out: server did not respond in time",
+  "模型没有返回内容（可能卡在预填充）": "Model returned nothing (possibly stuck in prefill)",
 }

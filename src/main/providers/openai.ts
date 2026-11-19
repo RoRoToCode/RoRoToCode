@@ -3,7 +3,9 @@ import { samplingBody } from '../../shared/chatbody'
 import { parseArgs, RAW_ARG_KEY } from '../../shared/toolargs'
 import type { ToolSpec } from '../tools/spec'
 import { imageDataUrl } from '../vision'
-import { ensureLocalAwake, explainStreamFailure, idleGuard, joinUrl, readError, requestSignal, sseLines } from './base'
+import { outputBudget, timeoutForOutput } from './budget'
+import { requestTokens } from '../../shared/tokens'
+import { ensureLocalAwake, explainStreamFailure, guardFor, joinUrl, readError, requestSignal, sseLines } from './base'
 import type { OpenAIChunk, StreamOptions, StreamResult } from './base'
 
 type ContentPart =
@@ -80,13 +82,12 @@ function normalizeBase(provider: ProviderConfig): string {
  * 十几万 tokens 的钱，余额不够就直接 402 —— 用户看到的是「我明明有额度，却用不了」。
  * 带上一个够用又不夸张的值，预扣就只按这个数算。
  *
- * 上限 8192 与 Anthropic 那条路径保持一致；上下文很小的本地模型按 1/4 留，
- * 免得把整个窗口都许给输出。
+ * 具体给多少不再写死在这里：`budget.outputBudget()` 按「这次请求实际还剩多少窗口」
+ * 和「本地/云端各愿意给多少」算。以前那个 16384 常量有两个毛病 ——
+ * 不知道 prompt 有多大（55K 历史 + 16K 输出直接把窗口撑爆），也没法配。
  */
-function maxOutputTokens(provider: ProviderConfig): number {
-  const ctx = Math.floor(Number(provider.contextWindow) || 0)
-  const cap = ctx > 0 ? Math.floor(ctx / 4) : 8192
-  return Math.min(Math.max(cap, 512), 8192)
+function maxOutputTokens(provider: ProviderConfig, promptTokens: number, escalate = false): number {
+  return outputBudget(provider, promptTokens, escalate)
 }
 
 export async function streamOpenAI(opts: StreamOptions): Promise<StreamResult> {
@@ -111,16 +112,26 @@ export async function streamOpenAI(opts: StreamOptions): Promise<StreamResult> {
     )
   }
   const base = normalizeBase(provider)
-  const { signal, abort, done } = requestSignal(opts.signal, 10 * 60 * 1000)
-  // 总超时管「彻底卡死」，看门狗管「一直没有输出」：后者才是排队时的真实体感
-  const guard = idleGuard(abort)
+  /**
+   * 预算要按「这次真的发出去多少」算。
+   * 图片附件已经在 messages 里（imageDataUrl），按字符估算对视觉输入偏小，
+   * 所以图上再留 1/8 窗口的余量 —— 视觉 token 从来不是按字符数算的。
+   */
+  const promptTokens = requestTokens(messages, tools) + (messages.some((m) => m.images?.length) ? Math.floor(Number(provider.contextWindow || 0) / 8) : 0)
+  const maxOut = maxOutputTokens(provider, promptTokens, opts.escalate)
+  const { signal, abort, done } = requestSignal(opts.signal, timeoutForOutput(maxOut))
+  // 总超时管「彻底卡死」，看门狗管「一直没有输出」：后者才是排队时的真实体感。
+  // 两段的时限按 provider 分级（本机给预填充留足、云端 150 秒），见 guardLimits
+  const guard = guardFor(provider, abort, {
+    onWait: opts.onWait ? (ms) => opts.onWait?.({ waitedMs: ms, promptTokens }) : undefined
+  })
 
   const body: Record<string, unknown> = {
     model: provider.model,
     messages: toOpenAIMessages(messages),
     stream: true,
     temperature: provider.temperature ?? 0.2,
-    max_tokens: maxOutputTokens(provider),
+    max_tokens: maxOut,
     // 让服务端在最后一帧附带 token 用量；不认识这个参数的网关会忽略它
     stream_options: { include_usage: true }
   }
@@ -135,6 +146,15 @@ export async function streamOpenAI(opts: StreamOptions): Promise<StreamResult> {
   Object.assign(body, samplingBody(provider, tools.length > 0))
 
   let res: Response
+  if (process.env.RORO_DUMP_REQ) {
+    // 临时诊断：把真正发出去的请求落盘，用来定位「写一半就停」是请求差异还是模型行为
+    try {
+      const fsx = await import('node:fs')
+      fsx.writeFileSync(`${process.env.RORO_DUMP_REQ}/req-${Date.now()}.json`, JSON.stringify(body))
+    } catch {
+      // 诊断失败不影响主流程
+    }
+  }
   try {
     res = await fetch(joinUrl(base, '/chat/completions'), {
       method: 'POST',
@@ -161,6 +181,12 @@ export async function streamOpenAI(opts: StreamOptions): Promise<StreamResult> {
   let text = ''
   // 思考过程只累计、绝不推给界面，也不算进回答正文
   let reasoning = ''
+  /**
+   * 已经吐出来的帧数：当作「近似生成 token 数」报给界面做实时进度。
+   * llama.cpp 是严格一帧一 token，所以本地模型上这个数相当准；在线网关
+   * 一帧可能含多个 token，只能当量级看，界面也按「约」展示。
+   */
+  let genUnits = 0
   const calls = new Map<number, ToolCall>()
   const rawArgs = new Map<number, string>()
   let usage: TokenUsage | undefined
@@ -215,7 +241,14 @@ export async function streamOpenAI(opts: StreamOptions): Promise<StreamResult> {
 
   try {
     for await (const payload of sseLines(res.body)) {
-      guard.touch()
+      /**
+       * 这里**不能**无条件 guard.touch()。
+       *
+       * llama.cpp 在 prefill 之前会先发一个只有 role、没有 content 的帧；把它当成
+       * 「已经开始流式输出」，看门狗就切到「90 秒没有新内容 = 连接断了」这一段，
+       * 而 prefill 本身要几分钟 —— 我们自己把请求掐了，上层再重发，于是永远到不了。
+       * 只有拿到真正的正文 / 思考 / 工具参数，才算「活过来了」。
+       */
       if (payload === '[DONE]') break
       let chunk: OpenAIChunk
       try {
@@ -245,11 +278,19 @@ export async function streamOpenAI(opts: StreamOptions): Promise<StreamResult> {
       if (!delta) continue
       if (delta.content) {
         text += delta.content
+        guard.touch()
         onText(delta.content)
+        genUnits++
       }
       // 推理模型（MiMo / DeepSeek-R1 蒸馏等）把思考单独放在这个字段。
       // 忽略它会导致「正文一直空 → 触发空白重试 → 用户以为加载失败」。
-      reasoning += delta.reasoning_content ?? delta.reasoning ?? ''
+      const thinking = delta.reasoning_content ?? delta.reasoning
+      if (thinking) {
+        reasoning += thinking
+        // 思考也是真的在产出：模型已经过了 prefill，不能再用「首字前」的时限去掐它
+        guard.touch()
+        genUnits++
+      }
       for (const tc of delta.tool_calls ?? []) {
         const idx = tc.index ?? 0
         if (tc.id) {
@@ -259,8 +300,12 @@ export async function streamOpenAI(opts: StreamOptions): Promise<StreamResult> {
         if (existing && tc.function?.name && !existing.name) existing.name = tc.function.name
         if (tc.function?.arguments) {
           rawArgs.set(idx, (rawArgs.get(idx) ?? '') + tc.function.arguments)
+          // 写文件/跑命令的耗时全在这些参数里，只数正文会让进度一直停在 0
+          guard.touch()
+          genUnits++
         }
       }
+      if (genUnits > 0) opts.onProgress?.(genUnits)
     }
   } catch (err) {
     // undici 的 `TypeError: terminated` 不能直接甩给用户（见 explainStreamFailure）

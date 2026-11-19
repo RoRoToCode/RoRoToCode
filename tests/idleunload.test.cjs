@@ -192,6 +192,105 @@ test('forget：手动启动后清掉「已卸载」记录', async () => {
   assert.equal(w.unloaded().length, 0)
 })
 
+/**
+ * 工作模型组保活：组内 N 个实例要「一起开、一起关」。
+ * 只要有一个还在忙，其它卡就不能被逐个卸掉 —— 否则子代理会静默回落主模型。
+ */
+const groupList = [
+  { key: 'w1', port: 8081, model: 'a.gguf', startedAt: 0, partial: false },
+  { key: 'w2', port: 8082, model: 'b.gguf', startedAt: 0, partial: false }
+]
+const groupOf = async () => ({ w1: 'worker', w2: 'worker' })
+
+test('tick（组保活）：组内有人在忙时整组都不卸载', async () => {
+  resetClock()
+  const { deps, stopped } = mkDeps({
+    list: () => groupList,
+    busy: async (port) => port === 8081,
+    groupOf
+  })
+  const w = createIdleWatcher(deps, { intervalMs: 5000 })
+  await w.tick()
+  clock.advance(60 * MIN)
+  assert.deepEqual(await w.tick(), [])
+  assert.deepEqual(stopped, [])
+})
+
+test('tick（组保活）：全组都空闲到点才一起卸载', async () => {
+  resetClock()
+  const { deps, stopped } = mkDeps({ list: () => groupList, groupOf })
+  const w = createIdleWatcher(deps, { intervalMs: 5000 })
+  await w.tick()
+  clock.advance(11 * MIN)
+  const gone = await w.tick()
+  assert.deepEqual(gone.sort(), ['w1', 'w2'])
+  assert.deepEqual(stopped.sort(), ['w1', 'w2'])
+  assert.equal(w.unloaded().length, 2)
+})
+
+test('tick（组保活）：组外的实例不跟着保活', async () => {
+  resetClock()
+  const list = [
+    ...groupList,
+    { key: 'main', port: 8080, model: 'm.gguf', startedAt: 0, partial: false }
+  ]
+  const { deps, stopped } = mkDeps({
+    list: () => list,
+    busy: async (port) => port === 8081,
+    groupOf
+  })
+  const w = createIdleWatcher(deps, { intervalMs: 5000 })
+  await w.tick()
+  clock.advance(60 * MIN)
+  const gone = await w.tick()
+  assert.deepEqual(gone, ['main'])
+  assert.deepEqual(stopped, ['main'])
+})
+
+test('tick（组保活）：不传 groupOf 时行为与单实例完全一致', async () => {
+  resetClock()
+  const { deps, stopped } = mkDeps({ list: () => groupList })
+  const w = createIdleWatcher(deps, { intervalMs: 5000 })
+  await w.tick()
+  clock.advance(11 * MIN)
+  assert.deepEqual(await w.tick(), ['w1', 'w2'])
+  assert.equal(stopped.length, 2)
+})
+
+/**
+ * 「主 + 子是一组」之后的新场景：用户一直在跟主模型聊天（主忙、子闲），
+ * 子代理那几张卡不该被逐个卸掉；反过来全组都闲才一起放开显存。
+ */
+const wholeGroup = [
+  { key: 'main', port: 8080, model: 'm.gguf', startedAt: 0, partial: false },
+  ...groupList
+]
+const wholeGroupOf = async () => ({ main: 'workgroup', w1: 'workgroup', w2: 'workgroup' })
+
+test('tick（整组保活）：主模型在忙时，闲到点的工作模型也不卸', async () => {
+  resetClock()
+  const { deps, stopped } = mkDeps({
+    list: () => wholeGroup,
+    busy: async (port) => port === 8080,
+    groupOf: wholeGroupOf
+  })
+  const w = createIdleWatcher(deps, { intervalMs: 5000 })
+  await w.tick()
+  clock.advance(60 * MIN)
+  assert.deepEqual(await w.tick(), [])
+  assert.deepEqual(stopped, [])
+})
+
+test('tick（整组保活）：主 + 子全闲到点就一起卸载', async () => {
+  resetClock()
+  const { deps, stopped } = mkDeps({ list: () => wholeGroup, groupOf: wholeGroupOf })
+  const w = createIdleWatcher(deps, { intervalMs: 5000 })
+  await w.tick()
+  clock.advance(11 * MIN)
+  assert.deepEqual((await w.tick()).sort(), ['main', 'w1', 'w2'])
+  assert.deepEqual(stopped.sort(), ['main', 'w1', 'w2'])
+})
+
 test('start/stop：定时器幂等且能停', async () => {
   const { deps } = mkDeps()
   const w = createIdleWatcher(deps, { intervalMs: 5000 })

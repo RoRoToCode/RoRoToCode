@@ -430,6 +430,28 @@ select:focus {
   animation: none;
 }
 
+/* 收起态的窄条：绿色主机器人往左挪，紫色子机器人缩一号贴在右下角 */
+.rail-robot.has-sub {
+  transform: translate(-4px, -2px);
+}
+
+.rail-sub {
+  /* rail-folders 有 overflow:hidden，贴边但不越界，免得右下角被裁掉 */
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: hsl(275 80% 72%);
+  animation: subagent-pulse 1.4s step-end infinite;
+}
+
+.rail-sub svg {
+  width: 11px;
+  height: 11px;
+}
+
 .rail-more {
   flex: none;
   font-size: calc(10px * var(--fs, 1));
@@ -572,17 +594,31 @@ select:focus {
   }
 }
 
-/* 侧栏底部：[+ 新建对话] 在 [+ 新的工作区] 上方，两个按钮同宽 */
+/* 侧栏底部：[新建会话] [新的工作区] 并排同一行，只留图标（加号 / 文件夹加号），
+   文字收进 title + aria-label，宽度对半分 */
+.sidebar-new-row {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.new-btn,
+.new-ws-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 1;
+  min-width: 0;
+  height: 32px;
+  padding: 0;
+  margin: 0;
+}
+
 .new-btn {
-  width: 100%;
-  margin: 0 0 8px;
-  padding: 8px 10px;
   background: var(--panel-2);
   border: 1px solid var(--border-strong);
   border-radius: 8px;
-  text-align: left;
   color: var(--text);
-  font-size: calc(12px * var(--fs, 1));
 }
 
 .new-btn:hover {
@@ -650,6 +686,33 @@ select:focus {
 .session-live.queued {
   color: hsl(38 62% 60%);
   animation: none;
+}
+
+/* 子 agent：紫色小机器人紧跟在绿色主机器人后面，除了颜色/闪烁和主机器人完全一样。
+   两枚同时亮 = 主对话还在、另有一个子任务在独立跑；收掉负间距免得中间空太宽。
+   这里刻意不叫 .subagent，避免命中聊天区子 agent 卡片的边框/背景样式。 */
+.session-live.is-sub {
+  margin-left: -4px;
+  color: hsl(275 80% 72%);
+  animation: subagent-pulse 1.4s step-end infinite;
+}
+
+@keyframes subagent-pulse {
+  0% {
+    opacity: 1;
+    color: hsl(275 88% 80%);
+    filter: drop-shadow(0 0 5px hsl(275 85% 68% / 0.85));
+  }
+  50% {
+    opacity: 0.32;
+    color: hsl(275 45% 60%);
+    filter: none;
+  }
+  100% {
+    opacity: 0.32;
+    color: hsl(275 45% 60%);
+    filter: none;
+  }
 }
 
 /* 机器人闪烁：亮半拍 / 暗半拍，亮的时候带一圈光晕。
@@ -750,6 +813,27 @@ select:focus {
   animation: none;
 }
 
+/* 折叠后的工作区：主机器人往左让一点，紫色子机器人贴在右下角 */
+.ws-live-badge.has-sub {
+  transform: translateX(-4px);
+}
+
+.ws-sub-badge {
+  position: absolute;
+  right: -8px;
+  bottom: -5px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: hsl(275 80% 72%);
+  animation: subagent-pulse 1.4s step-end infinite;
+}
+
+.ws-sub-badge svg {
+  width: 10px;
+  height: 10px;
+}
+
 .ws-chevron {
   flex: none;
   display: inline-flex;
@@ -847,6 +931,80 @@ select:focus {
   color: var(--danger);
 }
 
+/* 工作区右键菜单：portal 到 body，避免被侧栏 overflow:hidden 裁掉 */
+.ws-ctx-menu {
+  position: fixed;
+  z-index: 200;
+  min-width: 150px;
+  padding: 5px;
+  background: var(--panel-2, var(--panel));
+  border: 1px solid var(--border-strong, var(--border));
+  border-radius: 9px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35), 0 2px 8px rgba(0, 0, 0, 0.2);
+  font-size: calc(12px * var(--fs, 1));
+  color: var(--text);
+  animation: ws-ctx-in 0.1s ease-out;
+}
+
+@keyframes ws-ctx-in {
+  from { opacity: 0; transform: translateY(-3px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.ws-ctx-title {
+  padding: 4px 9px 6px;
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: calc(10.5px * var(--fs, 1));
+  color: var(--dim);
+}
+
+.ws-ctx-item {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  padding: 7px 9px;
+  border-radius: 6px;
+  color: var(--text);
+  text-align: left;
+  white-space: nowrap;
+}
+
+.ws-ctx-item svg {
+  flex: none;
+  color: var(--muted);
+}
+
+.ws-ctx-item:hover:not(:disabled) {
+  background: var(--hover);
+}
+
+.ws-ctx-item:disabled {
+  opacity: 0.42;
+  cursor: not-allowed;
+}
+
+.ws-ctx-item.danger {
+  color: var(--danger);
+}
+
+.ws-ctx-item.danger svg {
+  color: var(--danger);
+}
+
+.ws-ctx-item.danger:hover {
+  background: rgba(239, 106, 106, 0.14);
+}
+
+.ws-ctx-sep {
+  height: 1px;
+  margin: 4px 4px;
+  background: var(--border);
+}
+
 .ws-empty {
   padding: 8px 10px;
   font-size: calc(11.5px * var(--fs, 1));
@@ -861,14 +1019,9 @@ select:focus {
 }
 
 .new-ws-btn {
-  width: 100%;
-  padding: 8px 10px;
-  margin-bottom: 10px;
-  text-align: left;
   color: var(--muted);
   border: 1px dashed #33333c;
   border-radius: 8px;
-  font-size: calc(12px * var(--fs, 1));
 }
 
 .new-ws-btn:hover {
@@ -879,9 +1032,27 @@ select:focus {
 
 .foot-meta {
   display: flex;
+  align-items: center;
   justify-content: space-between;
   font-size: calc(11px * var(--fs, 1));
   color: var(--dim);
+}
+
+/* 底部版本号右侧的语言 / 设置按钮：和版本号贴在一起，抵消 header 里那套左边距 */
+.foot-meta-right {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.foot-meta-right .header-lang,
+.foot-meta-right .header-gear {
+  margin-left: 0;
+  padding: 3px 6px;
+}
+
+.foot-meta-right .header-gear {
+  padding: 4px;
 }
 
 .ws-row {
@@ -1892,19 +2063,54 @@ select:focus {
   text-overflow: ellipsis;
   white-space: nowrap;
   font-weight: 500;
-  color: var(--text-soft);
 }
 
-/* 默认的「正在思考」比具体进度低调一点，别让整行一直抢眼 */
-.run-status.idle .run-status-note {
-  font-weight: 400;
-  color: var(--muted);
+/* 每个字单独一个 inline-block，transform 才能作用在单字上（inline 元素忽略 translateY）。
+   animation-delay 由 RunStatus.tsx 按字符序递增写入（每字 0.06s），形成从左到右的波浪。 */
+.run-note-ch {
+  display: inline-block;
+  white-space: pre;
+}
+
+/* 正在工作：状态文字逐字波浪式跃动，不再单独发光。
+   节奏和 .run-dots i 一致（1.2s，30% 抬到 -3px），但每个字有自己的延迟，
+   从一个字传到下一个字，像三个点那样依次亮起；去掉呼吸光晕和文字渐隐，全程清晰可读。
+   默认的「RoRoTo Code · 正在思考，请稍等」和具体进度（正在执行 xxx）都算工作中，一视同仁。
+   queued 排队由下面的琥珀色规则接管 —— 那还没开始烧算力，不该跟着跳。 */
+.run-status:not(.queued) .run-status-note {
+  color: var(--accent);
+}
+
+.run-status:not(.queued) .run-note-ch {
+  animation: run-note-bounce 1.2s ease-in-out infinite;
+}
+
+@keyframes run-note-bounce {
+  0%,
+  60%,
+  100% {
+    transform: translateY(0);
+  }
+  30% {
+    transform: translateY(-3px);
+  }
 }
 
 .run-status-time {
   flex: none;
   color: var(--dim);
   font-variant-numeric: tabular-nums;
+}
+
+/* 实时生成量：证明模型确实在吐东西，不然几分钟的静默看着像卡死 */
+.run-status-gen {
+  flex: none;
+  color: var(--text-soft);
+  font-variant-numeric: tabular-nums;
+  font-size: calc(11px * var(--fs, 1));
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
 }
 
 /* 排队中：琥珀字，和「真的在跑」区分开，别让人以为卡住了 */
@@ -1920,10 +2126,11 @@ select:focus {
   background: hsl(38 60% 55%);
 }
 
-/* 不想看动效：保留文字，去掉跳动 */
+/* 不想看动效：保留文字和强调色高亮，去掉跳动与呼吸 */
 @media (prefers-reduced-motion: reduce) {
   .tool-status.run,
-  .run-dots i {
+  .run-dots i,
+  .run-note-ch {
     animation: none;
   }
 }
@@ -2051,6 +2258,14 @@ select:focus {
 
 .foot-pill:hover {
   border-color: var(--border-strong);
+}
+
+/* 只留图标的胶囊（加号 / 剪刀）：去掉文字后收成正方形，图标居中 */
+.foot-pill.icon-only {
+  flex: none;
+  width: 26px;
+  padding: 0;
+  justify-content: center;
 }
 
 /* 本会话用量：默认低调，鼠标悬停才看明细（title） */
@@ -2400,12 +2615,152 @@ select:focus {
   color: var(--accent);
 }
 
+/*
+ * 模型菜单里的主 / 子标记。主用强调色（对话正在用它），子用中性灰（给子代理干活）。
+ * 只做标记，不做切换 —— 角色在「④ 模型列表」里设定，下拉菜单只负责选模型。
+ */
+.model-item-role,
+.model-trigger-role {
+  flex: none;
+  align-self: flex-start;
+  min-width: 15px;
+  padding: 0 5px;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  color: var(--dim);
+  font-size: calc(10px * var(--fs, 1));
+  line-height: 1.6;
+  text-align: center;
+}
+
+.model-item-role.main {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/*
+ * 合成标记：device 写了多张卡（CUDA0,CUDA1），一个模型摊到几张卡上跑。
+ * 用强调色空心胶囊，和「主 / 子」的角色标记区分开 —— 合成是「跑法」不是角色。
+ */
+.model-item-merged {
+  flex: none;
+  align-self: flex-start;
+  min-width: 15px;
+  padding: 0 5px;
+  border: 1px solid var(--accent);
+  border-radius: 999px;
+  color: var(--accent);
+  font-size: calc(10px * var(--fs, 1));
+  line-height: 1.6;
+  text-align: center;
+}
+
+.model-trigger-role {
+  align-self: center;
+}
+
 .model-menu-foot {
   margin-top: 4px;
   padding: 7px 8px 3px;
   border-top: 1px solid var(--border);
   font-size: calc(10.5px * var(--fs, 1));
   color: var(--dim);
+}
+
+/*
+ * 「④ 模型列表」里每张卡片头上的主 / 子两段开关。
+ *
+ * 为什么是两段而不是一个「切换」按钮：用户的意图有两种 ——
+ * 「让这条来聊天」和「让这条去干活」，一个按钮只能表达其中一种。
+ * 两段各自亮起，当前落在哪种角色上一眼就能看出来。
+ */
+.role-seg {
+  display: inline-flex;
+  flex: none;
+  padding: 1px;
+  border: 1px solid var(--border-strong);
+  border-radius: 7px;
+  overflow: hidden;
+}
+
+.role-seg-btn {
+  min-width: 22px;
+  padding: 1px 6px;
+  border: 0;
+  background: transparent;
+  color: var(--dim);
+  font-size: calc(10.5px * var(--fs, 1));
+  line-height: 1.5;
+  cursor: pointer;
+}
+
+.role-seg-btn:hover:not(:disabled) {
+  color: var(--text);
+  background: var(--panel);
+}
+
+.role-seg-btn.on {
+  background: var(--panel-2);
+  color: var(--text);
+}
+
+.role-seg-btn.on.main {
+  background: var(--accent);
+  color: #fff;
+}
+
+.role-seg-btn:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+
+/* 顶部「主 / 子」总览：谁是主、几个子、一键启用 */
+.agent-role-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+  font-size: calc(11.5px * var(--fs, 1));
+  color: var(--dim);
+}
+
+.agent-role-main {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: var(--text);
+}
+
+.agent-role-sub {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+}
+
+.agent-role-tag {
+  flex: none;
+  min-width: 16px;
+  padding: 0 5px;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  color: var(--dim);
+  font-size: calc(10px * var(--fs, 1));
+  line-height: 1.6;
+  text-align: center;
+}
+
+.agent-role-tag.main {
+  border-color: var(--accent);
+  color: var(--accent);
 }
 
 /* 可用性指示 */
@@ -2550,6 +2905,65 @@ select:focus {
   margin-top: 0;
 }
 
+/* 模型列表分类标题：本地模型 / 线上模型 */
+.model-group {
+  margin-bottom: 18px;
+}
+
+.model-group:last-child {
+  margin-bottom: 0;
+}
+
+.model-group-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 0 8px;
+  margin-bottom: 10px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text);
+  font-size: calc(13px * var(--fs, 1));
+  font-weight: 600;
+}
+
+.model-group-title::before {
+  content: '';
+  width: 3px;
+  height: 14px;
+  border-radius: 2px;
+  background: var(--accent);
+}
+
+.model-group-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 20px;
+  height: 20px;
+  padding: 0 6px;
+  border-radius: 10px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  color: var(--dim);
+  font-size: calc(11px * var(--fs, 1));
+  font-weight: 500;
+}
+
+/* 「线上模型」分组标题后的子 agent 总开关：推到右侧，做成紧凑胶囊 */
+.subagent-toggle {
+  margin-left: auto;
+  padding: 3px 12px;
+  border-radius: 14px;
+  font-size: calc(12px * var(--fs, 1));
+  line-height: 1.4;
+}
+
+.subagent-toggle.primary {
+  background: var(--ok);
+  border-color: var(--ok);
+  color: #fff;
+}
+
 .provider {
   border: 1px solid var(--border);
   border-left-width: 4px;
@@ -2610,6 +3024,11 @@ select:focus {
   border-radius: 6px;
   padding: 1px 6px;
   flex-shrink: 0;
+}
+
+/* 合成徽章用实心，和空心的「主 / 子」prov-badge 区分开 */
+.prov-merged-badge {
+  background: rgba(110, 168, 254, 0.2);
 }
 
 /* 每个供应商的检测结果文字：绿=可用，红=不可用，灰=检测中 */
@@ -2993,6 +3412,15 @@ select:focus {
   gap: 8px;
   flex-shrink: 0;
 }
+/* 静默中断后的自动续跑倒计时：用暖色和「秒数」强调它正在走，跟普通中断横幅区分开 */
+.auto-resume-banner {
+  border-color: var(--warn, #d29922);
+  background: color-mix(in srgb, var(--warn, #d29922) 8%, var(--panel-2));
+}
+.auto-resume-banner .resume-banner-text strong {
+  color: var(--warn, #d29922);
+  font-variant-numeric: tabular-nums;
+}
 
 ::-webkit-scrollbar {
   width: 10px;
@@ -3149,7 +3577,7 @@ select:focus {
   flex-shrink: 0;
 }
 
-/* 顶部的「获取模型 / 刷新」：字号更大，与「一键启动」同规格 */
+/* 顶部的「获取模型 / 刷新」：字号更大，与「保存到列表」同规格 */
 .guide-getmodels {
   font-size: calc(13px * var(--fs, 1));
   padding: 7px 12px;
@@ -3553,6 +3981,231 @@ a.btn {
   margin-top: 8px;
 }
 
+/* 模型多于 3 个时列表先折起来，这里点一下展开全部 / 收起。
+   下箭头展开时翻上来，和按钮文案一致。 */
+.guide-models-more {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  align-self: flex-start;
+  margin-top: 7px;
+  padding: 3px 9px;
+  font-size: calc(11px * var(--fs, 1));
+  font-family: inherit;
+  color: var(--accent);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.guide-models-more:hover {
+  border-color: var(--accent);
+}
+
+.guide-models-more svg {
+  transition: transform 0.15s ease;
+}
+
+.guide-models-more svg.up {
+  transform: rotate(180deg);
+}
+
+/* 显卡槽位：一卡一格，点一下就是「为这张卡选模型」。
+   多卡机器上这是唯一能同时看清「哪张卡、跑的是哪个模型、占了多少显存」的地方，
+   所以卡名、占用模型、运行状态都塞在同一格里。 */
+.gpu-slots {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--code-bg);
+}
+
+.gpu-slots-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+
+.gpu-slots-head b {
+  font-size: calc(13px * var(--fs, 1));
+  color: var(--text);
+}
+
+.gpu-slot-row {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.gpu-slot {
+  flex: 1 1 172px;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  text-align: left;
+  font-family: inherit;
+  font-size: calc(11.5px * var(--fs, 1));
+  color: var(--dim);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 7px 10px;
+  background: var(--panel);
+  cursor: pointer;
+  line-height: 1.4;
+}
+
+.gpu-slot:hover {
+  border-color: #3c3c46;
+  color: var(--text);
+}
+
+.gpu-slot.on {
+  border-color: rgba(110, 168, 254, 0.7);
+  background: rgba(110, 168, 254, 0.12);
+  color: var(--text);
+}
+
+/* 空卡用虚线：先说「这里还没人用」，比只灰掉更明确 */
+.gpu-slot.free {
+  border-style: dashed;
+  opacity: 0.8;
+}
+
+.gpu-slot.free:hover {
+  opacity: 1;
+}
+
+.gpu-slot-top {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.gpu-slot-id {
+  font-size: calc(11px * var(--fs, 1));
+  color: var(--dim);
+}
+
+.gpu-slot.on .gpu-slot-id {
+  color: var(--accent);
+}
+
+.gpu-slot-live {
+  font-size: calc(10px * var(--fs, 1));
+  padding: 1px 5px;
+  border-radius: 4px;
+  color: #63c98a;
+  background: rgba(99, 201, 138, 0.14);
+}
+
+.gpu-slot-here {
+  font-size: calc(10px * var(--fs, 1));
+  padding: 1px 5px;
+  border-radius: 4px;
+  color: #8fb8f0;
+  background: rgba(143, 184, 240, 0.16);
+}
+
+.gpu-slot-role {
+  font-size: calc(10px * var(--fs, 1));
+  padding: 1px 5px;
+  border-radius: 4px;
+  color: var(--dim);
+  border: 1px solid var(--border-strong);
+}
+
+.gpu-slot-role.main {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.gpu-slot-name {
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.gpu-slot-sub {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.gpu-slot.on .gpu-slot-sub {
+  color: var(--text);
+}
+
+.gpu-slot-vram {
+  font-size: calc(10.5px * var(--fs, 1));
+  opacity: 0.7;
+}
+
+/* 「这个模型装到哪张卡」：跟在标题后面，比塞进提示串更容易一眼看到 */
+.gpu-pick-target {
+  font-size: calc(10.5px * var(--fs, 1));
+  padding: 1px 6px;
+  border-radius: 4px;
+  color: var(--accent);
+  background: rgba(110, 168, 254, 0.14);
+}
+
+/* 合并多卡：整排卡槽合成一块，用虚线框表达「这几张卡是一个整体」，
+   而不是并列的两个格子 —— 并列会让人以为还能单独往某一张上放模型 */
+.gpu-merged {
+  border: 1px dashed rgba(110, 168, 254, 0.55);
+  border-radius: 8px;
+  padding: 8px 10px;
+  background: rgba(110, 168, 254, 0.08);
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.gpu-merged-top {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.gpu-merged-badge {
+  font-size: calc(10px * var(--fs, 1));
+  padding: 1px 6px;
+  border-radius: 4px;
+  color: var(--accent);
+  background: rgba(110, 168, 254, 0.2);
+}
+
+.gpu-merged-names {
+  font-size: calc(12px * var(--fs, 1));
+  color: var(--text);
+}
+
+.gpu-merged-sub {
+  font-size: calc(11px * var(--fs, 1));
+  color: var(--dim);
+}
+
+/* 合并态的目标标签：和单卡的蓝色区分开，避免「以为只选了一张卡」 */
+.gpu-pick-target.merged {
+  color: var(--text);
+  background: rgba(110, 168, 254, 0.28);
+}
+
+/* 开关型按钮的「已开启」态：不是主操作，所以不加 primary 的实心蓝，
+   但必须一眼看出「现在开着」—— 描边 + 淡蓝底 + 蓝字，和两侧的灰按钮拉开层次 */
+.btn.on {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: rgba(110, 168, 254, 0.16);
+}
+
 /* 本地模型选择器：多个模型时让用户点选 */
 .guide-pick {
   margin-top: 12px;
@@ -3735,6 +4388,23 @@ a.btn {
   font-size: calc(11.5px * var(--fs, 1));
   color: var(--dim);
   overflow-wrap: anywhere;
+}
+
+/* 底部说明 + 右侧动作：说明占满剩余宽度，按钮不换行、也不被压扁 */
+.guide-note-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.guide-note-row > .guide-note {
+  flex: 1;
+  min-width: 0;
+}
+
+.guide-note-row > .btn {
+  flex: none;
+  margin-left: auto;
 }
 
 .guide-pick-picked b {
@@ -6394,7 +7064,7 @@ a.btn {
 .msg:hover .turn-del,
 .tool-card:hover .turn-del,
 .tool-stack:hover .turn-del,
-.subagent:hover .turn-del,
+.msg > .subagent:hover .turn-del,
 .turn-del:focus-visible {
   opacity: 1;
 }
@@ -6990,7 +7660,8 @@ a.btn {
    子 agent 卡片
    ============================================================ */
 
-.subagent {
+/* 只在消息区生效：侧栏的机器人图标也会带状态类，别让卡片的大框跑到那儿去 */
+.msg > .subagent {
   margin: 2px 0 6px;
   padding: 10px 12px 10px 14px;
   background: var(--panel-2);
@@ -6999,16 +7670,16 @@ a.btn {
   border-radius: 10px;
 }
 
-.subagent.running {
+.msg > .subagent.running {
   border-left-color: var(--accent);
   animation: subagent-breathe 1.8s ease-in-out infinite;
 }
 
-.subagent.fail {
+.msg > .subagent.fail {
   border-left-color: var(--danger);
 }
 
-.subagent.ok {
+.msg > .subagent.ok {
   border-left-color: var(--ok);
 }
 
@@ -7032,11 +7703,11 @@ a.btn {
   transform: rotate(45deg);
 }
 
-.subagent.fail .subagent-mark {
+.msg > .subagent.fail .subagent-mark {
   background: var(--danger);
 }
 
-.subagent.ok .subagent-mark {
+.msg > .subagent.ok .subagent-mark {
   background: var(--ok);
 }
 
@@ -7190,12 +7861,12 @@ a.btn {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .subagent.running {
+  .msg > .subagent.running {
     animation: none;
   }
 }
 
-/* ---------- 免费模型目录（模型 API 页） ---------- */
+/* ---------- 免费模型目录（线上模型页） ---------- */
 .free-box {
   margin: 14px 0 6px;
   padding: 12px 14px;

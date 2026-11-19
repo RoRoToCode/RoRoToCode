@@ -60,6 +60,28 @@ export interface ParsedArgs {
 /** provider 解析失败时把原始文本放在这个键上，让模型在历史里能看到自己写了什么 */
 export const RAW_ARG_KEY = '_raw'
 
+/**
+ * 写类工具里「装正文」的字段名，按出现频率排序。
+ *
+ * 漏掉一个就是一类工具彻底没有恢复能力：以前只有 content 那批，于是
+ * `edit_file` 的 `new_string` 和 `patch` 的 diff 被截断时只能整份重来，
+ * 而 patch 恰恰是大改动最省 token 的写法 —— 最该救的那条路反而没救。
+ * `patch` 工具内部还有个 edits 数组，`new_string` 在数组元素里出现，
+ * 按 `,` 边界扫也能命中，拿到的就是那一项（配 recoverArgs 取同级的 path）。
+ */
+export const WRITE_TEXT_KEYS = [
+  'content',
+  'new_string',
+  'patch',
+  'diff',
+  'text',
+  'contents',
+  'body',
+  'file_content',
+  'new_content',
+  'new_text'
+]
+
 /** 从 start 处的 { 或 [ 找到配对的收尾位置；字符串和转义都跳过 */
 export function balancedEnd(text: string, start: number): number {
   let depth = 0
@@ -469,6 +491,154 @@ function readField(raw: string, key: string): FieldReply {
   return { value: low === 'true' ? true : low === 'false' ? false : null }
 }
 
+/**
+ * 读一个「可能没闭合」的字符串字面量，把已经生成的部分尽量交出来。
+ *
+ * 和 readField 的区别在于「不放弃」：那边是没闭合就不救，因为半个文件落盘比报错糟；
+ * 这边只取文本、不落盘，用途是断点续写 —— 把模型已经写出来的部分交还给它，让它接着写。
+ */
+function readStringBody(raw: string, from: number, quote: string): { text: string; closed: boolean } {
+  let out = ''
+  let i = from
+  while (i < raw.length) {
+    const c = raw[i]
+    if (c === '\\') {
+      const nx = raw[i + 1]
+      // 转义符本身写到一半就断了：这段不能要，否则会接出一个错字符
+      if (nx === undefined) return { text: out, closed: false }
+      if (nx === 'n') out += '\n'
+      else if (nx === 't') out += '\t'
+      else if (nx === 'r') out += '\r'
+      else if (nx === 'b') out += '\b'
+      else if (nx === 'f') out += '\f'
+      else if (nx === 'u') {
+        const hex = raw.slice(i + 2, i + 6)
+        if (!/^[0-9a-fA-F]{4}$/.test(hex)) return { text: out, closed: false }
+        out += String.fromCharCode(parseInt(hex, 16))
+        i += 6
+        continue
+      } else out += nx
+      i += 2
+      continue
+    }
+    if (c === quote) return { text: out, closed: true }
+    out += c
+    i++
+  }
+  return { text: out, closed: false }
+}
+
+/**
+ * 原文是不是「断在字符串中间」—— 这是输出被切断最硬的证据。
+ *
+ * 为什么不看括号平衡：`{"path":"a","content":"x"` 少了右花括号，但 content 其实写完了，
+ * 按截断处理只会白让模型重写一遍。只有连字符串都没闭合，才说明真的被砍在半句上。
+ *
+ * 也不能只信 `finish_reason`：中转网关、部分 Ollama 版本、某些 chat template 会返回
+ * `stop` 或干脆不给字段，那时半截参数会被容错层补成合法对象，然后照样覆盖文件。
+ */
+export function cutInsideString(raw: string): boolean {
+  let inStr = false
+  let quote = '"'
+  let escaped = false
+  for (let i = 0; i < raw.length; i++) {
+    const c = raw[i]
+    if (!inStr) {
+      if (c === '"' || c === "'") {
+        inStr = true
+        quote = c
+      }
+      continue
+    }
+    if (escaped) {
+      escaped = false
+      continue
+    }
+    if (c === '\\') escaped = true
+    else if (c === quote) inStr = false
+  }
+  // 末尾那个反斜杠说明连转义序列都没写完，同样算断在字符串里
+  return inStr
+}
+
+/**
+ * 从「写到一半的 JSON」里把某个字符串字段的前缀抠出来。
+ *
+ * 只认 `{` 或 `,` 后面的键，避免把文件内容里出现的同名文字当成字段
+ * （写 HTML 时正文里出现 `"content"` 完全可能）。
+ */
+export function partialString(
+  raw: string,
+  keys: string[]
+): { key: string; text: string; closed: boolean } | null {
+  for (const key of keys) {
+    const esc = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const m = new RegExp(`(?:^|[{,\\s])["']?${esc}["']?\\s*:\\s*(["'])`).exec(raw)
+    if (!m) continue
+    const body = readStringBody(raw, m.index + m[0].length, m[1])
+    if (body.text) return { key, text: body.text, closed: body.closed }
+  }
+  return null
+}
+
+/** 只按键名抠「已经完整」的短字段（path 这类），续写补齐后用它重建完整调用 */
+export function recoverArgs(raw: string, keys: string[]): Record<string, unknown> {
+  const out: Record<string, unknown> = {}
+  for (const k of keys) {
+    const r = readField(raw, k)
+    if (r.value !== undefined) out[k] = r.value
+  }
+  return out
+}
+
+/**
+ * 把模型「续写」出来的那一段接到已有内容后面。
+ *
+ * 三种走法都要能处理，本地小模型三种都会干：
+ * 1. 老老实实从断点接着写 —— 直接拼；
+ * 2. 复读尾巴（最常见）—— 找到最长重叠，只取重叠之后的部分；
+ * 3. 干脆从头重写一遍 —— 取公共前缀之后的部分，等价于把前半段丢弃。
+ * 不做这两道去重的话，拼出来的文件会在接缝处长出一段重复代码，
+ * 而且往往还是语法错的那种。
+ */
+export function joinContinuation(soFar: string, chunk: string): string {
+  const add = chunk
+    .replace(/^\s*```[A-Za-z0-9_-]*[ \t]*\r?\n?/, '')
+    .replace(/\r?\n?```\s*$/, '')
+  if (!add.trim()) return soFar
+  if (!soFar) return add
+
+  // 从头重写：公共前缀够长，就认为它在重复已经写完的部分
+  let cp = 0
+  const maxCp = Math.min(soFar.length, add.length)
+  while (cp < maxCp && soFar[cp] === add[cp]) cp++
+  if (cp >= 200 && cp >= maxCp * 0.6) return soFar + add.slice(cp)
+
+  /**
+   * 整行重抄：模型把「断在半句的那一行」从头又写了一遍，再接下去。
+   *
+   * 实测（本地 9B 写打砖块）：断在 `paddle = { w: 90, h: 14, x: W / 2 - `，
+   * 续写从 `paddle = { w: 90, h: 14, x: W / 2 - paddle.w /2, …` 开始 —— 重叠 36 字符，
+   * 差 4 个字符够不到下面那个 40 的字数门槛，于是重复半行直接进了文件，
+   * 拼出来是 `x: W / 2 - paddle = {…`，语法直接坏掉。
+   *
+   * 按「最后一行」比而不是按字数卡：只要续写以 soFar 的未完成末行为开头，
+   * 它就是重抄，长度多少都该切掉。
+   */
+  const nl = soFar.lastIndexOf('\n')
+  if (nl >= 0) {
+    const lastLine = soFar.slice(nl + 1)
+    if (lastLine.trim().length >= 8 && add.startsWith(lastLine)) return soFar + add.slice(lastLine.length)
+  }
+
+  // 复读尾巴：soFar 的后缀与 add 的前缀最长的重合
+  const cap = Math.min(2000, add.length - 1, soFar.length)
+  for (let k = cap; k >= 24; k--) {
+    if (soFar.endsWith(add.slice(0, k))) return soFar + add.slice(k)
+  }
+  return soFar + add
+}
+
 function salvage(
   raw: string,
   schema?: ArgSchema
@@ -669,3 +839,15 @@ export function settleToolArgs(
       : undefined
   return { args: coerced, note }
 }
+
+/**
+ * 「这份参数是续写拼出来的」标记。
+ *
+ * 单次写入上限的目的是不让模型**一次生成**超过输出预算的内容；而续写拼好的
+ * 内容已经生成完毕了，是原本被切断、又被一段段接起来的 —— 再按单次上限拒掉，
+ * 等于把好不容易救回来的两万字符直接扔掉，让它从头再吐一遍，那才是真浪费。
+ *
+ * 用 Symbol 且不可枚举：JSON.stringify 会忽略它，不会污染会话记录、审批载荷
+ * 或发给模型的历史。只有工具层读得到。
+ */
+export const HEALED_ARGS = Symbol.for('roroto.healedArgs')
