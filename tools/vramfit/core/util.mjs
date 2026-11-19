@@ -23,8 +23,8 @@ export function utf8Length(s) {
 }
 
 /**
- * 人类可读体积。小于 1 GB 走 MiB —— 运行时开销只有 200 MiB，
- * 印成「0.20 GB」既不容易读，也和「200 MiB」的说法对不上。
+ * 人类可读体积。小于 1 GB 走 MiB —— 运行时开销是 800 MiB，
+ * 印成「0.78 GB」既不容易读，也和「800 MiB」的说法对不上。
  */
 export function fmtSize(bytes) {
   const b = Number(bytes) || 0

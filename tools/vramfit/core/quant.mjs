@@ -51,6 +51,23 @@ export function paramCountOf(file, explicit) {
   return named ? named * 1e9 : undefined
 }
 
+/**
+ * MoE 激活参数（B 为单位）：从文件名的「A22B」写法里取，如
+ * `DeepSeek-R1-235B-A22B-Q4_K_M.gguf` → 22。
+ *
+ * 只认明确带 `A<数字>B` 的名字，不会把 total 的 235B 误当激活。
+ * 这是 GGUF 元数据缺 expert_used_count 时的兜底之一 —— 模型作者常把激活参数
+ * 写进文件名，却不写进 KV 元数据。取不到就返回 undefined，交给上层按专家比例算。
+ */
+export function activeParamsFromName(file) {
+  const base = baseName(file).replace(/\.gguf$/i, '')
+  // A 前要有边界（^ 或非字母数字），避免把 "Qwen3-A..." 之类误判；A 与 B 都是大写惯例，但放宽大小写
+  const m = /(?:^|[^a-z0-9])[aA](\d+(?:\.\d+)?)\s*[bB](?![a-zA-Z0-9])/.exec(base)
+  if (!m) return undefined
+  const n = Number(m[1])
+  return n > 0 && n < 10000 ? n : undefined
+}
+
 export function quantRank(q) {
   if (!q) return -1
   if (/BF16|F16|F32/i.test(q)) return 50

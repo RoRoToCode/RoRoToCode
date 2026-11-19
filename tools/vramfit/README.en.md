@@ -102,7 +102,7 @@ Recursive scanning matches LM Studio's `models/<publisher>/<repo>/x.gguf` layout
 | `-i, --interactive` | kept for compatibility; no arguments already starts interactive mode |
 | `--kv <type>` | KV cache precision: `f16` (default) / `q8_0` (halves it) / `q4_0` |
 | `--vram 12` | pretend you have 12 GB (keeps GPU name and bandwidth) to price an upgrade |
-| `--gpu N` | evaluate the Nth GPU; required on multi-GPU machines, no tensor parallelism |
+| `--gpu N` | evaluate the Nth GPU (default: the first); multi-GPU machines also get a combined estimate |
 | `--budget static\|auto` | budget basis: `static` (default, total VRAM×0.94, ignores current usage) / `auto` (current free VRAM) |
 | `--mirror <url>` | default `hf-mirror.com`; `https://huggingface.co` goes direct |
 | `--lang zh\|en` | UI language, defaults to the system; `VRAMFIT_LANG` also works |
@@ -132,12 +132,12 @@ Real output, abridged: RTX 3050 (8 GB) checking a 7B Q4_K_M.
             28 layers · 28 heads / 4 KV heads (GQA)
   Hardware  RTX 3050 · CUDA · bandwidth 224 GB/s
             VRAM 8.00 GB total / 1.15 GB used / 6.85 GB free
-  Budget    weights 4.36 GB + overhead 200 MiB → ceiling 7.52 GB
+  Budget    weights 4.36 GB + overhead 800 MiB → ceiling 7.52 GB
 
   Context      need       of ceiling
-      4K     4.78 GB  █████████████░░░░░░░ ✓
-     32K     6.31 GB  █████████████████░░░ ✓
-     64K     8.06 GB  ████████████████████ ✗
+      4K     5.38 GB  ██████████████░░░░░░ ✓
+     32K     6.91 GB  ███████████████████░ ✓
+     64K     8.66 GB  ████████████████████ ✗
     128K    11.56 GB  ████████████████████ ✗
 
   Recommended  32K (6.31 GB / ceiling 7.52 GB)
@@ -148,6 +148,30 @@ Real output, abridged: RTX 3050 (8 GB) checking a 7B Q4_K_M.
 ```
 
 The number that matters isn't "it runs" — it's **"native 128K, but this machine tops out at 32K"**. Every report ends with a parameters block; `--about` is the full version.
+
+### Multi-GPU machines
+
+With two cards plugged in, the hardware section lists each card and then adds a **combined estimate**: one model split across the cards by layer (`-sm layer`), VRAM summed, bandwidth taken from the slowest card.
+
+When a model fits the pool but not a single card, the verdict says so up front and the launch flags switch to the multi-GPU set — no hand-assembling:
+
+```
+  ✗ Won't run on this machine
+    Weights fit (6.63 GB), but the smallest tier (4K) needs 8.23 GB in total, above 7.52 GB
+    2 GPUs combined can run it at 32K — see the combined check below
+
+  Combined (multi-GPU, layer split)
+    Combined VRAM pool  16.00 GB 2 cards combined
+    Largest context     32K (fits once combined)
+
+  Suggested launch flags (llama.cpp)
+    -dev CUDA0,CUDA1      GPUs in the merged pool (driver enumeration order)
+    -sm layer             whole layers per GPU, not tensor parallelism
+    -ngl 999              put all layers in VRAM
+    -c 32768              suggested context 32K
+```
+
+This is **layer splitting** (a whole layer lives on one card), not tensor parallelism: the VRAM really is pooled, but the cards take turns on the same token, so throughput doesn't double — hence the speed is quoted from the slowest card. To use the cards separately (one model each), evaluate them one at a time with `--gpu 1`.
 
 ## How the web version relates
 
@@ -240,7 +264,7 @@ All constants live in [`core/assumptions.mjs`](core/assumptions.mjs) — the rep
 |---|---|
 | Weights | file bytes, shards scaled by count |
 | KV cache | `ctx × layers × n_kv_head × (k+v) × bytes per element`; f16=2 B, q8_0=1.0625 B, q4_0=0.5625 B |
-| Runtime overhead | fixed 200 MiB |
+| Runtime overhead | fixed 800 MiB (CUDA context + compute buffers) |
 | Speed | `bandwidth × 0.7 ÷ weightGB`, ±15% |
 | Thresholds | need > ceiling×0.85 → "close"; < 3B → runs only; < 8K → too short; 1–2 bit → "avoid" (empirical) |
 

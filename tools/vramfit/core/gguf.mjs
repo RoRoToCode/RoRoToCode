@@ -315,6 +315,17 @@ export async function parseGguf(fh, size, label = '') {
     // 每 N 层只有 1 层是 full attention，其余是线性注意力，KV 不随上下文增长。
     // 不识别这个字段会把 KV cache 高估数倍。
     fullAttentionInterval: pick('full_attention_interval'),
+    // MLA（Multi-head Latent Attention，DeepSeek V2/V3/R1 系列）：
+    // KV 不按注意力头逐个缓存完整 K/V，而是先压成一个低秩潜向量再存，
+    // 显存只随 kv_lora_rank 增长，与 head 数无关。
+    // llama.cpp 的 is_mla() 要求下面两个 *_mla 键同时存在；缺任一个就仍走普通 GQA 路径
+    // （早期的 deepseek2 转换就是 16 个 KV 头、192/128 长度、没有 *_mla 键）。
+    keyLengthMla: pick('attention.key_length_mla'),
+    valueLengthMla: pick('attention.value_length_mla'),
+    kvLoraRank: pick('attention.kv_lora_rank'),
+    // 参与 RoPE 的那部分维度（DeepSeek 是 64），潜向量 + 它是每 token 的 K 行宽
+    ropeDimCount: pick('rope.dimension_count'),
+    qLoraRank: pick('attention.q_lora_rank'),
     // MTP / 多 token 预测层，llama.cpp 会忽略，不算进推理层数
     nextnLayers: pick('nextn_predict_layers'),
     ssmStateSize,

@@ -58,10 +58,12 @@ export function buildView(meta, result, ctx = {}) {
   const quant = quantFromName(meta.file) ?? (meta.fileType !== undefined ? FILE_TYPE[meta.fileType] : undefined) ?? tx('rp.unknown')
   const shard = shardInfo(meta.file)
   const weights = totalWeightsBytes(meta)
-  // 和命令行 / JSON 用同一个封顶：小模型上带宽公式会给出跑不出来的数值
+  // 和命令行 / JSON 用同一个封顶：小模型上带宽公式会给出跑不出来的数值。
+  // 封顶权重取速度口径的 basisBytes（MoE = 激活权重），三端口径必须一致。
+  const speedBytes = result.speed?.basisBytes ?? weights
   const speed = result.speed?.onVram
   const sp = Number.isFinite(speed) && speed > 0
-    ? Math.round(Math.min(speed, speedCapFor(weights)))
+    ? Math.round(Math.min(speed, speedCapFor(speedBytes)))
     : null
   const att = attentionReport(meta)
   const tpl = analyzeTemplate(meta.chatTemplate)
@@ -84,7 +86,7 @@ export function buildView(meta, result, ctx = {}) {
     bestCtxText: result.best ? fmtCtx(result.best.ctx) : '—',
     speed: sp,
     speedOnCpu: Number.isFinite(result.speed?.onRam) && result.speed.onRam > 0
-      ? Math.round(Math.min(result.speed.onRam, speedCapFor(weights)))
+      ? Math.round(Math.min(result.speed.onRam, speedCapFor(speedBytes)))
       : null,
     bandwidth: result.speed?.bandwidth ?? null,
     gpuName: result.gpu ? clean(result.gpu.name) : null,
@@ -109,14 +111,19 @@ export function buildView(meta, result, ctx = {}) {
       best: result.best?.ctx === r.ctx
     })),
     template: { level: tpl.level, notes: tpl.notes },
+    // MLA：KV 压成潜向量，网页也用同一份 core 解析，字段直接可得
+    mla: att.mla
+      ? { r: att.mla.latentRank ?? '?', p: att.mla.ropeDim ?? '?', t: att.mla.keyRow ?? '?' }
+      : null,
     attention: att.swa
       ? tx('rp.att.swa', { n: att.kvLayers, full: att.swa.fullLayers, win: fmtCtx(att.swa.window) })
       : att.intervalInferred
         ? tx('rp.att.interval', { n: att.kvLayers, i: att.interval })
         : tx('rp.att.plain', { n: att.kvLayers }),
-    moe: meta.expertCount
-      ? tx('rp.moe', { n: meta.expertCount, used: meta.expertUsedCount ?? '?' })
+    moe: result.moe
+      ? tx('rp.moe', { n: result.moe.experts, used: result.moe.used ?? '?' })
       : null,
+    moeCorrected: result.moe?.corrected ?? null,
     kvType: ctx.kvType ?? 'f16'
   }
 }
@@ -162,6 +169,7 @@ export function renderView(v) {
     [tx('rp.info.template'), levelText(v.template.level), read],
     [tx('rp.info.kv'), v.kvType === 'f16' ? tx('rp.info.kvDefault') : v.kvType, tx('rp.src.set')]
   ]
+  if (v.mla) infoRows.push([tx('rp.info.mla'), tx('rp.mla', v.mla), tx('rp.src.read')])
   if (v.moe) infoRows.push([tx('rp.info.moe'), v.moe, read])
   if (v.shard) infoRows.push([tx('rp.info.shard'), tx('rp.info.shardVal', { n: v.shard }), tx('rp.src.derived')])
 
@@ -292,7 +300,7 @@ export function renderRepoTable(repo, rows, hwName) {
  * 「参数与假设」面板。
  *
  * 网页上不写死文案，直接渲染 core/assumptions.mjs 里的清单 ——
- * 和 assess() 用的是同一份常量，改一处三处同步，不会出现「文档说 200 MiB、
+ * 和 assess() 用的是同一份常量，改一处三处同步，不会出现「文档说 800 MiB、
  * 代码算 400 MiB」这种最难查的问题。
  */
 export function renderAssumptions() {

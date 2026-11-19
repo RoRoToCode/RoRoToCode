@@ -377,6 +377,10 @@ function detectHardware() {
 
 function makeHardware(manualVram = 0, gpuIndex = 0) {
   const hw = detectHardware()
+  // 记下探测顺序（= 驱动枚举顺序，也是 llama.cpp `-dev CUDA<N>` 的编号）。
+  // --gpu 会把选中的卡换到 gpus[0]，顺序一变，-dev 的编号就会错位，
+  // 合并启动参数必须按这个原始编号来，不能按数组下标。
+  hw.gpus = (hw.gpus ?? []).map((g, i) => ({ ...g, devIndex: i }))
   // 选卡：把要评估的那张换到第一位。
   // assess() 只认 gpus[0]，这样「整模型装不装得下」自然按这张卡算 ——
   // 双卡机器上两个模型各跑各的卡，公式一行都不用改。

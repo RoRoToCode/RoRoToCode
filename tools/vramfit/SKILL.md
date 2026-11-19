@@ -13,7 +13,7 @@ description: 判断 GGUF 模型能不能在本机显存跑起来、能开多大�
 - 给了 HF 仓库或 `.gguf` 路径，要判断能否下载/启动
 - 多量化档取舍、递归扫模型目录、要 `--json` 进脚本或报告
 
-不适用：非 GGUF、实测性能、多卡切分与张量并行。
+不适用：非 GGUF、实测性能、张量并行（多卡**按层切分**的合并评估支持，不做张量并行）。
 
 ## CLI 定位
 
@@ -36,7 +36,7 @@ CLI --json --gpu 1 --vram 8 path/to/model.gguf
 CLI --about
 ```
 
-参数：`--json` 机器可读 ｜ `--gpu N` 第 N 块卡（双卡必指定）｜ `--vram GB` 手动给显存、跳过探测 ｜ `--repo owner/name` 列出全部量化并逐个远程体检 ｜ `--kv f16|q8_0|q4_0`（默认 f16，q8_0 约省一半）｜ `--mirror URL`（默认已是 hf-mirror.com，直连官方写 `--mirror https://huggingface.co`）｜ `--lang zh|en` ｜ `--about` / `--help`
+参数：`--json` 机器可读 ｜ `--gpu N` 第 N 块卡（默认第 1 块；多卡机器自动追加合并评估，不用手动指定）｜ `--vram GB` 手动给显存、跳过探测 ｜ `--repo owner/name` 列出全部量化并逐个远程体检 ｜ `--kv f16|q8_0|q4_0`（默认 f16，q8_0 约省一半）｜ `--mirror URL`（默认已是 hf-mirror.com，直连官方写 `--mirror https://huggingface.co`）｜ `--lang zh|en` ｜ `--about` / `--help`
 
 目录递归最深 6 层、只收 `.gguf`。`--json` 是数组；单项含 `error` 只影响该文件，有 error 项退出码 1，否则 0。非 GGUF 报「不是 GGUF 文件（magic 不匹配）」。
 
@@ -48,9 +48,11 @@ CLI --about
 | `recommendedCtx` | 装得下且 ≤ 原生上下文的最大档；`null` = 一档都不行。配 `tiers[]`（`ctx`/`needBytes`/`fits`）看边界 |
 | `budget.limitBytes` / `basis` | 显存上限及算法来源（Windows WDDM / Linux / macOS 规则不同） |
 | `gpu` / `cpuOnly` | 探到的显卡 / 是否退化为 CPU 推理 |
+| `gpus` / `combined` / `splitAcrossGpus` | 全部探到的卡 / 合并评估（显存池、`recommendedCtx`、速度按最弱卡）/ 启动旗标是否按多卡切分 |
+| `launchArgs` | llama.cpp 旗标建议（`-ngl`、`-c`、MoE 的 `--n-cpu-moe`、多卡的 `-dev` `-sm layer`） |
 | `tools` | `strong/partial/weak/none`，模板字符串特征，非实测能力 |
 | `genTokPerSec` / `genTokPerSecAtCtx` | 零上下文理论峰值 / 按建议上下文折减；均非实测，不含首字延迟与工具执行 |
-| `nativeContext` `params` `quant` `layers` `shard` `moe` | 模型侧信息；有 `moe` 时速度常被低估 |
+| `nativeContext` `params` `quant` `layers` `shard` `moe` | 模型侧信息。MoE 速度按激活参数算（不是全权重）；`moe.combinedFit` 表示权重进不了显存但「显存+内存」合计够 |
 | `disclaimer` | 原文口径，汇报时一并带上 |
 
 ## 汇报
@@ -58,6 +60,8 @@ CLI --about
 顺序：装不装得下 → 建议上下文 → agent 可用性 → 速度量级。突出「原生 128K、本机只能 32K」这类数字。
 
 - 必须附：静态推算、非实测，实际加载运行一次才算数。
+- MoE 装不进显存但 `moe.combinedFit=true` 时，说的是「要 `--n-cpu-moe` 把专家放内存」，不是「跑不动」。
+- 单卡放不下但 `combined.recommendedCtx` 有值时，先报「多卡合起来能跑」，再给 `-dev`/`-sm layer` 旗标；这是按层切分，不是张量并行，速度不翻倍。
 - 禁止：`agent-ready` ≠ 稳定调用工具；`unknown` ≠ 跑不动。
 
 ## 边界

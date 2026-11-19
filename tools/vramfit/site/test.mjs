@@ -197,7 +197,7 @@ test('参数与假设：面板分组齐全、内容已转义', () => {
   for (const g of assumptionsList()) {
     assert.ok(html.includes(g.group), `面板里缺少「${g.group}」`)
   }
-  assert.ok(html.includes('200 MiB'), '运行时开销那一条要写具体数值')
+  assert.ok(html.includes('800 MiB'), '运行时开销那一条要写具体数值')
   assert.doesNotMatch(html, /undefined|NaN/)
 })
 

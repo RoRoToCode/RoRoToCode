@@ -2,7 +2,7 @@
  * 全部可调参数与前提假设，集中在这一处。
  *
  * 为什么要单独抽一个文件：
- *   1. 报告里写的「+ 200 MiB 开销」和代码里算的必须是同一个数。以前分散在
+ *   1. 报告里写的「+ 800 MiB 开销」和代码里算的必须是同一个数。以前分散在
  *      assess / render / 网页三处，改一个忘两个就会自相矛盾。
  *   2. 用户有权知道结论是怎么来的。网页和命令行的「参数与假设」全都是从这里
  *      渲染出来的，不是另写一份文案 —— 文案会过期，代码不会。
@@ -12,8 +12,16 @@
 
 import { getLocale } from './i18n.mjs'
 
-export const TUNING = {  /** 运行时开销：batch / 计算缓冲。RTX 2080 + 9B Q4_M 实测约 80 MiB，取 200 MiB 留余量 */
-  overheadBytes: 200 * 1024 * 1024,
+/**
+ * 运行时开销：CUDA context + batch / 计算缓冲。
+ *
+ * 取 800 MiB 而不是只算 batch 缓冲的那点钱：CUDA context 本身随驱动和显卡版本
+ * 就要占几百 MiB（驱动 581 实测 300–500 MiB），再加上计算缓冲与碎片。
+ * 8 GB 卡的上限只有 7.5 GB 左右，少了这几百 MiB 就会把「临界装得下」判成装得下，
+ * 真加载时反而 OOM —— 宁可保守。
+ */
+export const TUNING = {
+  overheadBytes: 800 * 1024 * 1024,
 
   /**
    * 挂上视觉投影器（mmproj）之后的额外开销。
@@ -67,6 +75,13 @@ export const TUNING = {  /** 运行时开销：batch / 计算缓冲。RTX 2080 +
 
   /** 纯 CPU 推理按物理内存的这个比例 */
   ramFactor: 0.8,
+
+  /**
+   * MoE 专家 offload 到系统 RAM 时，可拿来放专家权重的可信比例。
+   * 物理内存不能全给用户模型：OS、浏览器、llama.cpp 的计算缓冲都要占。
+   * 取 0.8 与 CPU 推理同一口径 —— 「显存预算 + RAM×0.8」是 MoE 合计能装下的上限。
+   */
+  moeRamFactor: 0.8,
 
   /** 参数量低于这个门槛，只算「能跑」，不算 agent 可用 */
   minAgentParams: 3e9,
@@ -131,6 +146,10 @@ export const ASSUMPTIONS = [
       { k: ['公式', 'Formula'], v: ['ctx × 层数 × n_kv_head × (k_dim + v_dim) × 每元素字节',
         'ctx × layers × n_kv_head × (k_dim + v_dim) × bytes per element'],
         note: ['', ''] },
+      { k: ['MLA（DeepSeek）', 'MLA (DeepSeek)'], v: ['ctx × 层数 × n_kv_head × (潜向量 + RoPE) × 每元素字节',
+        'ctx × layers × n_kv_head × (latent + RoPE) × bytes/element'],
+        note: ['V 复用同一行 K，不单独分配；只在 GGUF 同时带 key/value_length_mla 时按 MLA 算',
+          'V reuses the same K row; applied only when both *_length_mla keys are present'] },
       { k: ['每元素字节', 'Bytes per element'], v: ['f16 = 2 B · q8_0 = 1.0625 B · q4_0 = 0.5625 B',
         'f16 = 2 B · q8_0 = 1.0625 B · q4_0 = 0.5625 B'],
         note: ['q8_0 / q4_0 带 per-block scale', 'q8_0 / q4_0 carry a per-block scale'] },
@@ -146,9 +165,9 @@ export const ASSUMPTIONS = [
   {
     group: ['运行时开销', 'Runtime overhead'],
     items: [
-      { k: ['固定预留', 'Fixed reserve'], v: ['200 MiB', '200 MiB'],
-        note: ['batch 与计算缓冲。RTX 2080 + 9B Q4_K_M 实测约 80 MiB，这里留了余量',
-          'Batch and compute buffers. Measured ~80 MiB on an RTX 2080 with 9B Q4_K_M; rounded up'] },
+      { k: ['固定预留', 'Fixed reserve'], v: ['800 MiB', '800 MiB'],
+        note: ['CUDA context + batch 与计算缓冲。驱动 581 实测 context 300–500 MiB，再加缓冲与碎片',
+          'CUDA context plus batch/compute buffers. Driver 581 measured 300–500 MiB for context alone'] },
       { k: ['看图投影器', 'Vision projector'], v: ['投影器文件 + 384 MiB 激活', 'projector file + 384 MiB activation'],
         note: ['传了 --mmproj 才计入。实测 9B：纯文本 7032 MiB，带图 7710 MiB（+680 MiB，其中投影器 290 MiB）',
           'Only counted with --mmproj. Measured 9B: 7032 MiB text vs 7710 MiB with images (+680 MiB, projector 290 MiB)'] }
@@ -199,9 +218,9 @@ export const ASSUMPTIONS = [
       { k: ['小模型', 'Small models'], v: ['< 2 GB 封顶 200，其余 400 tok/s', 'cap 200 under 2 GB, 400 otherwise'],
         note: ['每 token 的固定开销会压住公式值，公式对小模型失效；命令行与 JSON 都套用同一个封顶',
           'Per-token overhead dominates, so the formula stops holding. CLI and JSON apply the same cap'] },
-      { k: ['MoE 模型', 'MoE models'], v: ['未计入激活比例', 'activation ratio not modelled'],
-        note: ['MoE 每 token 只读部分专家，实际速度会高于估算；界面会提示这一点',
-          'Only some experts are read per token, so real speed is higher; the UI flags this'] }
+      { k: ['MoE 模型', 'MoE models'], v: ['速度按激活专家数修正', 'speed adjusted by active experts'],
+        note: ['MoE 每 token 只读激活的专家，速度按「全权重×(激活数/专家数)」估算；显存仍按全权重（专家都得驻留）。共享层未剔除，故偏乐观',
+          'Each token reads only active experts: speed uses full weights × (active/experts); VRAM still counts all weights. Shared layers are not excluded, so this is optimistic'] }
     ]
   },
   {
@@ -211,9 +230,9 @@ export const ASSUMPTIONS = [
         note: ['所有数字都是静态推算，不是性能测试', 'Every number is a static estimate, not a benchmark'] },
       { k: ['不读真实占用', 'No live usage'], v: ['网页端做不到', 'impossible in a browser'],
         note: ['浏览器不暴露显存占用，只能按用户填的值算', 'Browsers do not expose VRAM usage, so the value you type is used'] },
-      { k: ['不跨卡切分', 'No cross-GPU split'], v: ['一个模型只放一张卡', 'one model on one GPU only'],
-        note: ['可以用 --gpu 选评估哪张卡，但张量并行 / 逐层切分不在估算范围内',
-          'Use --gpu to pick which card to evaluate; tensor parallelism and layer splits are out of scope'] },
+      { k: ['不做张量并行', 'No tensor parallelism'], v: ['多卡只按整层切分', 'multi-GPU is layer split only'],
+        note: ['--gpu 选评估哪张卡；多卡机器另给合并评估（显存相加、带宽取最慢卡、速度不翻倍），张量并行不在范围内',
+          'Use --gpu to pick a card; multi-GPU machines also get a combined estimate (VRAM summed, weakest bandwidth, no speed-up). Tensor parallelism is out of scope'] },
       { k: ['模板只做字符串分析', 'Templates are parsed, not run'], v: ['不代表真实调用成功率', 'not a measure of success rate'],
         note: ['有 tools 分支 ≠ 模型真会稳定调用工具', 'A tools branch ≠ reliable tool calling'] }
     ]

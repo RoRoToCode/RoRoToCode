@@ -296,13 +296,13 @@ export function parseOptions(argv) {
   }
 
   /**
-   * 预算口径。默认 auto（按当前空闲显存），`static` 按物理容量算。
+   * 预算口径。默认 static（按物理容量算，不看当前占用），`auto` 按当前空闲显存算。
    *
-   * 非法值必须报错而不是静默回落到 auto：这直接决定结论是高是低，
-   * 用户写了 `--budget statik` 却拿到一份动态口径的报告，只会更难发现。
+   * 非法值必须报错而不是静默回落到 static：这直接决定结论是高是低，
+   * 用户写了 `--budget statik` 却拿到一份静态口径的报告，只会更难发现。
    */
   const bgIdx = argv.indexOf('--budget')
-  let budget = 'auto'
+  let budget = 'static'
   if (bgIdx >= 0) {
     const v = argv[bgIdx + 1]
     if (!v || v.startsWith('--')) problems.push(t('in.p.budgetNeeds'))

@@ -115,6 +115,8 @@ const DICT = {
   'rp.info.template': { zh: '对话模板', en: 'Chat template' },
   'rp.info.kv': { zh: 'KV 精度', en: 'KV precision' },
   'rp.info.moe': { zh: 'MoE', en: 'MoE' },
+  'rp.info.mla': { zh: 'MLA', en: 'MLA' },
+  'rp.mla': { zh: '潜向量 {r} + RoPE {p} = 每 token {t} 元素', en: 'latent {r} + RoPE {p} = {t}/token' },
   'rp.info.shard': { zh: '分片', en: 'Shard' },
   'rp.info.layersVal': { zh: '{n} 层 · {att}', en: '{n} layers · {att}' },
   'rp.info.kvDefault': { zh: 'f16（默认）', en: 'f16 (default)' },
