@@ -42,9 +42,18 @@ export function paramsFromName(file) {
   // `L3.2-8X4B-MOE-...-21B-Q4_K_S` 里的 8X4B 是「8 专家 × 4B」，不是总参数；
   // 旧写法 [^a-z0-9] 会把 X 当成边界，于是 21B 的模型被报成 4B。
   const m = /(?:^|[^a-zA-Z0-9])(\d+(?:\.\d+)?)\s*[bB](?![a-zA-Z0-9])/.exec(base)
-  if (!m) return undefined
-  const n = Number(m[1])
-  return n > 0 && n < 10000 ? n : undefined
+  if (m) {
+    const n = Number(m[1])
+    if (n > 0 && n < 10000) return n
+  }
+  // Gemma 3n/4 的 `E4B` 写法：E 是「有效参数」（MatFormer 每 token 实际激活的规模），
+  // 前面的 E 是字母，上面那条会被边界挡掉，于是一整类模型都没有参数量。
+  const e = /(?:^|[^a-zA-Z0-9])E(\d+(?:\.\d+)?)\s*[bB](?![a-zA-Z0-9])/.exec(base)
+  if (e) {
+    const n = Number(e[1])
+    if (n > 0 && n < 10000) return n
+  }
+  return undefined
 }
 
 /** 参数量：优先用元数据里的 general.parameter_count，其次从文件名里的「8B」猜 */

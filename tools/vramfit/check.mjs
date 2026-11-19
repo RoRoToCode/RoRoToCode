@@ -144,6 +144,16 @@ function render(meta, hw, result, opts = {}) {
   const mergedViable = Boolean(mergedResult?.estimated && mergedResult.weightsFit && mergedResult.best)
   /** 单卡侧是否已经能跑（含 MoE 专家 offload 到内存这种「能跑但要降速」） */
   const singleViable = Boolean(result.estimated && result.best) || Boolean(result.moe?.canOffload)
+  /**
+   * 单卡只能「专家放内存」时，合并全放显存往往快好几倍（内存 50 GB/s vs 显存 450）。
+   * 这时候报告末尾那条「启动参数建议」必须给合并的那套 —— 用户永远只抄最后一段，
+   * 给他一条 12 tok/s 的命令而 74 tok/s 就写在上面几行，等于白算。
+   */
+  const mergedSpeed = mergedResult?.speed?.onVram
+  const preferMerged = Boolean(
+    mergedViable && result.moe?.canOffload && Number.isFinite(mergedSpeed) &&
+    (!Number.isFinite(result.speed?.onRam) || mergedSpeed > result.speed.onRam * 1.15)
+  )
 
   // ── 版式约定：全报告只有这一套，任何一行都落在栅格上
   //   小节标题   2 空格 + 粗体，前面空一行
@@ -197,6 +207,33 @@ function render(meta, hw, result, opts = {}) {
   }
   L.push(`    ${paint(t('r.disclaimer'), 'dim')}`)
 
+  // ── 附加件（视觉投影件 / 推测解码草稿）：不是能独立加载的模型。
+  // 它们没有 KV cache、也没有可评估的上下文档位，硬套主报告的显存/速度段
+  // 只会输出一堆空表和「算不出来」。这里给一份只讲「怎么配、额外占多少」的短报告。
+  if (meta.isVision || meta.isAssistant) {
+    const kind = meta.isVision ? 'vision' : 'draft'
+    const extra = (meta.sizeBytes ?? 0) + (meta.isVision ? TUNING.visionOverheadBytes : 0)
+    section(t('s.model'))
+    L.push(row(t('f.file'), stripControl(path.basename(meta.file))))
+    L.push(row(t('f.size'), `${fmtGB(meta.sizeBytes)}${meta.tensorCount
+      ? paint(t('f.tensors', { n: meta.tensorCount }), 'dim')
+      : ''}`))
+    L.push(row(t('f.kind'), t(`a.${kind}.kind`)))
+    if (meta.arch) L.push(row(t('f.arch'), stripControl(meta.arch)))
+    section(t('s.attach'))
+    if (opts.pair) L.push(row(t('f.pair'), stripControl(opts.pair)))
+    L.push(row(t('f.attachFlag'), cyan(t(`a.${kind}.flag`))))
+    L.push(note(meta.isVision
+      ? t('a.extra.vision', {
+        s: fmtGB(extra), w: fmtGB(meta.sizeBytes), o: fmtGB(TUNING.visionOverheadBytes)
+      })
+      : t('a.extra.draft', { s: fmtGB(extra) })))
+    L.push(note(t(meta.isVision ? 'a.vision.noKv' : 'a.draft.note')))
+    if (!opts.pair) L.push(note(t('a.noPair')))
+    L.push('')
+    return L.join('\n')
+  }
+
   // ── 模型
   section(t('s.model'))
   L.push(row(t('f.file'), stripControl(path.basename(meta.file))))
@@ -229,11 +266,17 @@ function render(meta, hw, result, opts = {}) {
     const kl = kvLayers(meta)
     const ai = attentionInterval(meta)
     if (kl && kl < realLayers) {
-      const how = ai.inferred
-        ? t('f.mixedInferred', { i: ai.interval })
-        : t('f.mixedExplicit', { i: ai.interval })
       L.push(row(t('f.attention'), t('f.kvLayers', { kl, rl: realLayers })))
-      L.push(note(t('f.mixedNote', { how })))
+      // 两种来源要说清：逐层 head_count_kv 直接给了「哪几层带 KV」（LFM2/3 这类
+      // 卷积与注意力交替的架构），还是按 full_attention_interval 推出来的。
+      // 前者 interval 恒为 1，套「每 1 层 1 层 full attention」会变成一句废话。
+      L.push(note(meta.kvLayerCount
+        ? t('f.mixedPerLayer')
+        : t('f.mixedNote', {
+          how: ai.inferred
+            ? t('f.mixedInferred', { i: ai.interval })
+            : t('f.mixedExplicit', { i: ai.interval })
+        })))
     }
   }
   // MLA（DeepSeek V3/R1）：KV 压成潜向量，和同规模 GQA 差一个量级，必须单独说清，
@@ -423,8 +466,11 @@ function render(meta, hw, result, opts = {}) {
     }
     L.push('')
     if (best) {
-      L.push(row(t('t.bestCtx'), `${paint(fmtCtx(best.ctx), 'cyan', 'bold')}` +
+      L.push(row(t('t.bestCtx'), `${paint(fmtCtx(best.ctx), best.tight ? 'yellow' : 'cyan', 'bold')}` +
         paint(t('t.bestCtxNote', { need: fmtGB(best.need), limit: fmtGB(limit) }), 'dim')))
+      // 表格里那一行有「△ 接近上限」，但结论行才是用户真正会照抄的数字。
+      // 99% 占用在 8 GB 卡上基本等于「启动就 OOM」，不能只在表格里标个小三角。
+      if (best.tight) L.push(sub(t('t.bestTight')))
       if (meta.contextLength && best.ctx < meta.contextLength) {
         L.push(sub(t('t.canGoHigher', { n: fmtCtx(meta.contextLength) })))
       }
@@ -540,7 +586,9 @@ function render(meta, hw, result, opts = {}) {
     }
     // MoE 能把专家塞内存时，合并后全放显存通常更快 —— 与其让用户自己拼旗标，
     // 这里直接给一条能抄的命令。带宽未知时不给速度，但显存/内存的差别是结构性的。
-    if (moe?.canOffload && mergedViable && mg.devices?.length) {
+    // preferMerged 时这一段不写命令：报告末尾的「启动参数建议」就是这一套，
+    // 同一份报告里出现两条一模一样的命令行，用户会以为是两种方案。
+    if (moe?.canOffload && mergedViable && mg.devices?.length && !preferMerged) {
       L.push(row(t('f.mergedLaunch'),
         cyan(`-dev ${mg.devices.join(',')} -sm layer -ngl 999 -c ${mergedResult.best.ctx}`)))
       L.push(note(t('f.mergedFaster')))
@@ -551,7 +599,7 @@ function render(meta, hw, result, opts = {}) {
   // ── 启动参数建议：把上面的结论翻译成可照抄的 llama.cpp 旗标。
   // 单卡一档上下文都放不下、但多卡合起来能跑时，给的是合并的那套旗标 ——
   // 只报「-ngl 999」会让人以为单卡就能跑，照着抄必然 OOM。
-  const useMerged = !singleViable && mergedViable
+  const useMerged = mergedViable && (!singleViable || preferMerged)
   const launchSrc = useMerged ? mergedResult : result
   const launch = launchArgsOf(meta, launchSrc, {
     kvType: opts.kvType,
@@ -567,7 +615,7 @@ function render(meta, hw, result, opts = {}) {
     for (const a of launch) {
       L.push(`    ${paint(dpad(a.flag, flagW), 'cyan')}${t(a.whyKey, a.args ?? {})}`)
     }
-    L.push(note(t(useMerged ? 'la.noteMerged' : 'la.note')))
+    L.push(note(t(useMerged ? (preferMerged ? 'la.noteFaster' : 'la.noteMerged') : 'la.note')))
   }
 
   // ── 参数与假设：结论旁边就写清楚它是怎么算出来的
@@ -971,6 +1019,41 @@ async function visionExtra(mmproj, { jsonOut = false } = {}) {
   }
 }
 
+/**
+ * 给附加件找配对的主模型。
+ *
+ * mmproj 的命名里本来就有主模型名（`xxx-Q4_K_M-mmproj.gguf` 对应 `xxx-Q4_K_M.gguf`），
+ * 草稿件则是加了前缀（`mtp-xxx.gguf` 对应 `xxx.gguf`）。先按命名直接找，找不到
+ * 再按「前几段共同词干」在目录里扫一遍 —— 命名不规范时也能给出个候选。
+ * 找不到就返回 null，报告里明说「自己挂到实际用的主模型上」，不瞎猜。
+ */
+async function findPair(file) {
+  if (!file || isUrlLike(file)) return null
+  const abs = path.resolve(file)
+  const dir = path.dirname(abs)
+  const base = path.basename(abs)
+  const cands = []
+  if (/-mmproj\.gguf$/i.test(base)) cands.push(base.replace(/-mmproj\.gguf$/i, '.gguf'))
+  if (/^mtp-/i.test(base)) cands.push(base.replace(/^mtp-/i, ''))
+  for (const c of cands) {
+    try {
+      const st = await fs.stat(path.join(dir, c))
+      if (st.isFile()) return c
+    } catch { /* 继续试下一个 */ }
+  }
+  // 词干兜底：`mtp-gemma-4-E4B-it-Artemis-Q4_0.gguf` 的实际主模型叫
+  // `gemma-4-E4B_q4_0-it.gguf`，名字对不上但前 3 段（gemma-4-E4B）一致
+  const stem = base.replace(/^mtp-/i, '').split(/[-_]/).slice(0, 3).join('-')
+  if (stem.length < 6) return null
+  try {
+    const names = await fs.readdir(dir)
+    const hit = names.filter((n) => /\.gguf$/i.test(n) && n !== base &&
+      !/mmproj/i.test(n) && n.toLowerCase().replace(/[-_]/g, '-').startsWith(stem.toLowerCase()))
+    if (hit.length === 1) return hit[0]
+  } catch { /* 目录读不到就算了 */ }
+  return null
+}
+
 /** 逐个文件出报告；返回每一项（含失败项），便于上层决定退出码 */
 async function runChecks(files, { jsonOut = false, kvType = 'f16', hw = makeHardware(), mmproj = null, budget = 'static' } = {}) {
   const results = []
@@ -1007,7 +1090,10 @@ async function runChecks(files, { jsonOut = false, kvType = 'f16', hw = makeHard
         ? assess(meta, mg.hw, { kvType, weightsBytes, extraBytes: extra.bytes, budget })
         : null
       results.push({ meta, result, extra, visionFit, hw, mg, combined })
-      if (!jsonOut) console.log(render(meta, hw, result, { kvType, extra, visionFit, budget, weightsBytes }))
+      if (!jsonOut) {
+        const pair = meta.isVision || meta.isAssistant ? await findPair(meta.file) : null
+        console.log(render(meta, hw, result, { kvType, extra, visionFit, budget, weightsBytes, pair }))
+      }
     } catch (err) {
       results.push({ file: f, error: err.message })
       if (!jsonOut) {
@@ -1047,9 +1133,20 @@ function toJson(results) {
     const { meta, result } = r
     const shard = shardInfo(meta.file)
     const totalBytes = totalWeightsBytes(meta)
+    // 附加件没有可评估的上下文档位与速度：tiers / genTokPerSec 给 null/[]，
+    // 让消费方按 kind 走另一条分支，而不是把 6 档全 ✓ 的空表渲染出来。
+    const isAttachment = Boolean(meta.isVision || meta.isAssistant)
     // 和终端报告同一套判断：单卡连一档上下文都装不下、多卡合并能跑时，
     // JSON 里的 launchArgs 也要给多卡那套，否则脚本拿到的是照抄就 OOM 的旗标。
-    const splitAcrossGpus = Boolean(
+    // 单卡只能「专家放内存」而合并全放显存更快时，同样给合并那套 ——
+    // 终端给快的那条、JSON 给慢的那条，是最难查的一类不一致。
+    const mergedSpeed = r.combined?.speed?.onVram
+    const preferMerged = Boolean(
+      r.combined?.estimated && r.combined.weightsFit && r.combined.best &&
+      result.moe?.canOffload && Number.isFinite(mergedSpeed) &&
+      (!Number.isFinite(result.speed?.onRam) || mergedSpeed > result.speed.onRam * 1.15)
+    )
+    const splitAcrossGpus = preferMerged || Boolean(
       r.combined?.estimated && r.combined.weightsFit && r.combined.best &&
       !result.best && !result.moe?.canOffload
     )
@@ -1058,12 +1155,16 @@ function toJson(results) {
       file: meta.file,
       name: meta.name,
       arch: meta.arch,
+      // 附加件（mmproj / MTP 草稿）不是模型：调用方看到 kind 就该换个界面分支，
+      // 而不是拿 tiers / genTokPerSec 去渲染一张空表。
+      kind: meta.isVision ? 'vision' : meta.isAssistant ? 'draft' : 'model',
       sizeBytes: meta.sizeBytes,
       // 分片模型：sizeBytes 是第 1 片，weightsBytes 才是按片数折算后的整体
       shard: shard ? { index: shard.index, total: shard.total } : null,
       weightsBytes: totalBytes,
       quant: quantFromName(meta.file),
-      params: paramCountOf(meta.file, meta.paramCount) ?? null,
+      // 投影件的文件名继承自主模型（`…12b…-mmproj.gguf`），从里面猜 12B 是纯误导
+      params: meta.isVision ? null : paramCountOf(meta.file, meta.paramCount) ?? null,
       layers: meta.blockCount ?? null,
       headCount: meta.headCount ?? null,
       headKv: meta.headKv ?? null,
@@ -1093,8 +1194,8 @@ function toJson(results) {
         bandwidthGBps: x.bandwidthGBps ?? null,
         kind: x.kind ?? 'discrete'
       })),
-      /** 多卡合并评估；单卡时为 null。显存池=各卡之和，速度按最弱卡粗估 */
-      combined: r.mg?.merged ? {
+      /** 多卡合并评估；单卡或附加件时为 null。显存池=各卡之和，速度按最弱卡粗估 */
+      combined: !isAttachment && r.mg?.merged ? {
         cards: r.mg.cards,
         poolBytes: r.mg.hw.gpus[0].totalBytes,
         weakest: r.mg.weakestName,
@@ -1128,22 +1229,28 @@ function toJson(results) {
        * （ratio 0.994），明明一毫米余量，还是照样推荐、照样按它启动，
        * 装不下再花 10 秒重载降档。beyondNative 同理，界面要能说明「这档是 RoPE 外推」。
        */
-      tiers: result.rows.map((x) => ({
+      tiers: isAttachment ? [] : result.rows.map((x) => ({
         ctx: x.ctx,
         needBytes: x.need,
         fits: x.fits,
         tight: x.tight === true,
         beyondNative: x.beyondNative === true
       })),
-      recommendedCtx: result.best?.ctx ?? null,
+      recommendedCtx: isAttachment ? null : result.best?.ctx ?? null,
       estimated: result.estimated !== false,
       bandwidth: result.speed?.bandwidth ?? null,
       // 速度口径见 speedBasis：零上下文、batch=1、权重驻留显存时的解码峰值。
       // 封顶按速度口径的权重（MoE = 激活权重），与命令行/网页封顶同一个数。
-      genTokPerSec: jsonSpeed(result.speed?.onVram, result.speed?.basisBytes ?? totalBytes),
-      genTokPerSecOnCpu: jsonSpeed(result.speed?.onRam, result.speed?.basisBytes ?? totalBytes),
+      genTokPerSec: isAttachment
+        ? null
+        : jsonSpeed(result.speed?.onVram, result.speed?.basisBytes ?? totalBytes),
+      genTokPerSecOnCpu: isAttachment
+        ? null
+        : jsonSpeed(result.speed?.onRam, result.speed?.basisBytes ?? totalBytes),
       // 按建议上下文补上 KV cache 读取代价后的折减值，用来解释峰值与实测的差距
-      genTokPerSecAtCtx: jsonSpeed(result.speed?.atCtx, result.speed?.basisBytes ?? totalBytes),
+      genTokPerSecAtCtx: isAttachment
+        ? null
+        : jsonSpeed(result.speed?.atCtx, result.speed?.basisBytes ?? totalBytes),
       speedCtx: result.speed?.atCtxTokens ?? null,
       speedBasis: 'zero-context-decode-peak',
       /**
@@ -1169,10 +1276,13 @@ function toJson(results) {
         offloadLayers: result.moe.offloadLayers
       } : null,
       /** llama.cpp 启动旗标建议（结构化，供界面直接拼命令行） */
-      launchArgs: launchArgsOf(meta, launchTarget, {
-        kvType: r.kvType,
-        merged: splitAcrossGpus ? { devices: r.mg?.devices } : null
-      }),
+      // 附加件给不出「怎么跑主模型」的旗标，空数组比一组误导性的 -ngl 999 好
+      launchArgs: meta.isVision || meta.isAssistant
+        ? []
+        : launchArgsOf(meta, launchTarget, {
+          kvType: r.kvType,
+          merged: splitAcrossGpus ? { devices: r.mg?.devices } : null
+        }),
       /** 上面那套旗标是不是多卡按层切分（单卡放不下、合并能跑时才为 true） */
       splitAcrossGpus,
       verdict: verdictOf(meta, result),

@@ -44,7 +44,8 @@ CLI --about
 
 | 字段 | 含义 |
 | --- | --- |
-| `verdict` | `agent-ready` / `runs-only` / `not-recommended` / `unknown`（元数据不全，≠ 跑不动） |
+| `kind` | `model` / `vision`（mmproj 投影件）/ `draft`（MTP 草稿件）。后两者不是能单独加载的模型 |
+| `verdict` | `agent-ready` / `runs-only` / `not-recommended` / `unknown`（元数据不全，≠ 跑不动）/ `vision-projector` / `draft-model` |
 | `recommendedCtx` | 装得下且 ≤ 原生上下文的最大档；`null` = 一档都不行。配 `tiers[]`（`ctx`/`needBytes`/`fits`）看边界 |
 | `budget.limitBytes` / `basis` | 显存上限及算法来源（Windows WDDM / Linux / macOS 规则不同） |
 | `gpu` / `cpuOnly` | 探到的显卡 / 是否退化为 CPU 推理 |

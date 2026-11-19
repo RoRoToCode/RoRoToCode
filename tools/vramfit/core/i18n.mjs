@@ -26,6 +26,16 @@ export const LOCALES = ['zh', 'en']
  */
 const DICT = {
   // ── 结论（core/assess.mjs headlineOf）
+  // 附加件（视觉投影件 / 推测解码草稿）不是「模型」，走这两条结论，
+  // 免得一份 77 MB 的草稿件被报成「128K 装得下、可以当 agent 用」。
+  'hl.vision.title': ['这是视觉投影件，不能单独运行', 'This is a vision projector, not a model'],
+  'hl.vision.short': ['投影件', 'projector'],
+  'hl.vision.why': ['mmproj 只给主模型加「看图」能力，单独加载会失败；显存另算 {s}',
+    'mmproj only adds vision to a main model; loading it alone fails. Adds {s} of VRAM'],
+  'hl.draft.title': ['这是推测解码草稿件，不能单独运行', 'This is a draft model, not a standalone one'],
+  'hl.draft.short': ['草稿件', 'draft'],
+  'hl.draft.why': ['MTP 草稿用来加速主模型，必须搭配同系列主模型；显存另算 {s}',
+    'An MTP draft only speeds up a main model and needs its pair; adds {s} of VRAM'],
   'hl.unknown.title': ['算不出来', "Can't estimate"],
   'hl.unknown.short': ['算不出', "can't estimate"],
   'hl.unknown.why': ['模型里缺 block_count / head_count / embedding_length，只剩权重体积可信',
@@ -81,6 +91,8 @@ const DICT = {
     'a starting point from this check; adjust until it loads without OOM'],
   'la.noteMerged': ['单卡放不下，以上是合并多卡的起点；-dev 编号以本机 device 为准',
     'single GPU is too small; these split across GPUs, check -dev numbering locally'],
+  'la.noteFaster': ['单卡把专家放内存只有上面那个慢速档；这套合并全放显存更快，-dev 编号以本机 device 为准',
+    'experts in RAM is the slow path; this keeps all weights in VRAM, check -dev numbering'],
 
   // ── 对话模板分析（core/assess.mjs analyzeTemplate）
   'tpl.none': ['模型内没有 chat_template', 'No chat_template in the model'],
@@ -157,11 +169,33 @@ const DICT = {
   'f.moe': ['MoE', 'MoE'],
   'f.moeExperts': ['{n} 专家 · 每 token 激活 {u}', '{n} experts · {u} active/token'],
   'f.moeParams': [' · 约 {p}B 激活', ' · ~{p}B active'],
+
+  // ── 附加件（mmproj / MTP 草稿）：不能单独跑，报告只讲「怎么配、额外占多少」
+  's.attach': ['怎么用', 'How to use'],
+  'f.kind': ['类型', 'Kind'],
+  'f.pair': ['主模型', 'Main model'],
+  'f.attachFlag': ['旗标', 'Flag'],
+  'a.vision.kind': ['视觉投影件 · CLIP', 'vision projector · CLIP'],
+  'a.draft.kind': ['推测解码草稿 · MTP', 'draft model · MTP'],
+  'a.vision.flag': ['--mmproj <本文件>', '--mmproj <this file>'],
+  'a.draft.flag': ['-md <本文件>', '-md <this file>'],
+  'a.extra.vision': ['额外占 {s} 显存（投影器 {w} + 图像编码缓冲 {o}）',
+    'adds {s} of VRAM ({w} projector + {o} vision buffers)'],
+  'a.extra.draft': ['额外占 {s} 显存，主模型的结论要按「主模型 + {s}」重算',
+    'adds {s} of VRAM; re-check the main model with {s} on top'],
+  'a.vision.noKv': ['它自身没有 KV cache，上下文与速度都取决于主模型',
+    'It has no KV cache of its own; context and speed come from the main model'],
+  'a.draft.note': ['只有猜中才提速，猜错要回退；收益取决于任务，别按翻倍估',
+    'Only guesses that hit speed things up; misses roll back. Do not expect 2x'],
+  'a.noPair': ['同目录里没找到明显配对的主模型，把上面的旗标挂到你实际用的那个上',
+    'No obvious main model in this folder; attach the flag above to the one you use'],
   'f.attention': ['注意力', 'Attention'],
   'f.kvLayers': ['{kl}/{rl} 层带 KV cache', '{kl}/{rl} layers carry KV cache'],
   'f.mixedInferred': ['元数据未声明 full_attention_interval，按 {i} 层 1 层 full attention 推断',
     'full_attention_interval not declared; assuming 1 full-attention layer per {i}'],
   'f.mixedExplicit': ['每 {i} 层 1 层 full attention', '1 full-attention layer per {i}'],
+  'f.mixedPerLayer': ['混合架构 · 层数取自逐层 head_count_kv（0 = 该层不带 KV）',
+    'Hybrid arch · per-layer head_count_kv (0 = no KV on that layer)'],
   'f.mixedNote': ['混合架构 · {how} · KV 增长远小于同规模纯注意力模型',
     'Hybrid arch · {how} · KV grows far slower than a pure-attention model of the same size'],
 
@@ -275,6 +309,9 @@ const DICT = {
   't.tight': ['  接近上限', '  near ceiling'],
   't.bestCtx': ['建议上下文', 'Suggested ctx'],
   't.bestCtxNote': ['（{need} / 上限 {limit}）', ' ({need} / ceiling {limit})'],
+  // 建议档贴着上限时必须跟着一句：不然用户拿着 99% 占用的数字去启动，OOM 了只会觉得工具算错
+  't.bestTight': ['贴近上限，碎片或驱动保留量可能让它加载失败，退一档更稳',
+    'Near the ceiling: fragmentation may still OOM, one tier down is safer'],
   't.canGoHigher': ['原生支持 {n}，还能往上开，但显存不够', 'Native context is {n}, so you could go higher — but VRAM will not stretch'],
   't.nativeShort': ['⚠ 原生上下文太短', '⚠ Native context too short'],
   't.nativeShortNote': ['只有 {n}，长文件塞不进去，只能当玩具或做微调基座', 'Only {n} — long files will not fit; a toy, or a base for fine-tuning'],

@@ -179,22 +179,24 @@ export class Cursor {
   }
 
   /**
-   * 读数值数组的第一个元素。
-   * 关键：`{arch}.attention.head_count_kv` 在很多模型里是逐层数组（Llama3 / Qwen2
-   * 每层 GQA 比例不同），不读出来就会把 KV cache 按 MHA 算，显存被高估一倍以上。
+   * 读数值数组的逐个元素（只给 `head_count_kv` 这类逐层数组用，长度 = 层数）。
+   *
+   * 只取第一个元素是不够的：LFM2/LFM3 这类「卷积层 + 注意力层」交替的混合架构，
+   * 卷积层的 head_count_kv 写的是 0，首层正好是卷积层 —— 取第一个就把整个模型
+   * 判成「没有 KV 头、算不出来」，而实际上有一半层带 KV。
    */
-  async firstNumOfArray() {
+  async numArray(limit = 4096) {
     const elem = await this.u32()
     const count = await this.u64()
     const sz = FIXED_SIZE[elem]
-    if (sz === undefined || count === 0 || count > 100_000) {
+    if (sz === undefined || count === 0 || count > limit) {
       this.pos -= 12
       await this.skipValue(T.ARRAY)
       return null
     }
-    const first = await this.num(elem)
-    this.skip(sz * (count - 1))
-    return first
+    const out = []
+    for (let i = 0; i < count; i++) out.push(await this.num(elem))
+    return out
   }
 }
 
@@ -237,7 +239,8 @@ export async function parseGguf(fh, size, label = '') {
         const v = await c.firstStringOfArray()
         if (v) kv.set(key, v.replace(/\u0000+$/g, ''))
       } else if (/\.attention\.head_count_kv$/.test(key)) {
-        const v = await c.firstNumOfArray()
+        // 逐层数组：留存整条，后面取「最大值」当 KV 头数、「非零个数」当真正带 KV 的层数
+        const v = await c.numArray()
         if (v !== null) kv.set(key, v)
       } else {
         await c.skipValue(type)
@@ -275,10 +278,30 @@ export async function parseGguf(fh, size, label = '') {
     return typeof v === 'number' ? v : undefined
   }
 
-  // head_count_kv 可能是数组（逐层不同），取第一个
+  // head_count_kv 可能是逐层数组（Llama3/Qwen2 每层 GQA 比例不同，
+  // LFM2/3 这种「卷积层 + 注意力层」交替的架构则有一半写成 0）。
+  // 头数取数组最大值，同时记下「非零层数」—— 那才是真正要分配 KV cache 的层数。
+  // 只看第一个元素会把混合架构判成没有 KV 头，整份报告退化成「算不出来」。
   const headCount = pick('attention.head_count')
-  const headKv = pick('attention.head_count_kv') ?? headCount
+  const kvRaw = kv.get(`${arch}.attention.head_count_kv`)
+  const kvArr = Array.isArray(kvRaw) ? kvRaw.filter((x) => typeof x === 'number') : null
+  const headKv = kvArr && kvArr.length
+    ? Math.max(...kvArr)
+    : (typeof kvRaw === 'number' ? kvRaw : headCount)
+  // 数组里出现 0，说明确实有层不带 KV（卷积 / 线性注意力）；全是 0 就当没给
+  const kvLayerCount = kvArr && kvArr.length && headKv > 0
+    ? kvArr.filter((x) => x > 0).length
+    : undefined
   const embd = pick('embedding_length')
+  // 视觉投影件（mmproj）：arch 是 clip，带 has_vision_encoder，没有 block_count。
+  // 它不能单独加载，只能作为主模型的附加件 —— 当成普通模型体检会给出荒谬结论
+  // （0.16 GB 的文件被报成 12B 参数、128K 上下文装得下）。
+  const isVision = arch === 'clip' || Boolean(kv.get('clip.has_vision_encoder'))
+  // 推测解码草稿件（MTP / assistant）：arch 带 -assistant 后缀，或所有层都是 MTP 层。
+  // 同理不能单独跑，必须和主模型一起用（llama.cpp 的 -md）。
+  const isAssistant = /-assistant$/i.test(arch) ||
+    (typeof pick('nextn_predict_layers') === 'number' &&
+      pick('nextn_predict_layers') === pick('block_count'))
 
   // 混合线性注意力（Mamba / Gated DeltaNet）的判据。
   // 光看 full_attention_interval 不够：Qwen3-Next 这类模型的 GGUF 里根本没有这个键，
@@ -303,6 +326,11 @@ export async function parseGguf(fh, size, label = '') {
     blockCount: pick('block_count'),
     headCount,
     headKv,
+    // 真正带 KV cache 的层数（逐层 head_count_kv 里的非零个数）；与 blockCount 相等时不返回
+    kvLayerCount: kvLayerCount !== undefined && kvLayerCount !== pick('block_count') ? kvLayerCount : undefined,
+    // 附加件（不是独立模型）：视觉投影件 / 推测解码草稿
+    isVision,
+    isAssistant,
     embdLength: embd,
     contextLength: pick('context_length') ?? pick('context_length_train'),
     keyLength: pick('attention.key_length'),

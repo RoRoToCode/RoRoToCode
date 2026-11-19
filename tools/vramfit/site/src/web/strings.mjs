@@ -107,6 +107,26 @@ const DICT = {
   'rp.tier.no': { zh: '不够', en: "Won't fit" },
   'rp.tier.beyond': { zh: '超出原生', en: 'Past native' },
 
+  // ── 报告：附加件（mmproj / MTP 草稿）──
+  // 这类文件不是模型，没有档位表也没有速度，界面必须换成「怎么配」而不是硬塞一张空表
+  'rp.attach.title': { zh: '这不是能单独加载的模型', en: 'Not a standalone model' },
+  'rp.attach.vision': {
+    zh: '视觉投影件（mmproj）：只给主模型加「看图」能力，单独加载会直接失败',
+    en: 'Vision projector (mmproj): only adds image input to a main model; loading it alone fails'
+  },
+  'rp.attach.draft': {
+    zh: '推测解码草稿（MTP）：只用来给主模型加速，必须搭配同系列主模型',
+    en: 'MTP draft: only speeds up a main model and needs its pair'
+  },
+  'rp.attach.flag': { zh: '加载方式', en: 'How to load' },
+  'rp.attach.visionFlag': { zh: '--mmproj <本文件>', en: '--mmproj <this file>' },
+  'rp.attach.draftFlag': { zh: '-md <本文件>', en: '-md <this file>' },
+  'rp.attach.extra': { zh: '额外占显存 {s}', en: 'Extra VRAM {s}' },
+  'rp.attach.noKv': {
+    zh: '它自身没有 KV cache，上下文与速度都取决于主模型 —— 请对主模型做体检。',
+    en: 'No KV cache of its own; context and speed come from the main model — check that one instead.'
+  },
+
   // ── 报告：信息行 ──
   'rp.info.arch': { zh: '架构', en: 'Architecture' },
   'rp.info.params': { zh: '参数量', en: 'Parameters' },

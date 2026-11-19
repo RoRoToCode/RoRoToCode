@@ -285,3 +285,34 @@ test('网页报告：语言跟着页面走，界面与结论必须同一种语�
   assert.ok(buildView(meta, assess(meta, hw, {}), {}).verdict.title.includes('可以当')
     || buildView(meta, assess(meta, hw, {}), {}).verdict.title.includes('能跑'), '结论不是中文')
 })
+
+// ───────────────────────── 附加件（mmproj / MTP 草稿）─────────────────────────
+
+test('网页报告：视觉投影件不能渲染成「12B 模型」，也不给档位表', () => {
+  const mmproj = {
+    file: 'gemma-4-12b-it-Q4_K_M-mmproj.gguf', sizeBytes: 175115840, arch: 'clip',
+    name: 'Gemma-4-12B-It', tensorCount: 11, isVision: true
+  }
+  const r = assess(mmproj, hw, { weightsBytes: mmproj.sizeBytes })
+  const v = buildView(mmproj, r, {})
+  assert.match(v.verdict.title, /视觉投影件/, '结论要说清楚它不是模型')
+  assert.equal(v.params, '—', '不能从主模型名里猜出 12B')
+  assert.deepEqual(v.tiers, [], '投影件没有上下文档位')
+  assert.equal(v.speed, null, '不该报一个假的速度')
+  const html = renderView(v)
+  assert.doesNotMatch(html, /12\.00B/)
+})
+
+test('网页报告：MTP 草稿件给的是「不能单独运行」，不是「可以当 agent 用」', () => {
+  const draft = {
+    file: 'mtp-gemma-4-E4B-it-Artemis-Q4_0.gguf', sizeBytes: 76979616,
+    arch: 'gemma4-assistant', blockCount: 4, headCount: 4, headKv: 2,
+    embdLength: 256, contextLength: 131072, tensorCount: 49,
+    chatTemplate: '{% if tools %}<tool_call>{% endif %}', isAssistant: true
+  }
+  const r = assess(draft, hw, { weightsBytes: draft.sizeBytes })
+  const v = buildView(draft, r, {})
+  assert.match(v.verdict.title, /草稿件/)
+  assert.doesNotMatch(v.verdict.title, /agent/)
+  assert.deepEqual(v.tiers, [])
+})

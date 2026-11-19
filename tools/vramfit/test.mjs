@@ -34,7 +34,7 @@ import {
   TUNING, ASSUMPTIONS, KV_BYTES_PER_ELEM, VALUE_FLAGS, setMirror, getMirror, DEFAULT_MIRROR, OFFICIAL,
   setLocale, getLocale, detectLocale, t, dictStats, bothLangs, labelWidth, assumptionsList, localeOf,
   speedCapFor, assumptionLines, mergedHardware, moeInfo, activeParamsFromName, launchArgsOf, isMla,
-  paramCountOf
+  paramCountOf, verdictOf
 } from './core/index.mjs'
 import { appleWorkingSet, gpuBandwidth } from './cli/hardware.mjs'
 
@@ -1183,6 +1183,16 @@ test('MoE 合计判定：显存放不下但 RAM 够 → combinedFit / canOffload
   assert.ok(Math.abs(r.moe.usableRam - 32 * GB * TUNING.moeRamFactor) < 1)
 })
 
+test('结论一致性：MoE 靠专家放内存能跑时，verdict 不能说「跑不动」', () => {
+  // 以前 verdictOf 只看 weightsFit/best：报告抬头写「能跑，但专家要放内存」，
+  // JSON 却给 not-recommended，照 JSON 做界面的会说反话。
+  const r = assess(metaBigMoe, hw8Ram32, { weightsBytes: 16.04e9 })
+  assert.equal(r.moe.canOffload, true)
+  assert.equal(r.best, null, '单卡确实一档上下文都没有（权重都装不下）')
+  assert.notEqual(verdictOf(metaBigMoe, r), 'not-recommended')
+  assert.match(headlineOf(metaBigMoe, r).title, /专家|offload/)
+})
+
 test('MoE 合计判定：RAM 也不够时 combinedFit=false，不误导', () => {
   const tinyRam = { ...hw8Ram32, ramBytes: 4 * GB }
   const r = assess(metaBigMoe, tinyRam, { weightsBytes: 16.04e9 })
@@ -1219,6 +1229,38 @@ test('启动参数：MoE offload 场景给 -ngl / --n-cpu-moe / -c', () => {
   assert.ok(row.launchArgs.length >= 3)
   assert.equal(row.moe.canOffload, true)
   assert.equal(row.moe.offloadLayers, r.moe.offloadLayers)
+})
+
+test('启动参数：单卡靠专家放内存、合并全放显存更快时，末尾给合并那条', () => {
+  // 双卡机器上同样的 MoE：合并后 16 GB 全进显存，比专家读内存快一个档。
+  // 这时候终端末尾的「启动参数建议」和 JSON 的 launchArgs 都必须是合并那一套 ——
+  // 用户只抄最后一段，给慢的那条等于让 74 tok/s 白写在上面。
+  const hwTwo = {
+    ...hw8Ram32,
+    gpus: [
+      { name: 'RTX 2080', totalBytes: 8 * GB, usedBytes: 0.85 * GB, bandwidthGBps: 448, backend: 'cuda' },
+      { name: 'P104-100', totalBytes: 8 * GB, usedBytes: 0, bandwidthGBps: 320, backend: 'cuda' }
+    ]
+  }
+  // 11.29 GB：单卡 7.52 GB 上限装不下，合并池 15.04 GB 正好放得下
+  const moe = { ...metaBigMoe, file: 'L3.2-8X4B-MOE-21B-Q4_k_s.gguf', sizeBytes: 11.29e9, paramCount: 21e9 }
+  const r = assess(moe, hwTwo, { weightsBytes: 11.29e9 })
+  const mg = mergedHardware(hwTwo)
+  const merged = assess(moe, mg.hw, { weightsBytes: 11.29e9 })
+  assert.equal(r.moe.canOffload, true, '单卡走专家放内存')
+  assert.ok(merged.weightsFit && merged.best, '合并后全放显存')
+  assert.ok(merged.speed.onVram > r.speed.onRam * 1.15, '合并确实快得多')
+
+  const out = render(moe, hwTwo, r, { kvType: 'f16', budget: 'static' })
+  const launch = out.slice(out.indexOf('启动参数建议'))
+  assert.match(launch, /-dev CUDA0,CUDA1/, '末尾命令要给合并')
+  assert.doesNotMatch(launch, /--n-cpu-moe/, '不能再给「专家放内存」那条慢路')
+  // 命令只出现一次：合并评估段里不该再重复一遍
+  assert.equal((out.match(/-dev CUDA0,CUDA1/g) || []).length, 1)
+
+  const row = toJson([{ meta: moe, result: r, combined: merged, mg }])[0]
+  assert.equal(row.splitAcrossGpus, true)
+  assert.ok(row.launchArgs.some((a) => a.flag.startsWith('-dev')), 'JSON 也要给合并')
 })
 
 test('启动参数：dense 与元数据不全场景不出 --n-cpu-moe', () => {
@@ -1569,4 +1611,116 @@ test('交互模式：乱写的语言不改动当前语言', () => {
   }).stdout
   assert.match(out, /没有「war」这个语言/)
   assert.match(out, /检查 > /, '报错后应该还停在中文')
+})
+
+// ── 附加件与逐层 KV 头数
+//
+// 这三个坑都是拿真实模型跑出来的：
+//   LFM3       卷积层 + 注意力层交替，head_count_kv 首层是 0 → 整份报告「算不出来」
+//   mmproj     视觉投影件，文件名继承主模型（…12b…-mmproj.gguf）→ 被报成 12B 模型
+//   MTP 草稿   77 MB 的文件被判成「128K 装得下，可以当 agent 用」
+
+/** 拼一个最小可解析的 GGUF v3（只有元数据，没有张量） */
+function ggufBytes(kvs) {
+  const parts = []
+  const push = (b) => parts.push(b)
+  const u32 = (n) => { const b = new Uint8Array(4); new DataView(b.buffer).setUint32(0, n, true); push(b) }
+  const u64 = (n) => {
+    const b = new Uint8Array(8); new DataView(b.buffer).setBigUint64(0, BigInt(n), true); push(b)
+  }
+  const str = (s) => { const e = new TextEncoder().encode(s); u64(e.length); push(e) }
+  u32(0x46554747); u32(3); u64(0); u64(kvs.length)
+  for (const [key, val] of kvs) {
+    str(key)
+    if (typeof val === 'string') { u32(8); str(val) } else if (Array.isArray(val)) {
+      u32(9); u32(5); u64(val.length) // 9 = ARRAY，5 = INT32
+      for (const n of val) u32(n)
+    } else { u32(5); u32(val) } // 5 = INT32
+  }
+  const total = parts.reduce((n, p) => n + p.length, 0)
+  const out = new Uint8Array(total)
+  let off = 0
+  for (const p of parts) { out.set(p, off); off += p.length }
+  return out
+}
+
+async function writeGguf(kvs) {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'vramfit-gguf-'))
+  const file = path.join(dir, 'probe.gguf')
+  await writeFile(file, ggufBytes(kvs))
+  return { file, dir }
+}
+
+test('逐层 head_count_kv：首层是 0 也要读出 KV 头数与带 KV 的层数', async () => {
+  // LFM3 的真实形态：24 层，卷积层写 0，注意力层写 4
+  const arr = Array.from({ length: 24 }, (_, i) => (i % 2 === 0 ? 0 : 4))
+  const { file, dir } = await writeGguf([
+    ['general.architecture', 'lfm3'],
+    ['lfm3.block_count', 24],
+    ['lfm3.attention.head_count', 16],
+    ['lfm3.attention.head_count_kv', arr],
+    ['lfm3.embedding_length', 2048],
+    ['lfm3.attention.key_length', 128],
+    ['lfm3.attention.sliding_window', 256]
+  ])
+  try {
+    const meta = await readGguf(file)
+    assert.equal(meta.headKv, 4, '取数组最大值，不是第一个元素（第一个是 0）')
+    assert.equal(meta.kvLayerCount, 12, '12 层带 KV，不是 24')
+    assert.equal(kvLayers(meta), 12)
+    // 有 KV 才算得出来：以前 headKv=0 直接返回 null，整份报告退化成「算不出来」
+    const kv = kvBytes(meta, 4096, 'f16')
+    assert.ok(kv > 0, 'KV 必须算得出来，不能被 0 头数拦掉')
+    const r = assess(meta, { gpus: [{ name: 'X', totalBytes: 8 * GB, usedBytes: 0, bandwidthGBps: 400 }] })
+    assert.notEqual(r.estimated, false)
+  } finally { await rm(dir, { recursive: true, force: true }) }
+})
+
+test('视觉投影件：arch=clip 且 has_vision_encoder → 判成 mmproj，不当模型', async () => {
+  const { file, dir } = await writeGguf([
+    ['general.architecture', 'clip'],
+    ['general.name', 'Gemma-4-12B-It'],
+    ['clip.has_vision_encoder', 1]
+  ])
+  try {
+    const meta = await readGguf(file)
+    assert.equal(meta.isVision, true)
+    assert.equal(meta.isAssistant, false)
+    const r = assess(meta, { gpus: [{ name: 'X', totalBytes: 8 * GB, bandwidthGBps: 400 }] })
+    const hd = headlineOf(meta, r)
+    assert.match(hd.title, /视觉投影件/)
+    assert.match(hd.why, /显存另算 0\.\d+ GB/, '要给出额外占多少显存（投影件 + 图像缓冲）')
+    assert.equal(verdictOf(meta, r), 'vision-projector')
+  } finally { await rm(dir, { recursive: true, force: true }) }
+})
+
+test('MTP 草稿：所有层都是 nextn 层 → 判成草稿件，不给 -ngl', async () => {
+  const { file, dir } = await writeGguf([
+    ['general.architecture', 'gemma4-assistant'],
+    ['gemma4-assistant.block_count', 4],
+    ['gemma4-assistant.nextn_predict_layers', 4],
+    ['gemma4-assistant.attention.head_count', 4],
+    ['gemma4-assistant.attention.head_count_kv', 2],
+    ['gemma4-assistant.embedding_length', 256],
+    ['gemma4-assistant.context_length', 131072]
+  ])
+  try {
+    const meta = await readGguf(file)
+    assert.equal(meta.isAssistant, true)
+    const r = assess(meta, { gpus: [{ name: 'X', totalBytes: 8 * GB, bandwidthGBps: 400 }] })
+    const hd = headlineOf(meta, r)
+    assert.match(hd.title, /草稿件/)
+    assert.equal(verdictOf(meta, r), 'draft-model')
+    // 77 MB 的草稿件绝不能再出现「可以当 agent 用」或 -ngl 999
+    const out = render(meta, { gpus: [{ name: 'X', totalBytes: 8 * GB, bandwidthGBps: 400 }] }, r, {})
+    assert.doesNotMatch(out, /-ngl/)
+    assert.match(out, /-md/)
+  } finally { await rm(dir, { recursive: true, force: true }) }
+})
+
+test('参数量：E4B 这类有效参数写法也要认出来', () => {
+  assert.equal(paramCountOf('gemma-4-E4B_q4_0-it.gguf'), 4e9)
+  // 8X4B 仍然不能被当成总参数（这是「8 专家 × 4B」，总参数 21B）
+  assert.equal(paramCountOf('L3.2-8X4B-MOE-21B-Q4_k_s.gguf'), 21e9)
+  assert.equal(paramCountOf('Mixtral-8x7B-Instruct-Q4_K_M.gguf'), undefined)
 })

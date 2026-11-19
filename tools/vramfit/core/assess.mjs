@@ -96,6 +96,11 @@ export function kvLayers(meta) {
   const total = meta.blockCount ?? 0
   if (!total) return 0
   const real = Math.max(1, total - (meta.nextnLayers ?? 0))
+  // 元数据直接给了「哪几层带 KV」（逐层 head_count_kv 里有 0），比按间隔推断准得多：
+  // LFM2/LFM3 是卷积层与注意力层交替，注意力只落在偶数层，任何「每 N 层 1 层」的
+  // 规则都对不上。有这个数就不用再猜。
+  const exact = meta.kvLayerCount
+  if (typeof exact === 'number' && exact > 0 && exact <= real) return exact
   const { interval } = attentionInterval(meta)
   if (interval > 1) return Math.ceil(real / interval)
   return real
@@ -520,11 +525,18 @@ export function attentionReport(meta) {
 
 /** 三档结论，报告和 JSON 共用同一套判据 */
 export function verdictOf(meta, result) {
+  // 附加件不是模型，没有「装不装得下」这回事。单独给一个档，
+  // 免得界面拿 not-recommended 去渲染红色叉 —— 用户会以为文件有问题。
+  if (meta?.isVision || meta?.isAssistant) return meta.isVision ? 'vision-projector' : 'draft-model'
   const tpl = analyzeTemplate(meta.chatTemplate)
   // 元数据缺层数 / head / 隐层维度，KV 一档都算不出来。
   // 这种情况不能报「装不下」—— 用户会去换更小的模型，而真正的问题是文件本身。
   if (result.estimated === false) return 'unknown'
-  if (!result.weightsFit || !result.best) return 'not-recommended'
+  // MoE 把专家放内存也能跑：只看 weightsFit/best 会把它判成「跑不动」，
+  // 而报告抬头上明明写着「能跑，但专家要放内存」。同一个结论不能两个说法 ——
+  // 消费 JSON 的界面会照着 not-recommended 劝用户换模型，其实机器够。
+  const runnable = Boolean(result.best || result.moe?.canOffload)
+  if (!runnable) return 'not-recommended'
   if (!meta.chatTemplate) return 'not-recommended'
   // 与 render 里的 tooSmall 同一条门槛：小于 3B 只算「能跑」，不算 agent 可用
   const p = paramCountOf(meta.file, meta.paramCount)
@@ -546,6 +558,20 @@ export function verdictOf(meta, result) {
  *   bad  → 红色叉，别在这台机器上试
  */
 export function headlineOf(meta, result) {
+  // 附加件先判：它们是「零件」不是「模型」。
+  // 不拦的话，77 MB 的 MTP 草稿件会被判成「128K 装得下、可以当 agent 用」——
+  // 用户照着去加载，llama.cpp 直接报错，工具的公信力就没了。
+  if (meta?.isVision || meta?.isAssistant) {
+    const kind = meta.isVision ? 'vision' : 'draft'
+    const bytes = (meta.sizeBytes ?? 0) +
+      (meta.isVision ? TUNING.visionOverheadBytes : 0)
+    return {
+      level: 'warn',
+      title: t(`hl.${kind}.title`),
+      short: t(`hl.${kind}.short`),
+      why: t(`hl.${kind}.why`, { s: `${(bytes / 1024 ** 3).toFixed(2)} GB` })
+    }
+  }
   const tpl = analyzeTemplate(meta.chatTemplate)
   const p = paramCountOf(meta.file, meta.paramCount)
   const tier = quantTier(quantFromName(meta.file)).tier

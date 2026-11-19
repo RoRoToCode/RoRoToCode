@@ -253,8 +253,15 @@ recorded as free but have been scattered by WDDM paging, so throughput does not 
 
 | Format | Status |
 |---|---|
-| **GGUF** | supported: shards as `first × count`, `mmproj` skipped, quant and template read from metadata |
+| **GGUF** | supported: shards as `first × count`, quant and template read from metadata |
+| **mmproj / MTP draft** | recognised, but never treated as a model: it tells you how to attach it and what VRAM it adds |
 | safetensors / MLX | not supported: a bf16 file isn't what you'd actually run. It says so instead of guessing |
+
+An `mmproj` (vision projector, `arch=clip`) or an `mtp-*.gguf` (speculative-decoding draft,
+`arch=*-assistant`) is not a loadable model. Drop one in and the report says what it is, which
+flag attaches it (`--mmproj` / `-md`), and how much VRAM it costs — instead of turning 0.07 GB
+into a confident "128K fits". If the matching main model sits in the same folder, its name is
+printed in the report.
 
 ## How the numbers are derived
 
