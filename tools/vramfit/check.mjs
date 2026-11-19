@@ -1166,8 +1166,9 @@ function toJson(results) {
       shard: shard ? { index: shard.index, total: shard.total } : null,
       weightsBytes: totalBytes,
       quant: quantFromName(meta.file),
-      // 投影件的文件名继承自主模型（`…12b…-mmproj.gguf`），从里面猜 12B 是纯误导
-      params: meta.isVision ? null : paramCountOf(meta.file, meta.paramCount) ?? null,
+      // 投影件的文件名继承自主模型（`…12b…-mmproj.gguf`），草稿件同理
+      // （`mtp-gemma-4-E4B…` 只有 77 MB）：从名字里猜 12B / 4B 是纯误导，一律置空。
+      params: isAttachment ? null : paramCountOf(meta.file, meta.paramCount) ?? null,
       layers: meta.blockCount ?? null,
       headCount: meta.headCount ?? null,
       headKv: meta.headKv ?? null,
@@ -1261,9 +1262,10 @@ function toJson(results) {
        * 后端未知时 family='unknown'、efficiency 退回 0.7（2080 实测校准点）。
        * 让脚本能解释一个数是怎么来的，而不是只拿到一个孤零零的 tok/s。
        */
-      speedFamily: result.speed?.family ?? null,
-      speedEfficiency: result.speed?.efficiency ?? null,
-      speedBitsPerWeight: result.speed?.bitsPerWeight ?? null,
+      speedFamily: isAttachment ? null : result.speed?.family ?? null,
+      speedEfficiency: isAttachment ? null : result.speed?.efficiency ?? null,
+      // 位宽是从「体积 ÷ 参数量」反推的，附加件这两项都不可信（0.07 GB / 4B → 0.15 bpw）
+      speedBitsPerWeight: isAttachment ? null : result.speed?.bitsPerWeight ?? null,
       /**
        * MoE：速度按激活专家估算，显存仍按全权重。ratio=null 表示拿不到激活数、速度未修正。
        * source: kv = 元数据 expert_used_count；name = 文件名 A22B 兜底；null = 未修正。

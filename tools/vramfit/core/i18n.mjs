@@ -91,8 +91,8 @@ const DICT = {
     'a starting point from this check; adjust until it loads without OOM'],
   'la.noteMerged': ['单卡放不下，以上是合并多卡的起点；-dev 编号以本机 device 为准',
     'single GPU is too small; these split across GPUs, check -dev numbering locally'],
-  'la.noteFaster': ['单卡把专家放内存只有上面那个慢速档；这套合并全放显存更快，-dev 编号以本机 device 为准',
-    'experts in RAM is the slow path; this keeps all weights in VRAM, check -dev numbering'],
+  'la.noteFaster': ['单卡把专家放内存更慢；这套合并全放显存，-dev 编号以本机 device 为准',
+    'experts in RAM is slow; all weights in VRAM here — check -dev numbering'],
 
   // ── 对话模板分析（core/assess.mjs analyzeTemplate）
   'tpl.none': ['模型内没有 chat_template', 'No chat_template in the model'],
@@ -197,7 +197,7 @@ const DICT = {
   'f.mixedPerLayer': ['混合架构 · 层数取自逐层 head_count_kv（0 = 该层不带 KV）',
     'Hybrid arch · per-layer head_count_kv (0 = no KV on that layer)'],
   'f.mixedNote': ['混合架构 · {how} · KV 增长远小于同规模纯注意力模型',
-    'Hybrid arch · {how} · KV grows far slower than a pure-attention model of the same size'],
+    'Hybrid arch · {how} · KV grows slower than dense attention'],
 
   // ── 硬件小节
   's.hw': ['硬件', 'Hardware'],
@@ -265,13 +265,13 @@ const DICT = {
     'static: {p}% of total VRAM, ignores current usage (reproducible)'],
   'f.usedWarn': ['⚠ 有 {n} 被其他程序占用（LM Studio / Ollama / 浏览器都可能）',
     '⚠ {n} is held by other apps (LM Studio / Ollama / a browser)'],
-  'f.usedWarnStatic': ['⚠ 当前有 {n} 被其他程序占用：上面的上限没扣它，但真跑起来会和它抢显存（掉速或加载失败）',
-    '⚠ {n} is held by other apps right now: the ceiling above ignores it, but a real run will compete for it (slower or failed to load)'],
+  'f.usedWarnStatic': ['⚠ 有 {n} 被其他程序占用：上限没扣它，真跑起来会抢显存（掉速或失败）',
+    '⚠ {n} held by other apps: a real run competes (slower or may fail)'],
   'f.swaLine': ['滑窗架构：{full} 层全注意力 + {swa} 层滑窗（窗口 {w}）',
     'Sliding-window arch: {full} full-attention layers + {swa} SWA layers (window {w})'],
-  'f.swaNote': ['层分配比例由架构规则推断，不同层规模组合可能有 ±25% 偏差',
-    'Layer split is inferred from architecture rules; ±25% off for unusual layer mixes'],
-  'f.swaNote2': ['；元数据未给滑窗 head_dim，按 key_length 顶替', '; no SWA head_dim in metadata, using key_length'],
+  'f.swaNote': ['层划分由架构推断（±25%）',
+    'Layer split inferred (±25% for odd mixes)'],
+  'f.swaNote2': ['；滑窗 head_dim 缺失，按 key_length', '; SWA head_dim missing → key_length'],
   'f.slidingOnly': ['该模型用滑窗注意力（{w}），KV 估算偏保守', 'This model uses sliding-window attention ({w}); the KV estimate is conservative'],
 
   // ── 装不下 / 算不出
@@ -355,7 +355,7 @@ const DICT = {
   'v.afterOffload': ['offload 后', 'After offload'],
   'v.muchSlower': ['明显变慢', 'much slower'],
   'v.offloadNote': ['权重能全放显存，但加上上下文就超了，被赶到内存的层按 {bw} GB/s 读',
-    'The weights fit, but context pushes past the ceiling; offloaded layers read at {bw} GB/s'],
+    'Weights fit, but context exceeds the ceiling; offloaded layers read at {bw} GB/s'],
   'v.offloadNote2': ['如果能全放显存可达约 {n} tok/s，但要缩短上下文', 'About {n} tok/s if fully in VRAM, but you must shorten the context'],
   'v.partial': ['部分 offload', 'Partial offload'],
   'v.partialNote': ['权重本身就超出显存，剩余层走系统内存（约 {bw} GB/s）', 'The weights alone exceed VRAM; the rest runs from system RAM (≈ {bw} GB/s)'],

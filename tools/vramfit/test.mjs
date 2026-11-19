@@ -1780,3 +1780,56 @@ test('参数量：E4B 这类有效参数写法也要认出来', () => {
   assert.equal(paramCountOf('L3.2-8X4B-MOE-21B-Q4_k_s.gguf'), 21e9)
   assert.equal(paramCountOf('Mixtral-8x7B-Instruct-Q4_K_M.gguf'), undefined)
 })
+
+// 宽度测试原来只渲染一个人造夹具，而真实模型会走到滑窗混合、显存被占用、MoE 合并
+// 这些「只有真机才触发」的说明行。上线前用 21 个真实文件扫出 146/152 列的英文行，
+// 这里把这些路径固定成用例，避免下次改文案又悄悄撑破 100 列。
+test('英文报告：滑窗混合 / 显存被占用 / MoE 合并的说明行也不超 100 列', () => {
+  const swa = {
+    ...meta8b,
+    file: 'Qwen3-Next-9B-Q4_K_M.gguf', arch: 'qwen3next', name: 'Qwen3-Next-9B',
+    blockCount: 40, headKv: 4, slidingWindow: 512, keyLength: 128
+  }
+  const busy = {
+    gpus: [{ name: 'RTX 2080', totalBytes: 8 * GB, usedBytes: 7.19 * GB, bandwidthGBps: 448, backend: 'cuda' }],
+    ramBytes: 32 * GB, ramBandwidthGBps: 51, osPlatform: 'win32'
+  }
+  const two = {
+    gpus: [
+      { name: 'RTX 2080', totalBytes: 8 * GB, usedBytes: 0, bandwidthGBps: 448, backend: 'cuda' },
+      { name: 'RTX 2080', totalBytes: 8 * GB, usedBytes: 0, bandwidthGBps: 448, backend: 'cuda' }
+    ],
+    ramBytes: 32 * GB, ramBandwidthGBps: 51, osPlatform: 'win32'
+  }
+  const cases = [
+    ['滑窗混合 + 显存被占用', swa, busy, {}],
+    ['MoE 单卡 offload、合并更快', metaBigMoe, two, { weightsBytes: 16.04e9 }]
+  ]
+  for (const [label, meta, hw, opts] of cases) {
+    for (const lang of ['zh', 'en']) {
+      setLocale(lang)
+      const out = render(meta, hw, assess(meta, hw, opts), opts)
+      for (const line of out.split('\n')) {
+        const w = [...line].reduce((n, ch) => n + (/[\u1100-\u115f\u2e80-\ua4cf\uac00-\ud7a3\uf900-\ufaff\ufe30-\ufe6f\uff00-\uff60\uffe0-\uffe6]/.test(ch) ? 2 : 1), 0)
+        assert.ok(w <= 100, `${label} [${lang}] 有 ${w} 列的行：${line}`)
+      }
+    }
+  }
+  setLocale('zh')
+})
+
+test('JSON：附件件不给参数与速度（77 MB 文件不能报 4B / 0.15 bpw）', () => {
+  const draft = {
+    file: 'mtp-gemma-4-E4B-it-Artemis-Q4_0.gguf', sizeBytes: 76979616,
+    arch: 'gemma4-assistant', blockCount: 4, headCount: 4, headKv: 2,
+    embdLength: 256, contextLength: 131072, tensorCount: 49, isAssistant: true
+  }
+  const r = assess(draft, hw8b, { weightsBytes: draft.sizeBytes })
+  const [j] = toJson([{ meta: draft, result: r, combined: null, mg: null }])
+  assert.equal(j.kind, 'draft')
+  assert.equal(j.params, null, '名字里的 4B 是主模型的，不是草稿件的')
+  assert.equal(j.genTokPerSec, null)
+  assert.equal(j.speedBitsPerWeight, null, '0.15 bpw 这种数不该出现在 JSON 里')
+  assert.equal(j.speedFamily, null)
+  assert.deepEqual(j.tiers, [])
+})
