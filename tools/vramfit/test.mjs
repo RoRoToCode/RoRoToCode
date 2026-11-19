@@ -36,7 +36,7 @@ import {
   speedCapFor, assumptionLines, mergedHardware, moeInfo, activeParamsFromName, launchArgsOf, isMla,
   paramCountOf
 } from './core/index.mjs'
-import { appleWorkingSet } from './cli/hardware.mjs'
+import { appleWorkingSet, gpuBandwidth } from './cli/hardware.mjs'
 
 
 // 断言比的是中文字符串，所以测试必须固定语言。
@@ -509,6 +509,13 @@ test('多卡报告：列出所有卡并给出合并评估段', () => {
   }
   assert.ok(zh.includes('16.00 GB'), '中文报告合并池应是 16 GB')
   assert.ok(zh.includes('带宽有卡未收录'), '带宽未知要如实说明')
+})
+
+test('带宽表：矿卡型号也要认，否则多卡合并连速度都估不出来', () => {
+  assert.equal(gpuBandwidth('NVIDIA P104-100'), 320)
+  assert.equal(gpuBandwidth('NVIDIA P106-100'), 192)
+  assert.equal(gpuBandwidth('NVIDIA GeForce RTX 2080'), 448, '消费卡不能被矿卡规则抢走')
+  assert.equal(gpuBandwidth('NVIDIA GeForce RTX 4070 Ti SUPER'), 672, 'ti super 要先于 ti 匹配')
 })
 
 test('多卡合并：-dev 按驱动枚举顺序，--gpu 换序后也不错位', () => {
