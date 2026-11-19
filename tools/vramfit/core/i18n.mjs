@@ -68,6 +68,8 @@ const DICT = {
   // ── 启动参数建议（core/assess.mjs launchArgsOf）—— 旗标不翻，只译「为什么」
   's.launch': ['启动参数建议（llama.cpp）', 'Suggested launch flags (llama.cpp)'],
   'la.nglAll': ['全部层放显存', 'put all layers in VRAM'],
+  'la.nglMoe': ['所有层的注意力与 KV 放显存（专家见下一行）',
+    'attention and KV of every layer in VRAM (experts on the next line)'],
   'la.nglPartial': ['放不下的层退回内存', 'layers that do not fit fall back to RAM'],
   'la.cpuMoe': ['前 {n} 层专家留在系统 RAM，注意力/KV 仍在显存',
     'keep the first {n} expert layers in system RAM; attention/KV stay in VRAM'],
@@ -126,6 +128,8 @@ const DICT = {
     '⚠ Static estimate only — load the model once to be certain'],
   'r.mergedHint': ['但 {n} 块卡合起来能跑，{c} 上下文装得下 —— 见下面的合并评估',
     '{n} GPUs combined can run it at {c} — see the combined check below'],
+  'r.mergedHintMoe': ['也能 {n} 块卡合起来全放显存（{c}），比把专家放内存快 —— 见下面的合并评估',
+    'or pool {n} GPUs to keep it fully in VRAM ({c}) — faster than experts in RAM'],
 
   // ── 模型小节
   's.model': ['模型', 'Model'],
@@ -191,11 +195,17 @@ const DICT = {
   'f.mergedCards': ['{n} 块卡合计', '{n} cards combined'],
   'f.mergedCtx': ['合并后可开', 'Combined max ctx'],
   'f.mergedCan': ['{c}（合并后装得下）', '{c} (fits when combined)'],
+  'f.mergedCanTight': ['{c}（装得下，但贴近上限）', '{c} (fits, near the ceiling)'],
   'f.mergedCant': ['仍装不下（换更小的模型）', 'Still does not fit (try a smaller model)'],
   'f.mergedBasis': ['按最弱卡 {name} 的带宽估速', 'Speed by slowest card {name}'],
   'f.mergedBwUnknown': ['带宽有卡未收录，合并速度无法可靠估算', 'Some card bandwidth unknown; combined speed not reliable'],
   'f.mergedNote': ['一个模型按层切分到这几张卡（-sm layer），显存合计，速度是粗估',
     'Model split by layer across cards (-sm layer); VRAM summed, speed is rough'],
+  'f.mergedLaunch': ['合并启动', 'Combined launch'],
+  'f.mergedTight': ['已贴近上限，碎片和驱动保留量可能让它加载失败，退一档更稳',
+    'Close to the ceiling: fragmentation may still OOM, one tier down is safer'],
+  'f.mergedFaster': ['全放显存比把专家放内存快：每 token 要读的专家换成显存带宽',
+    'Fully in VRAM beats experts in RAM: reads move to VRAM bandwidth'],
 
   // ── 预算小节
   's.budgetVram': ['显存预算', 'VRAM budget'],

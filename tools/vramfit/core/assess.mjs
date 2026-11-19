@@ -664,12 +664,18 @@ export function launchArgsOf(meta, result, opts = {}) {
     out.push({ flag: '-sm layer', whyKey: 'la.sm' })
   }
 
-  // 全权重进显存的层数：装得下就全放，装不下按预算/需求比例给一个保守起点
+  // 全权重进显存的层数：装得下就全放，装不下按预算/需求比例给一个保守起点。
+  // MoE 走 --n-cpu-moe 时不能砍 -ngl：RAM 里放的是那几层的专家 FFN，
+  // 注意力/KV 仍该全上显存。以前两个一起给（-ngl 21 + --n-cpu-moe 15），
+  // 等于又砍掉 11 层注意力，显存闲着、速度白掉一截。
   let ngl = 999
-  if (!result.weightsFit && result.weights > 0 && result.limit > 0) {
+  if (!result.weightsFit && !moe?.canOffload && result.weights > 0 && result.limit > 0) {
     ngl = Math.max(0, Math.min(999, Math.floor(result.limit / result.weights * layers)))
   }
-  out.push({ flag: `-ngl ${ngl}`, whyKey: ngl >= layers && layers > 0 ? 'la.nglAll' : 'la.nglPartial' })
+  out.push({
+    flag: `-ngl ${ngl}`,
+    whyKey: moe?.canOffload && ngl >= layers ? 'la.nglMoe' : (ngl >= layers && layers > 0 ? 'la.nglAll' : 'la.nglPartial')
+  })
 
   // MoE offload：显存放不下但合计够时，把专家挪到 RAM
   if (moe?.canOffload && moe.offloadLayers > 0) {

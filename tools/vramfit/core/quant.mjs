@@ -38,7 +38,10 @@ export function totalWeightsBytes(meta) {
 /** 从文件名猜参数量（B 为单位），仅在没有 general.parameter_count 时用 */
 export function paramsFromName(file) {
   const base = baseName(file).replace(/\.gguf$/i, '')
-  const m = /(?:^|[^a-z0-9])(\d+(?:\.\d+)?)\s*[bB](?![a-zA-Z0-9])/.exec(base)
+  // 前面必须是「非字母数字」，大写字母也算字母：
+  // `L3.2-8X4B-MOE-...-21B-Q4_K_S` 里的 8X4B 是「8 专家 × 4B」，不是总参数；
+  // 旧写法 [^a-z0-9] 会把 X 当成边界，于是 21B 的模型被报成 4B。
+  const m = /(?:^|[^a-zA-Z0-9])(\d+(?:\.\d+)?)\s*[bB](?![a-zA-Z0-9])/.exec(base)
   if (!m) return undefined
   const n = Number(m[1])
   return n > 0 && n < 10000 ? n : undefined

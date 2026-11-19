@@ -33,7 +33,8 @@ import {
 import {
   TUNING, ASSUMPTIONS, KV_BYTES_PER_ELEM, VALUE_FLAGS, setMirror, getMirror, DEFAULT_MIRROR, OFFICIAL,
   setLocale, getLocale, detectLocale, t, dictStats, bothLangs, labelWidth, assumptionsList, localeOf,
-  speedCapFor, assumptionLines, mergedHardware, moeInfo, activeParamsFromName, launchArgsOf, isMla
+  speedCapFor, assumptionLines, mergedHardware, moeInfo, activeParamsFromName, launchArgsOf, isMla,
+  paramCountOf
 } from './core/index.mjs'
 import { appleWorkingSet } from './cli/hardware.mjs'
 
@@ -561,6 +562,7 @@ test('多卡报告：单卡放不下时抬头指向合并，启动参数也换�
     setLocale('zh')
   }
   assert.ok(/合起来能跑/.test(text), '抬头要立刻说「合起来可以」，否则用户去换模型')
+  assert.ok(/贴近上限/.test(text), '12 GB 权重塞 15 GB 合并池是 89%，必须标注贴上限')
   assert.ok(text.includes('-dev CUDA0,CUDA1'), '启动参数要指向合并多卡')
   assert.ok(text.includes('-sm layer'))
   for (const line of text.split('\n')) {
@@ -583,6 +585,56 @@ test('结论文案：权重放得下而上下文放不下时，不能说「权�
     assert.ok(!hd.why.includes('光权重就要'), '权重其实放得下，这句话会自相矛盾')
   } finally {
     setLocale('zh')
+  }
+})
+
+test('文件名参数：8X4B 是「8 专家×4B」，不能盖掉总参数 21B', () => {
+  // 真实案例：L3.2-8X4B-MOE-...-21B-...Q4_k_s 曾把 21B 报成 4.00B，
+  // 于是「11.29 GB 的文件装 4B 参数」自相矛盾，用户会怀疑整份报告
+  assert.equal(paramCountOf('L3.2-8X4B-MOE-V2-Dark-Champion-Inst-21B-uncen-Q4_k_s.gguf') / 1e9, 21)
+  assert.equal(paramCountOf('Mixtral-8x7B-Instruct-v0.1.Q4_K_M.gguf'), undefined,
+    '8x7B 是专家数×专家大小，总参数不在名字里 → 宁可不猜')
+  assert.equal(paramCountOf('Qwen3-8B-Q4_K_M.gguf') / 1e9, 8, '常规名字照旧')
+  assert.equal(paramCountOf('DeepSeek-R1-Distill-Qwen-7B-Q4.gguf') / 1e9, 7)
+})
+
+test('MoE 启动参数：给 --n-cpu-moe 时不能再砍 -ngl', () => {
+  const r = assess(metaBigMoe, hw8Ram32, { weightsBytes: 16.04e9 })
+  const flags = launchArgsOf(metaBigMoe, r).map((a) => a.flag)
+  assert.ok(flags.includes('-ngl 999'), `注意力/KV 仍该全上显存，实际：${flags.join(' ')}`)
+  assert.ok(flags.some((f) => f.startsWith('--n-cpu-moe')), '专家要放内存')
+  // 旧逻辑同时给 -ngl 21 + --n-cpu-moe，等于又砍掉 11 层注意力，显存白闲
+  assert.ok(!flags.some((f) => /^-ngl \d+$/.test(f) && f !== '-ngl 999'))
+})
+
+test('MoE + 多卡：专家放内存能跑时，也要指出合并后是全显存更快', () => {
+  // 11.29 GB / 32 层 / 8 专家，8G 单卡要 offload，8G+8G 合并刚好全放
+  const moe11 = { ...metaBigMoe, file: 'L3.2-8X4B-MOE-21B-Q4_k_s.gguf', sizeBytes: 11.29e9, paramCount: 21e9 }
+  const two = {
+    gpus: [
+      { name: 'RTX-2080', totalBytes: 8 * GB, usedBytes: 0, bandwidthGBps: 448, backend: 'cuda', devIndex: 0 },
+      { name: 'P104-100', totalBytes: 8 * GB, usedBytes: 0, bandwidthGBps: null, backend: 'cuda', devIndex: 1 }
+    ],
+    ramBytes: 32 * GB, ramBandwidthGBps: 51, osPlatform: 'win32', cpu: 'fake'
+  }
+  const r = assess(moe11, two, { budget: 'static' })
+  assert.equal(r.moe.canOffload, true, '前提：单卡要 offload 专家')
+  for (const lang of ['zh', 'en']) {
+    setLocale(lang)
+    let text = ''
+    try {
+      text = render(moe11, two, r, { budget: 'static' })
+    } finally {
+      setLocale('zh')
+    }
+    assert.ok(/-dev CUDA0,CUDA1/.test(text), `${lang} 合并段要给能直接抄的命令`)
+    assert.ok(text.includes('-sm layer'))
+    // 标签占满列宽时值不能贴上去（曾经渲染成「部分 offload约 12 tok/s」）
+    assert.ok(!/offload约|offload~/.test(text), `${lang} 速度和标签粘在一起了`)
+    for (const line of text.split('\n')) {
+      const w = [...line].reduce((n, c) => n + (/[\u1100-\u115f\u2e80-\ua4cf\uac00-\ud7a3\uf900-\ufaff\ufe30-\ufe6f\uff00-\uff60\uffe0-\uffe6]/.test(c) ? 2 : 1), 0)
+      assert.ok(w <= 100, `${lang} 有 ${w} 列的行：${line}`)
+    }
   }
 })
 

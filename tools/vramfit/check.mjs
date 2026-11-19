@@ -155,7 +155,10 @@ function render(meta, hw, result, opts = {}) {
   // 标签列宽跟着语言走：中文 6 个字 = 12 列，英文单词更长要 14。
   // 写死 12 的话 "Native ctx" 会把值挤到下一列，整张表歪掉。
   const LW = labelWidth()
-  const row = (label, value) => `    ${paint(dpad(label, LW), 'dim')}${value}`
+  // 标签正好占满列宽时 dpad 不会补空格，值会直接贴上去（"部分 offload约 12 tok/s"）。
+  // 宁可这一行多一列，也不能让两个词粘成一个。
+  const row = (label, value) =>
+    `    ${paint(dpad(label, LW) + (dwidth(label) >= LW ? ' ' : ''), 'dim')}${value}`
   const note = (text) => `    ${' '.repeat(LW)}${paint(text, 'dim')}`
   // 块标题（✗ 装不下 / ? 算不出来）下面的说明：只缩一个层级，
   // 不能按值列对齐 —— 那是给「标签—值」用的，套到整段说明上会悬在半空
@@ -188,6 +191,9 @@ function render(meta, hw, result, opts = {}) {
   // 否则他会按第一行去换模型或换卡，而机器本来就够。
   if (mergedViable && !singleViable) {
     L.push(`    ${paint(t('r.mergedHint', { n: mg.gpus, c: fmtCtx(mergedResult.best.ctx) }), 'cyan', 'bold')}`)
+  } else if (mergedViable && result.moe?.canOffload) {
+    // 专家放内存能跑，但合并后是全显存 —— 后者更快，值得在结论处就指出来
+    L.push(`    ${paint(t('r.mergedHintMoe', { n: mg.gpus, c: fmtCtx(mergedResult.best.ctx) }), 'cyan', 'bold')}`)
   }
   L.push(`    ${paint(t('r.disclaimer'), 'dim')}`)
 
@@ -514,9 +520,12 @@ function render(meta, hw, result, opts = {}) {
     if (mergedResult.estimated) {
       const ok = mergedResult.weightsFit && mergedResult.best
       const ctxText = ok ? fmtCtx(mergedResult.best.ctx) : ''
+      // 贴着上限（>85%）时别只写「装得下」：碎片、驱动保留量都可能让它加载失败
+      const tight = ok && mergedResult.best.need > mergedResult.limit * TUNING.tightRatio
       L.push(row(t('f.mergedCtx'), ok
-        ? paint(t('f.mergedCan', { c: ctxText }), 'green', 'bold')
+        ? paint(t(tight ? 'f.mergedCanTight' : 'f.mergedCan', { c: ctxText }), tight ? 'yellow' : 'green', 'bold')
         : paint(t('f.mergedCant'), 'red', 'bold')))
+      if (tight) L.push(note(t('f.mergedTight')))
     }
     // 速度按最弱卡；有一张带宽未知就明说无法可靠估算，不编一个数
     if (mg.bandwidthUnknown || !mergedResult.speed?.onVram) {
@@ -528,6 +537,13 @@ function render(meta, hw, result, opts = {}) {
         ? t('v.under', { n: cap })
         : t('v.about', { n: v.toFixed(0) }), 'yellow', 'bold')))
       L.push(note(t('f.mergedBasis', { name: mg.weakestName ?? '?' })))
+    }
+    // MoE 能把专家塞内存时，合并后全放显存通常更快 —— 与其让用户自己拼旗标，
+    // 这里直接给一条能抄的命令。带宽未知时不给速度，但显存/内存的差别是结构性的。
+    if (moe?.canOffload && mergedViable && mg.devices?.length) {
+      L.push(row(t('f.mergedLaunch'),
+        cyan(`-dev ${mg.devices.join(',')} -sm layer -ngl 999 -c ${mergedResult.best.ctx}`)))
+      L.push(note(t('f.mergedFaster')))
     }
     L.push(note(t('f.mergedNote')))
   }
