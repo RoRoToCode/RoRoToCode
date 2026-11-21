@@ -15,7 +15,7 @@ import assert from 'node:assert/strict'
 import path from 'node:path'
 import { readFile, readdir } from 'node:fs/promises'
 
-import { assess, assumptionsList } from '../core/index.mjs'
+import { assess, mergedHardware, assumptionsList } from '../core/index.mjs'
 import { buildHtml, writeSite, DIST, MODULES, sourcePath } from './build.mjs'
 
 // 网页模块 import 的是 '../core/index.mjs'（core 就在仓库根），
@@ -24,7 +24,7 @@ import { buildHtml, writeSite, DIST, MODULES, sourcePath } from './build.mjs'
 const present = await readFile(path.join(DIST, 'index.html'), 'utf8').catch(() => null)
 if (present === null) await writeSite(await buildHtml())
 
-const { buildView, renderView, renderRepoTable, renderAssumptions } = await import('./dist/web/report.mjs')
+const { buildView, renderView, buildMergedView, renderMerged, renderRepoTable, renderAssumptions } = await import('./dist/web/report.mjs')
 const { matchGpu, buildHardware, isSoftwareRenderer } = await import('./dist/web/gpu.mjs')
 
 const GB = 1024 ** 3
@@ -301,6 +301,73 @@ test('网页报告：视觉投影件不能渲染成「12B 模型」，也不给�
   assert.equal(v.speed, null, '不该报一个假的速度')
   const html = renderView(v)
   assert.doesNotMatch(html, /12\.00B/)
+})
+
+// ───────────────────────── 手动多卡 / 合并评估 ─────────────────────────
+
+test('网页识别：P104-100 / P106-100 矿卡能认出来（双卡机器常见的第二张）', () => {
+  const p104 = matchGpu('NVIDIA P104-100 Direct3D11 vs_5_0 ps_5_0')
+  assert.ok(p104, 'P104-100 不在型号表里，双卡机器就选不到第二张卡')
+  assert.equal(p104.name, 'P104-100')
+  assert.equal(p104.bw, 320)
+  const p106 = matchGpu('NVIDIA P106-100')
+  assert.equal(p106?.bw, 192)
+})
+
+test('网页硬件：extraCards 拼进 gpus[]，主卡仍在第一位', () => {
+  const primary = { name: 'RTX 2080', vram: 8, bw: 448, kind: 'discrete', vendor: 'nvidia' }
+  const h = buildHardware(primary, {
+    vramGB: 8, usedGB: 0.8, ramGB: 16,
+    extraCards: [{ name: 'P104-100', vram: 8, bw: 320, kind: 'discrete', vendor: 'nvidia' }]
+  })
+  assert.equal(h.gpus.length, 2)
+  assert.equal(h.gpus[0].name, 'RTX 2080', '主卡必须排第一，assess 只看 gpus[0]')
+  assert.equal(h.gpus[1].name, 'P104-100')
+  assert.equal(h.gpus[1].totalBytes, 8 * GB)
+  assert.equal(h.gpus[1].bandwidthGBps, 320)
+  assert.equal(h.gpus[0].devIndex, 0, '主卡是 CUDA0')
+  assert.equal(h.gpus[1].devIndex, 1, '第二张卡是 CUDA1，启动参数靠它拼 -dev')
+  const mg = mergedHardware(h)
+  assert.deepEqual(mg.devices, ['CUDA0', 'CUDA1'], '合并启动参数要有 -dev')
+})
+
+test('网页硬件：没有 extraCards 时行为与单卡完全一致', () => {
+  const primary = { name: 'RTX 3050', vram: 8, bw: 224, kind: 'discrete' }
+  const h = buildHardware(primary, { vramGB: 8, usedGB: 0.8, ramGB: 16, extraCards: [] })
+  assert.equal(h.gpus.length, 1)
+  assert.equal(h.gpus[0].name, 'RTX 3050')
+  // 空的、没选型号的残留行不能被算成一张卡
+  const h2 = buildHardware(primary, {
+    vramGB: 8, usedGB: 0.8, ramGB: 16,
+    extraCards: [{ name: '', vram: 8 }, null, { name: 'X', vram: 0 }]
+  })
+  assert.equal(h2.gpus.length, 1, '无效卡片要被过滤掉，不能让显存池凭空变大')
+})
+
+test('网页报告：双卡给出合并评估，显存相加、速度按最弱卡', () => {
+  const dual = buildHardware(
+    { name: 'RTX 2080', vram: 8, bw: 448, kind: 'discrete' },
+    { vramGB: 8, usedGB: 0.8, ramGB: 16,
+      extraCards: [{ name: 'P104-100', vram: 8, bw: 320, kind: 'discrete' }] })
+  const mg = mergedHardware(dual)
+  assert.equal(mg.merged, true)
+  assert.equal(mg.gpus, 2)
+  const mr = assess(meta, mg.hw, { weightsBytes: meta.sizeBytes })
+  const m = buildMergedView(meta, mg, mr)
+  assert.equal(m.cards, 2)
+  assert.equal(m.poolText, '16.00 GB', '两张 8G 卡合并池应为 16 GB')
+  assert.equal(m.weakestName, 'P104-100', '带宽取最弱卡')
+  const html = renderMerged(m)
+  assert.match(html, /合并评估|Combined estimate/)
+  assert.match(html, /16\.00 GB/)
+  assert.ok(!/undefined|NaN/.test(html))
+})
+
+test('网页报告：单卡不渲染合并段（避免重复结论）', () => {
+  const single = buildHardware({ name: 'RTX 3050', vram: 8, bw: 224, kind: 'discrete' },
+    { vramGB: 8, usedGB: 0.8, ramGB: 16 })
+  assert.equal(mergedHardware(single).merged, false)
+  assert.equal(renderMerged(buildMergedView(meta, mergedHardware(single), null)), '')
 })
 
 test('网页报告：MTP 草稿件给的是「不能单独运行」，不是「可以当 agent 用」', () => {

@@ -196,6 +196,17 @@
   .hwbar select:focus, .hwbar input:focus { border-color: var(--accent); }
   .hwbar input[type=number] { width: 68px; }
   #detect-note { flex-basis: 100%; font-size: 12px; color: var(--ink-3); font-family: var(--mono); overflow-wrap: anywhere; }
+  /* 手动多卡：浏览器只报当前渲染那张，其余卡由用户添加 */
+  #multi-hint { flex-basis: 100%; font-size: 11.5px; line-height: 1.6; color: var(--ink-3); margin-top: -4px; }
+  #extra-gpus { flex-basis: 100%; display: flex; flex-direction: column; gap: 8px; }
+  .extra-gpu { display: flex; flex-wrap: wrap; gap: 10px 14px; align-items: center; }
+  .extra-gpu label { color: var(--ink-2); display: flex; align-items: center; gap: 6px; }
+  .extra-gpu select { min-width: 190px; }
+  #add-gpu:disabled { opacity: .4; cursor: not-allowed; }
+  .merged .merged-body { padding: 18px 24px 4px; }
+  .merged .merged-launch { padding: 14px 24px 4px; border-top: 1px solid var(--line); }
+  .merged .merged-launch h3 { font-size: 12px; color: var(--ink-3); margin: 0 0 10px; }
+  .mono { font-family: var(--mono); font-size: 12.5px; }
 
   .status {
     padding: 14px 16px;
@@ -434,6 +445,9 @@
         <option value="q4_0">q4_0</option>
       </select>
     </label>
+    <button type="button" class="linkbtn" id="add-gpu">＋ 加一张卡</button>
+    <span id="multi-hint" class="multi-hint"></span>
+    <div id="extra-gpus"></div>
     <span id="detect-note"></span>
   </div>
 

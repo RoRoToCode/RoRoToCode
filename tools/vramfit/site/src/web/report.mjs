@@ -8,7 +8,7 @@
 import {
   GB, FILE_TYPE, quantFromName, paramCountOf, shardInfo, totalWeightsBytes,
   analyzeTemplate, attentionReport, stripControl, baseName, fmtSize,
-  headlineOf, TUNING, assumptionsList, speedCapFor
+  headlineOf, TUNING, assumptionsList, speedCapFor, launchArgsOf
 } from '../core/index.mjs'
 // 界面壳子的词条表（表单、表头、状态提示）。报告正文里的结论仍由 core/i18n.mjs
 // 按 core 的 locale 生成，两边在 app.mjs 里同时设定，不会各说一种语言。
@@ -136,6 +136,53 @@ export function buildView(meta, result, ctx = {}) {
       : null,
     moeCorrected: result.moe?.corrected ?? null,
     kvType: ctx.kvType ?? 'f16'
+  }
+}
+
+/**
+ * 把合并评估的 core 结果转成网页用的视图。
+ *
+ * 判据全部沿用 CLI（check.mjs 的 mg + mergedResult 那段）：装不装得下看
+ * weightsFit + best，贴没贴上限看 TUNING.tightRatio，速度按最弱卡。这里只把
+ * 数字打包，绝不在网页层另写一套门槛 —— 同一台机器网页和命令行必须给同一个结论。
+ *
+ * @param meta         GGUF 元数据
+ * @param mg           mergedHardware() 的返回值 { merged, hw, gpus, devices, ... }
+ * @param mergedResult assess(meta, mg.hw) 的结果，没合并时为 null
+ */
+export function buildMergedView(meta, mg, mergedResult) {
+  if (!mg?.merged || !mergedResult) return null
+  const poolBytes = mg.hw.gpus[0]?.totalBytes ?? 0
+  const speedBytes = mergedResult.speed?.basisBytes ?? totalWeightsBytes(meta)
+  const raw = mergedResult.speed?.onVram
+  const speed = Number.isFinite(raw) && raw > 0
+    ? Math.round(Math.min(raw, speedCapFor(speedBytes)))
+    : null
+  const ok = Boolean(mergedResult.estimated && mergedResult.weightsFit && mergedResult.best)
+  const ctx = ok ? mergedResult.best.ctx : null
+  const tight = ok && mergedResult.best.need > mergedResult.limit * TUNING.tightRatio
+
+  // 启动参数走 core 的 launchArgsOf，和命令行是同一份生成逻辑；
+  // 只有「合并后真能跑」才给，否则给一串必 OOM 的旗标是误导。
+  const launch = ok ? launchArgsOf(meta, mergedResult, {
+    kvType: mergedResult.kvType ?? 'f16',
+    merged: mg.devices?.length ? { devices: mg.devices } : null
+  }) : []
+
+  return {
+    pool: poolBytes,
+    poolText: fmtGB(poolBytes),
+    cards: mg.gpus,
+    cardNames: mg.cards ?? [],
+    devices: mg.devices ?? [],
+    ok,
+    ctx,
+    ctxText: ctx ? fmtCtx(ctx) : null,
+    tight,
+    speed,
+    bandwidthUnknown: Boolean(mg.bandwidthUnknown),
+    weakestName: mg.weakestName ?? null,
+    launch: launch.map((a) => ({ flag: a.flag, why: tx(a.whyKey, a.args ?? {}) }))
   }
 }
 
@@ -278,6 +325,53 @@ export function renderView(v) {
     <footer class="disclaimer">
       ${tx('rp.disclaimer', { err: TUNING.speedErrorPct })}
     </footer>
+  </article>`
+}
+
+/**
+ * 合并评估卡。放在主报告之后，用「单卡 / 合并」对照的方式呈现，
+ * 而不是替换主结论 —— 主卡够用时用户不需要多卡，只有单卡装不下时这段才关键。
+ */
+export function renderMerged(m) {
+  if (!m) return ''
+  const ctxValue = m.ok
+    ? esc(m.tight ? tx('rp.merged.ctxTight', { c: m.ctxText }) : m.ctxText)
+    : esc(tx('rp.merged.cant'))
+
+  const speedLine = m.bandwidthUnknown || !m.speed
+    ? `<p class="note">${tx('rp.merged.bwUnknown')}</p>`
+    : `<div class="kv-row"><span class="k">${tx('rp.merged.speed')}</span><span class="v">~${m.speed} tok/s</span></div>
+       <p class="note">${esc(tx('rp.merged.basis', { name: m.weakestName ?? '?' }))}</p>`
+
+  const launchBlock = m.launch.length
+    ? `<div class="merged-launch">
+        <h3>${tx('rp.merged.launch')}</h3>
+        ${m.launch.map((a) => `<div class="kv-row"><span class="v mono">${esc(a.flag)}</span><span class="src">${esc(a.why)}</span></div>`).join('')}
+      </div>`
+    : ''
+
+  return `<article class="card merged">
+    <header class="verdict" data-level="${m.ok ? 'good' : 'bad'}">
+      <div class="v-main">
+        <h2>${tx('rp.merged.title')}</h2>
+        <p>${esc(tx('rp.merged.note'))}</p>
+      </div>
+      <div class="v-side"><div class="v-num">${esc(m.ctxText ?? '—')}</div>
+        <div class="v-cap">${tx('rp.merged.ctx')}</div></div>
+    </header>
+    <div class="head">
+      <div class="h-meta">
+        <span class="chip">${esc(m.cardNames.join(' + '))}</span>
+        <span class="chip ghost">${esc(tx('rp.merged.pool'))} ${esc(m.poolText)}</span>
+      </div>
+    </div>
+    <div class="merged-body">
+      <div class="kv-row"><span class="k">${tx('rp.merged.pool')}</span><span class="v">${esc(m.poolText)} · ${esc(tx('rp.merged.cards', { n: m.cards }))}</span></div>
+      <div class="kv-row"><span class="k">${tx('rp.merged.ctx')}</span><span class="v">${ctxValue}</span></div>
+      ${speedLine}
+    </div>
+    ${launchBlock}
+    <footer class="disclaimer">${tx('rp.disclaimer', { err: TUNING.speedErrorPct })}</footer>
   </article>`
 }
 

@@ -8,14 +8,14 @@
  * 中间那段（解析、推算、判定）两边跑的是同一份 core。
  */
 
-import { parseHfInput, assess, totalWeightsBytes, setLocale } from '../core/index.mjs'
+import { parseHfInput, assess, mergedHardware, totalWeightsBytes, setLocale } from '../core/index.mjs'
 import { fetchGguf, listRepoGgufs } from '../net/hf.mjs'
 import { readLocalGguf, isFirstShard } from './local.mjs'
 import {
   detectRenderer, matchGpu, buildHardware, gpuOptions,
   UNIFIED_SIZES, isSoftwareRenderer
 } from './gpu.mjs'
-import { buildView, renderView, renderRepoTable, renderAssumptions } from './report.mjs'
+import { buildView, renderView, buildMergedView, renderMerged, renderRepoTable, renderAssumptions } from './report.mjs'
 import { localeOf, setUiLang, tx } from './strings.mjs'
 
 // 界面语言跟着页面走。window.__VRAMFIT_LANG 由母站注入（页面 <html lang> 也认），
@@ -53,6 +53,8 @@ function localizeStatic() {
   setText('#ex-lead', tx('ex.lead'))
   setText('#ex-qwen', tx('ex.qwen'))
   setText('#lbl-gpu', tx('hw.gpu'))
+  setText('#add-gpu', tx('hw.addGpu'))
+  setText('#multi-hint', tx('hw.multiHint'))
   setText('#lbl-mem', tx('hw.mem'))
   setText('#lbl-used', tx('hw.used'))
   setText('#lbl-kv', tx('hw.kv'))
@@ -80,7 +82,7 @@ function initGpuSelect() {
   const groups = gpuOptions()
   sel.innerHTML = `<option value="">${tx('gpu.none')}</option>` +
     groups.map((g) => `<optgroup label="${esc(g.label)}">${
-      g.items.map((it) => `<option value="${esc(it.name)}" data-vram="${it.vram}" data-bw="${it.bw}" data-unified="${it.unified ? 1 : 0}">${esc(it.name)}</option>`).join('')
+      g.items.map((it) => `<option value="${esc(it.name)}" data-vram="${it.vram}" data-bw="${it.bw}" data-unified="${it.unified ? 1 : 0}" data-vendor="${esc(it.vendor)}">${esc(it.name)}</option>`).join('')
     }</optgroup>`).join('')
 
   const renderer = detectRenderer()
@@ -144,7 +146,7 @@ function onSelectChange() {
     bw: Number(opt.dataset.bw) || 0,
     unified: opt.dataset.unified === '1',
     kind: opt.dataset.unified === '1' ? 'unified' : 'discrete',
-    vendor: 'other'
+    vendor: opt.dataset.vendor || 'other'
   }
   state.detected = false
   // Apple 芯片的显存就是买机器时选的内存，表里没有；给个常见起步值（32 GB），
@@ -154,13 +156,85 @@ function onSelectChange() {
   updateVramVisibility()
 }
 
+// ───────────────────────── 手动多卡 ─────────────────────────
+// 浏览器拿不到第二张卡（WebGL 只报当前渲染那张，也调不了 nvidia-smi），
+// 所以多卡只能手动加。卡片来自和主卡同一张型号表，显存可覆盖 ——
+// 与命令行版的 --vram 一样是「假如我有 N GB」的假设题，带宽仍按型号算。
+
+const MAX_EXTRA = 2   // 主卡之外最多再加 2 张，够覆盖常见的双卡/三卡机器
+
+function extraCardOptions() {
+  const groups = gpuOptions()
+  return groups.map((g) => `<optgroup label="${esc(g.label)}">${
+    g.items.map((it) => `<option value="${esc(it.name)}" data-vram="${it.vram}" data-bw="${it.bw}" data-unified="${it.unified ? 1 : 0}" data-vendor="${esc(it.vendor)}">${esc(it.name)}</option>`).join('')
+  }</optgroup>`).join('')
+}
+
+function addExtraCard() {
+  const wrap = $('#extra-gpus')
+  if (!wrap || wrap.children.length >= MAX_EXTRA) return
+  const i = wrap.children.length + 2   // 主卡是 1，这里从 2 开始
+  const row = document.createElement('div')
+  row.className = 'extra-gpu'
+  row.innerHTML = `<label><span>${esc(tx('hw.gpuN', { n: i }))}</span>
+      <select data-role="card"><option value="">${esc(tx('gpu.none'))}</option>${extraCardOptions()}</select>
+    </label>
+    <label><span>${esc(tx('hw.cap.vram'))}</span><input data-role="vram" type="number" min="1" max="512" step="1" value="8"></label>
+    <button type="button" class="linkbtn" data-role="remove">${esc(tx('hw.remove'))}</button>`
+  wrap.appendChild(row)
+
+  const sel = row.querySelector('[data-role=card]')
+  const vram = row.querySelector('[data-role=vram]')
+  sel.addEventListener('change', () => {
+    const opt = sel.selectedOptions[0]
+    const cap = Number(opt?.dataset.vram) || 0
+    if (cap) vram.value = String(cap)
+    vram.disabled = Boolean(opt?.dataset.unified === '1')
+    rerunIfAny()
+  })
+  vram.addEventListener('change', rerunIfAny)
+  row.querySelector('[data-role=remove]').addEventListener('click', () => {
+    row.remove();
+    // 删掉中间一张后，剩下卡的序号要重排，否则出现「第 2、第 4 张」
+    [...wrap.children].forEach((r, idx) => {
+      r.querySelector('span').textContent = tx('hw.gpuN', { n: idx + 2 })
+    })
+    $('#add-gpu').disabled = false
+    rerunIfAny()
+  })
+  if (wrap.children.length >= MAX_EXTRA) $('#add-gpu').disabled = true
+}
+
+function extraCards() {
+  return [...($('#extra-gpus')?.children ?? [])].map((row) => {
+    const sel = row.querySelector('[data-role=card]')
+    if (!sel?.value) return null
+    const opt = sel.selectedOptions[0]
+    return {
+      name: sel.value,
+      vram: Number(row.querySelector('[data-role=vram]')?.value) || Number(opt.dataset.vram) || 0,
+      bw: Number(opt.dataset.bw) || 0,
+      unified: opt.dataset.unified === '1',
+      kind: opt.dataset.unified === '1' ? 'unified' : 'discrete',
+      vendor: opt.dataset.vendor || 'other'
+    }
+  }).filter(Boolean)
+}
+
+function rerunIfAny() {
+  if (state.busy) return
+  const t = $('#target')?.value.trim()
+  if (t) run(t)
+}
+
 function currentHardware() {
   const vramGB = Number($('#vram').value) || 0
   const ramGB = Number($('#ram').value) || 16
   return buildHardware(state.gpu, {
     vramGB,
     ramGB,
-    usedGB: Number($('#used').value) || 0
+    usedGB: Number($('#used').value) || 0,
+    extraCards: extraCards()
   })
 }
 
@@ -256,15 +330,31 @@ async function run(rawInput, { fromUrl = false } = {}) {
   }
 }
 
+/**
+ * 主评估 + 合并评估，一次渲染。
+ * 合并只有真加了第二张卡才算（mergedHardware 内部会按 gpus.length<2 跳过），
+ * 且只在单卡文件（非附件）上做 —— mmproj 那种文件没有「装不装得下」的问题。
+ */
+function renderAssessment(meta, hw) {
+  const weightsBytes = totalWeightsBytes(meta)
+  const result = assess(meta, hw, { kvType: state.kvType, weightsBytes })
+  const view = buildView(meta, result, { kvType: state.kvType })
+  let mergedHtml = ''
+  if (!meta.isVision && !meta.isAssistant && hw.gpus?.length > 1) {
+    const mg = mergedHardware(hw)
+    if (mg.merged) {
+      const mergedResult = assess(meta, mg.hw, { kvType: state.kvType, weightsBytes })
+      mergedHtml = renderMerged(buildMergedView(meta, mg, mergedResult))
+    }
+  }
+  $('#output').innerHTML = renderView(view) + mergedHtml
+  return result
+}
+
 async function runFile(url, hw) {
   setStatus(tx('app.st.header'))
   const meta = await fetchGguf(url)
-  const result = assess(meta, hw, {
-    kvType: state.kvType,
-    weightsBytes: totalWeightsBytes(meta)
-  })
-  const view = buildView(meta, result, { kvType: state.kvType })
-  $('#output').innerHTML = renderView(view)
+  renderAssessment(meta, hw)
   setStatus('')
   syncUrl({ u: url, gpu: state.gpu?.name, vram: $('#vram').value || '', kv: state.kvType })
 }
@@ -290,7 +380,7 @@ async function runRepo(repo, hw) {
           weightsBytes: totalWeightsBytes(meta)
         })
         const view = buildView(meta, result, { kvType: state.kvType })
-        rows.push({ ...view, url, file: meta.file, hasTemplate: !!meta.chatTemplate, best: view.bestCtx })
+        rows.push({ ...view, url, file: meta.file, hasTemplate: !!meta.chatTemplate, best: view.bestCtx, result, meta })
       } catch (e) {
         rows.push({ error: e.message, file: url, url })
       }
@@ -324,12 +414,7 @@ async function runLocalFiles(files) {
     const first = ggufs.find((f) => isFirstShard(f.name)) ?? ggufs[0]
     setStatus(tx('app.st.readOne', { name: esc(first.name) }))
     const meta = await readLocalGguf(first)
-    const result = assess(meta, hw, {
-      kvType: state.kvType,
-      weightsBytes: totalWeightsBytes(meta)
-    })
-    const view = buildView(meta, result, { kvType: state.kvType })
-    $('#output').innerHTML = renderView(view)
+    renderAssessment(meta, hw)
     setStatus(ggufs.length > 1 ? tx('app.st.firstOnly', { n: ggufs.length }) : '')
     syncUrl({ gpu: state.gpu?.name, vram: $('#vram').value || '', kv: state.kvType })
   } catch (e) {
@@ -345,6 +430,8 @@ function syncUrl(params) {
   const u = new URL(location.href)
   u.search = ''
   for (const [k, v] of Object.entries(params)) if (v) u.searchParams.set(k, v)
+  const cards = extraCards()
+  if (cards.length) u.searchParams.set('cards', cards.map((c) => `${c.name}:${c.vram}`).join('|'))
   history.replaceState(null, '', u.toString())
   const btn = $('#share')
   btn.hidden = false
@@ -378,6 +465,25 @@ function restoreFromUrl() {
   }
   if (vram) $('#vram').value = vram
 
+  // 分享链接里的多卡：cards=RTX%202080:8|P104-100:8
+  const cardsRaw = q.get('cards')
+  if (cardsRaw && $('#add-gpu')) {
+    for (const part of cardsRaw.split('|').slice(0, MAX_EXTRA)) {
+      const sep = part.lastIndexOf(':')
+      if (sep < 1) continue
+      const name = part.slice(0, sep), cap = Number(part.slice(sep + 1))
+      addExtraCard()
+      const row = $('#extra-gpus').lastElementChild
+      const sel = row.querySelector('[data-role=card]')
+      const opt = [...sel.options].find((o) => o.value === name)
+      if (opt) {
+        sel.value = name
+        sel.dispatchEvent(new Event('change'))
+        row.querySelector('[data-role=vram]').value = String(cap || Number(opt.dataset.vram) || 8)
+      }
+    }
+  }
+
   const u = q.get('u')
   const m = q.get('m')
   if (u) { $('#target').value = u; run(u, { fromUrl: true }) }
@@ -401,6 +507,7 @@ function init() {
   if (asm) asm.innerHTML = renderAssumptions()
 
   $('#gpu').addEventListener('change', onSelectChange)
+  $('#add-gpu')?.addEventListener('click', addExtraCard)
   $('#vram').addEventListener('change', () => {
     if (state.busy) return
     const t = $('#target').value.trim()

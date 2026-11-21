@@ -6,7 +6,7 @@
 版本号是唯一事实来源：`package.json` 的 `version` 决定打包产物名与 Release tag（`v<版本>`），
 主进程的 MCP `clientInfo.version` 也从这里读取，不再手写。
 
-## [未发布]
+## [0.1.4] - 2026-11-21
 
 ### 修复
 
@@ -214,5 +214,6 @@ winget install RoRoToCode.RoRoToCode
 > 该版本 Release 文案里的 SHA256 与实际资产不一致（文案为 `f1e29218…`，实际 `fbf69a83…`），
 > 校验请以 GitHub API 返回的 asset digest 或本地 `Get-FileHash` 结果为准。0.1.3 起改为现算，不再出现此问题。
 
+[0.1.4]: https://github.com/RoRoToCode/RoRoToCode/releases/tag/v0.1.4
 [0.1.3]: https://github.com/RoRoToCode/RoRoToCode/releases/tag/v0.1.3
 [0.1.2]: https://github.com/RoRoToCode/RoRoToCode/releases/tag/v0.1.2

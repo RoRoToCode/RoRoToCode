@@ -56,6 +56,11 @@ const DICT = {
   'hw.cap.unified': { zh: '统一内存', en: 'Unified memory' },
   'hw.cpuOnly': { zh: 'CPU 推理', en: 'CPU inference' },
   'hw.other': { zh: '其它', en: 'Other' },
+  'hw.addGpu': { zh: '＋ 加一张卡', en: '+ Add a GPU' },
+  'hw.gpuN': { zh: '第 {n} 张卡', en: 'GPU {n}' },
+  'hw.remove': { zh: '移除', en: 'Remove' },
+  'hw.multiHint': { zh: '浏览器只能报出正在用的那张卡。多卡请手动添加，型号和显存按本机填；下面会分别给单卡与合并两套结论。', en: 'A browser only sees the card rendering this page. Add your other cards by hand — pick the model and enter its VRAM. You will get both a single-GPU and a combined verdict.' },
+  'hw.multiMax': { zh: '最多加 3 张', en: 'Up to 3 cards' },
   'hw.igpu.arc': { zh: 'Intel Arc 核显', en: 'Intel Arc iGPU' },
   'hw.igpu.intel': { zh: 'Intel 核显', en: 'Intel iGPU' },
   'hw.igpu.amd': { zh: 'AMD 核显', en: 'AMD iGPU' },
@@ -155,6 +160,20 @@ const DICT = {
   'rp.tpl.weak': { zh: '格式不全', en: 'format incomplete' },
   'rp.tpl.none': { zh: '不支持', en: 'not supported' },
   'rp.tpl.summary': { zh: '工具调用能力（{level}）', en: 'Tool calling ({level})' },
+  // ── 合并评估（手动多卡）──
+  // 正文的合计算式与判断全走 core 的 t()（s.merged / f.merged* / la.*），这里只放
+  // 网页特有的「单卡 / 合并」切换标签和启动参数抬头，避免两边各写一份口径。
+  'rp.merged.title': { zh: '合并评估', en: 'Combined estimate' },
+  'rp.merged.pool': { zh: '合并显存池', en: 'Combined VRAM pool' },
+  'rp.merged.cards': { zh: '{n} 块卡合计', en: '{n} cards combined' },
+  'rp.merged.ctx': { zh: '合并后可开', en: 'Combined max context' },
+  'rp.merged.ctxTight': { zh: '{c}（装得下，但贴近上限）', en: '{c} (fits, near the ceiling)' },
+  'rp.merged.cant': { zh: '仍装不下', en: 'Still does not fit' },
+  'rp.merged.speed': { zh: '全程显存', en: 'All in VRAM' },
+  'rp.merged.basis': { zh: '按最弱卡 {name} 的带宽估速', en: 'Speed by slowest card {name}' },
+  'rp.merged.bwUnknown': { zh: '带宽有卡未收录，合并速度无法可靠估算', en: 'Some card bandwidth is unknown; combined speed cannot be estimated reliably' },
+  'rp.merged.launch': { zh: '合并启动参数（llama.cpp）', en: 'Combined launch flags (llama.cpp)' },
+  'rp.merged.note': { zh: '一个模型按整层切分到这几张卡（-sm layer），显存合计、带宽取最弱卡，速度是粗估；不是张量并行。', en: 'One model split by whole layers across these cards (-sm layer); VRAM summed, speed by the slowest card, and only a rough estimate — not tensor parallelism.' },
   'rp.disclaimer': { zh: '<strong>以上全部是静态推算，不是实测。</strong> 权重按文件体积、KV 按层数×head、速度按带宽÷权重算出来的，误差通常在 ±{err}% 以内，但要看实际驱动和参数设置。模板里有 tools 分支也不等于模型真会调工具。结论只用来排掉「根本不可能」的选项，不能当合格证 —— 请实际加载跑一次再决定。', en: '<strong>Everything above is a static estimate, not a measurement.</strong> Weights come from file size, KV from layers × heads, speed from bandwidth ÷ weight size, and the error is usually within ±{err}%. Real drivers and settings still decide. A tools branch in the template does not mean the model will reliably call tools. Use this to rule out what cannot possibly work, never as a certificate — load the model once before you commit.' },
 
   // ── 仓库对比表 ──

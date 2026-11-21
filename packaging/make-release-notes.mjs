@@ -6,7 +6,7 @@
  * 这里直接从 exe 现算哈希和体积，文案不可能和资产不一致。
  *
  *   node packaging/make-release-notes.mjs                 # 版本取 package.json
- *   node packaging/make-release-notes.mjs --version 0.1.3
+ *   node packaging/make-release-notes.mjs --version 0.1.4
  */
 import fs from 'node:fs'
 import path from 'node:path'

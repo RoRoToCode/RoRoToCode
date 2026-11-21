@@ -1,6 +1,6 @@
 {
   "name": "roroto-code",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "private": true,
   "description": "A cross-platform coding agent with local (llama.cpp/GGUF) and online model support",
   "license": "MIT",

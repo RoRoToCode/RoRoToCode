@@ -63,6 +63,13 @@ const GPU_TABLE = [
   { re: /rtx\s*2070/i, name: 'RTX 2070', vram: 8, bw: 448, vendor: 'nvidia' },
   { re: /rtx\s*2060\s*super/i, name: 'RTX 2060 SUPER', vram: 8, bw: 448, vendor: 'nvidia' },
   { re: /rtx\s*2060/i, name: 'RTX 2060', vram: 6, bw: 336, vendor: 'nvidia' },
+  // ── NVIDIA 矿卡（P 系列）：二手市场常见，CLI 的带宽表也收了这两款。
+  // 不收进来时双卡机器选不到第二张，合并评估就没法做。
+  // P104-100 = GP104 + 256-bit GDDR5X 10 Gbps → 320 GB/s；
+  // P106-100 = GP106 + 192-bit GDDR5 → 192 GB/s。
+  // 注意 P104 只有 PCIe 1.1 x4，按层切分的实际代价比带宽表体现的更高。
+  { re: /p104\s*-?\s*100/i, name: 'P104-100', vram: 8, bw: 320, vendor: 'nvidia' },
+  { re: /p106\s*-?\s*100/i, name: 'P106-100', vram: 6, bw: 192, vendor: 'nvidia' },
   // ── NVIDIA 专业卡 / 数据中心
   { re: /h200/i, name: 'H200', vram: 141, bw: 4800, vendor: 'nvidia' },
   { re: /h100/i, name: 'H100', vram: 80, bw: 3350, vendor: 'nvidia' },
@@ -190,20 +197,48 @@ export function detectOS() {
 const RAM_BW = 60
 
 /**
+ * 把一张卡的下拉选中项转成 core 认得的硬件条目。
+ * 单卡和多卡共用，避免两条路径算出不同的显存/带宽。
+ */
+function gpuEntry(entry, vramOverride, usedGB) {
+  const unified = Boolean(entry.unified)
+  const vramGB = Number(vramOverride) > 0 ? Number(vramOverride) : (entry.vram || 0)
+  return {
+    name: entry.name,
+    totalBytes: vramGB * 1024 ** 3,
+    // Apple 统一内存没有"已用显存"这个概念，整机占用交给 maxWorkingSet 处理
+    usedBytes: unified ? 0 : usedGB * 1024 ** 3,
+    bandwidthGBps: entry.bw || 0,
+    unified,
+    kind: entry.kind ?? (unified ? 'unified' : 'discrete'),
+    // mergedHardware() 靠 backend 决定 -dev 前缀（cuda→CUDA / vulkan→Vulkan / metal→MTL）。
+    // 网页版只有型号表，vendor 字段没带过来时按名字猜一次。
+    backend: entry.backend ?? (entry.vendor === 'nvidia' ? 'cuda'
+      : entry.vendor === 'amd' ? 'vulkan'
+        : entry.vendor === 'apple' ? 'metal' : undefined),
+    source: 'web-table'
+  }
+}
+
+/**
  * 组装 core.assess 需要的硬件对象。
  *
- * @param entry  matchGpu 的结果，或下拉框选中项
- * @param opts.vramGB    覆盖显存容量（GB）；Apple / 核显必填
- * @param opts.usedGB    已占用显存。浏览器读不到，默认按 0.8 GB 估
- * @param opts.ramGB     系统内存，用于 CPU 兜底和 offload 速度
+ * @param entry   matchGpu 的结果，或下拉框选中项（主卡）
+ * @param opts.vramGB      主卡显存覆盖（GB）；Apple / 核显必填
+ * @param opts.usedGB      每张卡已占用显存。浏览器读不到，默认按 0.8 GB 估
+ * @param opts.ramGB       系统内存，用于 CPU 兜底和 offload 速度
+ * @param opts.extraCards  手动追加的卡：[{ name, vram, bw, unified }]，合并评估用
+ *
+ * gpus[] 的顺序就是 llama.cpp 的卡序（第一张是主卡）。core 的 assess() 只看
+ * gpus[0]，mergedHardware() 会把整条 gpus[] 合成一张虚拟卡 —— 所以主卡评估
+ * 和合并评估走的是同一份数据，不会出现两套口径。
  */
 export function buildHardware(entry, opts = {}) {
   const os = detectOS()
-  const vramGB = Number(opts.vramGB) > 0 ? Number(opts.vramGB) : (entry?.vram || 0)
   const usedGB = Number(opts.usedGB) >= 0 ? Number(opts.usedGB) : 0.8
   const ramGB = Number(opts.ramGB) > 0 ? Number(opts.ramGB) : 16
 
-  if (!entry || !vramGB) {
+  if (!entry || !(Number(opts.vramGB) > 0 || entry.vram)) {
     // 认不出卡或用户没填容量：退化成 CPU 推理，按内存估
     return {
       gpus: [],
@@ -214,18 +249,17 @@ export function buildHardware(entry, opts = {}) {
     }
   }
 
-  const unified = Boolean(entry.unified)
+  const extras = Array.isArray(opts.extraCards) ? opts.extraCards : []
+  const gpus = [gpuEntry(entry, opts.vramGB, usedGB),
+    ...extras.filter((x) => x && x.name && Number(x.vram) > 0)
+      .map((x) => gpuEntry(x, x.vram, usedGB))]
+  // mergedHardware() 要靠 devIndex 拼 llama.cpp 的 -dev CUDA0,CUDA1 启动参数。
+  // 网页版没有驱动枚举顺序，只能按用户添加的顺序编号 —— 提示里已说明
+  // 「-dev 编号以本机 device 为准」，这里给的是最可能的默认值。
+  gpus.forEach((g, i) => { g.devIndex = i })
+
   return {
-    gpus: [{
-      name: entry.name,
-      totalBytes: vramGB * 1024 ** 3,
-      // Apple 统一内存没有"已用显存"这个概念，整机占用交给 maxWorkingSet 处理
-      usedBytes: unified ? 0 : usedGB * 1024 ** 3,
-      bandwidthGBps: entry.bw || 0,
-      unified,
-      kind: entry.kind ?? (unified ? 'unified' : 'discrete'),
-      source: 'web-table'
-    }],
+    gpus,
     ramBytes: ramGB * 1024 ** 3,
     ramBandwidthGBps: RAM_BW,
     osPlatform: os,
