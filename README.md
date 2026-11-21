@@ -96,7 +96,7 @@ node tools/vramfit/check.mjs <模型.gguf> --json       # 可进 CI / 脚本
 
 常用参数：`--kv f16|q8_0|q4_0|k8v16`、`--vram <GB>`、`--gpu N`、`--mmproj <file>`、`--mirror <url>`、`--lang zh|en`。无参数进交互模式，Windows 可双击 `check.cmd`，支持从剪贴板读链接。
 
-`--json` 输出 `tiers`、`recommendedCtx`、`genTokPerSec`、`genTokPerSecAtCtx`、`tools`、`verdict` 等字段，恒定不随语言变化。自带 64 项测试，跑在 3 个 OS × Node 18/20/22 上。
+`--json` 输出 `tiers`、`recommendedCtx`、`genTokPerSec`、`genTokPerSecAtCtx`、`tools`、`verdict` 等字段，恒定不随语言变化。自带 108 项测试，跑在 3 个 OS × Node 18/20/22 上。
 
 ---
 
