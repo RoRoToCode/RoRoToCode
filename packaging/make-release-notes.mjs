@@ -36,10 +36,10 @@ const sizeMB = (bytes.length / 1024 ** 2).toFixed(1)
 writeShaFile(asset, sha)
 
 // NSIS 安装器是可选的，有就一起列出来
-// 只认本次的 NSIS 安装器。release/ 里可能残留旧版本 portable exe 或别的 exe，
-// 用 f !== asset 会把它们一起列进下载表格（也会算出一个误导性的哈希）。
+// 只认本次版本的 NSIS 安装器。release/ 里会残留旧版本的 exe，
+// 单靠 /setup/i 会把 0.1.3-setup.exe 也列进来并算出一个误导性的哈希。
 const installers = fs.readdirSync(path.join(root, 'release'))
-  .filter((f) => f.endsWith('.exe') && !f.endsWith('-portable.exe') && /setup/i.test(f))
+  .filter((f) => f.startsWith(`RoRoToCode-${version}-`) && f.endsWith('.exe') && !f.endsWith('-portable.exe') && /setup/i.test(f))
   .map((f) => {
     const buf = fs.readFileSync(path.join(root, 'release', f))
     const h = crypto.createHash('sha256').update(buf).digest('hex')
@@ -70,8 +70,8 @@ const lines = [
   '',
   '## 本版本变更',
   '',
-  `- llama.cpp 运行库、GGUF 模型与简易核心默认改存到用户数据目录，包管理器升级不再丢失已下载的模型；需要「模型跟 exe 放一起」时设 \`ROROTO_PORTABLE=1\`，自定义位置设 \`ROROTO_DATA_DIR\`。`,
-  '- 发布流程自动化：tag 触发构建、打包、现算哈希并生成 Release 文案与 winget 清单。',
+  '- 并行子任务：并发路数改按每条模型的容量求和（本地 1、远端默认 3），云端不再被当成串行；子 agent 的 token 按实际用的模型记账，写同一文件改为按绝对路径排队，步数用尽时补一次无工具收尾，不再丢掉整轮工作。',
+  '- vramfit 网页版支持手动添加多卡：给出单卡与合并两套结论，显存相加、带宽取最弱卡，启动参数复用 core，分享链接可还原多卡。',
   '',
   '## 要求',
   '',
