@@ -69,13 +69,17 @@ export function runtimeKindOf(p: ProviderConfig | null | undefined): LocalRuntim
 }
 
 /**
- * 自动备用链：设置页不再提供「作为备用模型」勾选，改由这里给答案。
+ * 自动备用链：设置页不再自动收录远端，改由这里给答案。
  *
  * 顺序与边界都有讲究：
  * - 显式勾过 fallback 的排最前，老配置的行为不变（包括用户主动指定的在线 API）；
  * - 其余只自动纳入**本地**供应商：本机模型互为兜底不额外花钱，远程 API 绝不自动切，
  *   否则主模型一次 5xx 可能悄悄产生一笔账单；
- * - worker 角色是子代理专用，不能接主对话；fallback === false 是显式排除；
+ * - worker 角色默认不进链（它是子代理专用的），但**显式勾了 fallback 的可以进** ——
+ *   手上配了好几个 key 时，「主模型 429、切到另一个 key 的便宜模型」是最常见的容灾
+ *   诉求；以前这里无条件跳过 worker，配上这条限制等于把这个能力藏起来了。
+ *   所以白天的 child、半夜的备胎可以是同一条，两件事不冲突；
+ * - fallback === false 是显式排除（优先级高于角色）。
  * - 内置 core 兜底由调用方追加，不在这里管，避免和 CORE_PROVIDER_ID 耦合。
  */
 export function fallbackCandidates(
@@ -85,9 +89,14 @@ export function fallbackCandidates(
   const explicit: ProviderConfig[] = []
   const local: ProviderConfig[] = []
   for (const p of providers) {
-    if (p.id === primaryId || !p.model?.trim() || p.fallback === false || p.role === 'worker') continue
-    if (p.fallback === true) explicit.push(p)
-    else if (isLlamaProvider(p) || isLoopbackUrl(p.baseUrl)) local.push(p)
+    if (p.id === primaryId || !p.model?.trim() || p.fallback === false) continue
+    if (p.fallback === true) {
+      explicit.push(p)
+      continue
+    }
+    // 子智能体不自动成链（远端 API 自动切换会悄悄产生账单），只有显式点过才算
+    if (p.role === 'worker') continue
+    if (isLlamaProvider(p) || isLoopbackUrl(p.baseUrl)) local.push(p)
   }
   return [...explicit, ...local]
 }

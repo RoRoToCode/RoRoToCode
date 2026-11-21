@@ -178,12 +178,24 @@ test('自动派发：故障报障型口语命中 review（带代码语境）', (
   // 15:30 实测漏派的真实原话，以及一整类「东西坏了去修」的说法
   assert.equal(allow('打开 sgf文件后 ，棋子的数量 不对'), 'review')
   assert.equal(allow('sgf文件棋子数量不对'), 'review')
-  assert.equal(allow('棋子数量错了'), null, '无代码语境的报障仍不该派')
   assert.equal(allow('脚本执行后黑子数量不正确'), 'review')
-  assert.equal(allow('这个功能坏了，打不开'), null, '没有代码语境词，防误派')
   assert.equal(allow('ui.py 里这个功能坏了'), 'review')
   assert.equal(allow('棋子的显示不对劲，配置文件里看看'), 'review')
   assert.equal(allow('src/main/board.py 算错了'), 'review')
+  /**
+   * 业务域实体也算代码语境（词表扩充后）。
+   * 「棋子数量错了」不带「文件 / 代码」这类字，但它唯一可能指的实体就是本项目里那套棋盘 ——
+   * 原先把这类说法判成「无代码语境」，15:30 那次漏派正是栽在这里。
+   */
+  assert.equal(allow('棋子数量错了'), 'review')
+  assert.equal(allow('对弈模式下人机走棋不对'), 'review')
+  /**
+   * 桌面端 bug 的主语也算：「这个功能坏了」在编码会话里指的就是正在开发的这个功能。
+   * 早先要求必须出现「文件 / 代码」才派，实测这类报障一律漏派。
+   * 误派风险由「必须同时带故障词」兜住 —— 见下一个用例。
+   */
+  assert.equal(allow('这个功能坏了，打不开'), 'review')
+  assert.equal(allow('软件设置页面打不开'), 'review')
 })
 
 test('自动派发：故障词单独出现不触发（守住代码语境闸门）', () => {
@@ -192,6 +204,9 @@ test('自动派发：故障词单独出现不触发（守住代码语境闸门�
   assert.equal(allow('这个想法错了'), null)
   assert.equal(allow('手机坏了'), null)
   assert.equal(allow('你觉得这个思路对不对，我们该先做哪一块'), null)
+  // 只扩大词表、不乱开口子：单个「棋 / 功能」之外的日常说法仍不派
+  assert.equal(allow('这盘棋下得不对劲'), null, '没命中「棋盘 / 棋子」，只提到棋不算代码语境')
+  assert.equal(allow('这个功能挺好用的'), null, '只有语境词、没有故障词，不该派')
 })
 
 test('自动派发：多文件摸底命中 survey', () => {

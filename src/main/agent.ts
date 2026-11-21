@@ -277,6 +277,14 @@ interface SubCtx {
   approvalPolicy?: 'deny' | 'allow'
   /** 本次生效的审批模式；不传则回落到 config.approvalMode */
   mode?: ApprovalMode
+  /**
+   * 子 agent 的用量回执：子任务烧的是这个会话的同一个额度。
+   *
+   * 以前只有主循环在累 runTokens / dayTokens，子 agent 这条路一个字都不记 ——
+   * 线上并行三路时，界面花费、单次上限、每日配额全按「没花钱」算。
+   * 复用主循环那个闭包，保证两条路记的是同一本账（含 runTokens 与跨天清零）。
+   */
+  addUsage?: (delta: TokenUsage) => Promise<void>
 }
 
 /** 子 agent 的结论要怎么回灌给主 agent：先给一行统计，再给它的总结 */
@@ -1289,9 +1297,14 @@ const CHITCHAT_RE =
 /**
  * 代码语境：派发的价值在「有现成的代码要读」，没这个信号就不派。
  * 从零写一个演示页时派子 agent 只是把一句话拆成一句话 —— 那种活自己写更快。
+ *
+ * 第二批词是「用户报障时其实在说这个项目」的说法：界面 / 功能 / 页面 / 显示 是
+ * 桌面端 bug 的常见主语（「本地模型页面卡住」），对弈 / 人机 / 棋盘 / 棋子 是本项目
+ * 业务域的实体（「棋子数量错了」）。它们都只在同时命中 BROKEN_RE / REVIEW_RE /
+ * SCALE_RE / 长需求之一时才会真的派发，纯提一句「这个功能怎么用」不会被派去查代码。
  */
 const CODE_CTX_RE =
-  /代码|文件|模块|项目|仓库|目录|函数|接口|脚本|配置|报错|异常|测试|依赖|调用|实现|逻辑|src\/|\.(?:ts|tsx|js|jsx|mjs|cjs|py|go|rs|java|kt|json|ya?ml|toml|md)\b|`[^`]+`/i
+  /代码|文件|模块|项目|仓库|目录|函数|接口|脚本|配置|报错|异常|测试|依赖|调用|实现|逻辑|软件|程序|功能|界面|页面|显示|按钮|样式|对弈|人机|棋盘|棋子|src\/|\.(?:ts|tsx|js|jsx|mjs|cjs|py|go|rs|java|kt|json|ya?ml|toml|md)\b|`[^`]+`/i
 /** 审查意图：要的是「检查」，不是「改」 */
 const REVIEW_RE =
   /审查|复查|自查|体检|核对|检查|有没有.{0,6}(?:问题|毛病|bug|漏洞)|看看.{0,8}(?:有没有|是否|问题|毛病|bug|漏洞)|找.{0,6}(?:bug|问题)|对不对|合不合|代码质量|review/i
@@ -1300,9 +1313,12 @@ const REVIEW_RE =
  * 这批词单独看很泛（「不对」「错了」日常也用），所以**绝不单独判定**：
  * delegateHint 里仍要求 CODE_CTX_RE 先命中（有代码语境），才把它当审查信号。
  * 这样「今天心情不对」「这个想法错了」之类不会被误派去查代码。
+ *
+ * 第二批是实测漏判的说法：「跑测试失败」「点了没反应」「卡住不动」「进程停止」——
+ * 它们同样是「东西坏了」，只是没带「不对/坏了」这类字。
  */
 const BROKEN_RE =
-  /不对|不正确|不对劲|错了|坏了|坏掉|出问题|有问题|故障|失效|崩了|崩溃|挂了|用不了|不能用|对不上|不一致|对不齐|显示错误|算错|数量错/i
+  /不对|不正确|不对劲|错了|坏了|坏掉|出问题|出现问题|有问题|故障|失效|崩了|崩溃|挂了|用不了|不能用|打不开|对不上|不一致|对不齐|显示错误|算错|数量错|失败|不运行|不动|卡住|没反应|停止/i
 /** 规模信号：这类活往往要翻很多文件，正是子 agent 擅长的 */
 const SCALE_RE =
   /整个|全部|所有|逐个|每个|全量|跨|多处|多个文件|模块|架构|链路|调用链|流程|全项目|全局|项目里|重构|迁移|梳理|排查/i
@@ -1349,6 +1365,33 @@ export function delegateHint(input: {
    */
   if (BROKEN_RE.test(raw)) return 'review'
   return null
+}
+
+/**
+ * 运行时信号：首句没命中，但模型已经闷头干了好几轮工具 —— 这时候补一次提醒。
+ *
+ * 为什么需要第二道：首句判定只在 step 0 看用户原话。用户常这么开口 ——
+ * 「打开 sgf文件后棋子数量不对」（命中）之后模型自己连读 8 个文件、改 3 处，
+ * 或者开场那句干脆没带故障词（「sgf 有点怪」），于是一整轮 30 多次工具调用
+ * 一次都没派过。这是「该派没派」里最贵的一类：活已经干到一半，上下文全是碎片。
+ *
+ * 判据刻意保守，宁可漏派也不要误派：
+ * - 首句已经提醒过（textTip 非空）就不再补：一句话说两遍，模型会以为它没照做；
+ * - 整轮只补一次（notified latch）：每步都念会让它反复派、反复读同一批文件；
+ * - 只在 step > 0 生效：首句判定是主角，运行时信号不抢它的位；
+ * - 门槛看「真跑过几次工具」而不是步数：一个 read_file 是一步，十个也是。
+ */
+export function runtimeDelegateTip(input: {
+  step: number
+  toolsRun: number
+  threshold: number
+  notified: boolean
+  textTip: DelegateHint | null
+  allowed: boolean
+}): DelegateHint | null {
+  const { step, toolsRun, threshold, notified, textTip, allowed } = input
+  if (!allowed || notified || textTip || step === 0) return null
+  return toolsRun >= threshold ? 'survey' : null
 }
 
 /**
@@ -3044,6 +3087,14 @@ export class AgentEngine {
      * 取一次就够 —— 循环中途注入的续跑 / 验证文字不是用户意图，不能拿来当触发依据。
      */
     const turnText = lastUserText(session)
+    /**
+     * 本轮是否已经派发过提醒：一次性 latch。
+     *
+     * 提醒文案拼在每一步的 tailNote 里重发，但只有在 delegateTip 非空的那一步才真正
+     * 出现。没有 latch 的话，运行时信号（toolsRun 达阈值）会在之后每一步都成立，
+     * 于是模型每步都被念一次「先派个只读子 agent」—— 它会以为一直没派成功而反复派。
+     */
+    let delegateNotified = false
     /** 一次提问最多连跑多少步：开着自动续跑时放宽到 4 倍，但仍有硬上限，防止真死循环 */
     const stepBudget = autoContinue
       ? Math.min(600, Math.max(config.maxSteps, config.maxSteps * 4))
@@ -3266,16 +3317,42 @@ export class AgentEngine {
        * 为什么不能只靠系统提示：派不派活过去完全由模型自己判断，实测连开几个会话
        * task 调用恒为 0，用户手打「你有员工，派活给他」才破冰 —— 能力早就在，
        * 缺的是每轮都成立的触发信号。这里只提醒，派几个、派什么仍由模型决定。
+       *
+       * 两条通道：首句判定（step 0 看用户原话）+ 运行时信号（已动手多轮却还没提醒过）。
+       * 后者是补漏：开场那句没带故障词、但模型随后连读七八个文件时不至于全程不派。
        */
-      const delegateTip =
-        delegateHint({
-          text: turnText,
-          step,
-          hasTask: stepTools.some((t) => t.name === 'task'),
-          enabled: config.autoDelegate !== false,
-          planMode: mode === 'plan',
-          nonInteractive
-        }) ?? null
+      const hasTask = stepTools.some((t) => t.name === 'task')
+      // 先落成局部常量：直接写 `mode !== 'plan'` 会让 TS 把 mode 窄化成非 plan，
+      // 下面再传 planMode 就变成「不可能相等」的类型错误
+      const planMode = mode === 'plan'
+      const delegateAllowed = config.autoDelegate !== false && hasTask && !nonInteractive && !planMode
+      const textTip: DelegateHint | null = delegateAllowed
+        ? delegateHint({
+            text: turnText,
+            step,
+            hasTask,
+            enabled: config.autoDelegate !== false,
+            planMode,
+            nonInteractive
+          })
+        : null
+      /**
+       * 阈值取 6：toolsRun 把读文件、跑验证、写文件都算进去，6 次大致对应
+       * 「读了两三个文件 + 几轮试错」。实测三个真实多文件任务分别用了 34 / 22 / 9 次
+       * 工具调用，6 都覆盖得到；设到 3 会把「改一处 + 跑一次测试」这种小活也判成大规模。
+       */
+      const DELEGATE_AFTER_TOOLS = 6
+      const runtimeTip: DelegateHint | null = runtimeDelegateTip({
+        step,
+        toolsRun,
+        threshold: DELEGATE_AFTER_TOOLS,
+        notified: delegateNotified,
+        textTip,
+        allowed: delegateAllowed
+      })
+      const delegateTip = textTip ?? runtimeTip
+      // 发出即锁：整轮只提醒一次，后续步骤不再念
+      if (delegateTip) delegateNotified = true
       /**
        * 本轮才成立的环境信息（时间 / 钩子 / 验证 / 续跑）：拼在最后一条 user 消息尾部，
        * 不进 system 提示 —— 见 runtimeBlock 上的说明，这是让前缀缓存能命中的前提。
@@ -4001,7 +4078,24 @@ export class AgentEngine {
         instructions: instructionsBlock(instructions) || null,
         nonInteractive,
         approvalPolicy: options?.approvalPolicy,
-        mode
+        mode,
+        /**
+         * 和主链路的记账完全同一条路：落会话、发 usage 事件、进 runTokens、
+         * 累进今日用量。子 agent 花的钱记在它自己用的模型名下（costUsd 已在
+         * subagent.ts 里按 worker 的价算好），不是按主模型的价格估。
+         */
+        addUsage: async (delta) => {
+          try {
+            const total = await store.bumpUsage(session.id, delta)
+            const cost = (total.costUsd ?? 0) > 0 ? total.costUsd : undefined
+            this.emit(session.id, { type: 'usage', usage: { ...total, costUsd: cost }, last: delta })
+          } catch {
+            // 统计失败不能影响子任务
+          }
+          // 写在 try 外面：落库失败也不能让用量闸门漏计，否则上限会失效
+          runTokens += delta.prompt + delta.completion
+          dayTokens = await bumpDayUsage(delta).catch(() => dayTokens + delta.prompt + delta.completion)
+        }
       }
 
       /**
@@ -5213,8 +5307,13 @@ export class AgentEngine {
       void warm
     }
     const pool = plan.pool
-    /** 按忙闲把子任务分派到不同实例（纯函数见 shared/agentpool.ts） */
-    const pickWorker = createSubAgentDispatcher(pool)
+    /**
+     * 按忙闲把子任务分派到不同实例（纯函数见 shared/agentpool.ts）。
+     *
+     * 每批开头会重建一次：分派器内部的 `assigned` 是**批内**计数，
+     * 跨批累积会让第二批看到「上一批已经占满」而误以为没容量。
+     */
+    let pickWorker = createSubAgentDispatcher(pool)
     /**
      * 子代理的上下文预算要按它自己那个模型算，而且要按**服务端真实的**窗口算。
      *
@@ -5367,7 +5466,9 @@ export class AgentEngine {
             mine.add(change.path)
             this.emit(ctx.sessionId, { type: 'file_change', change })
           },
-          onUpdate: (t: SubAgentTask) => this.emit(ctx.sessionId, { type: 'subagent_update', task: t })
+          onUpdate: (t: SubAgentTask) => this.emit(ctx.sessionId, { type: 'subagent_update', task: t }),
+          // 子任务烧的 token 记进本会话的账（含孙 agent、续写那些真请求）
+          onUsage: ctx.addUsage
         }
 
         done = await runSubAgent({
@@ -5520,18 +5621,24 @@ export class AgentEngine {
     }
 
     /**
-     * 一批最多并行几个：跟着「真能接活的实例数」走。
+     * 一批最多并行几个：跟着「真能接活的容量之和」走，而不是「池里几条配置」。
      *
      * 算式只有一份（`laneCount`），系统提示和自动派发文案用的是同一个 ——
      * 以前提示按「配了几个子智能体」说、这里按「池里几个就绪」跑，配了 1 个时
      * 提示教它连写 3 个、这里一次只放 1 个，几路审查排队串行外带全撞限流。
      *
-     * 池里有几个就并行几个；池子空时本地 llama 只有 1 个槽位（多放只会排队 +
-     * 各自重付 prefill），远端 API 保持 3 个。每个实例自己的槽位仍由 gate.ts
-     * 按 baseUrl 单独排队。
+     * 容量按类型给：本地 llama 恒 1（一个进程一个槽，多放只会排队 + 各自重付
+     * prefill），远端默认 3、可用 `provider.lanes` 覆写。所以「云端主模型 + 一条
+     * 便宜的云端子模型」现在是 3 路，而不再因为列表里只有一行就退化成串行。
+     * 每个实例自己的槽位仍由 gate.ts 按 baseUrl 单独排队。
      */
-    const MAX = laneCount(pool.length, isLlamaProvider(ctx.provider))
+    const MAX = laneCount(
+      pool.map((m) => m.provider),
+      ctx.provider
+    )
     for (let i = 0; i < calls.length; i += MAX) {
+      // 批内重新计数：上一批占满的实例在这里不该继续算满
+      pickWorker = createSubAgentDispatcher(pool)
       const settled = await Promise.all(calls.slice(i, i + MAX).map(one))
       for (const r of settled) {
         await this.pushToolResult(ctx, r.call, r.output, r.ok, r.durationMs)

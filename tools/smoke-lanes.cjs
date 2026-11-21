@@ -1,13 +1,14 @@
 /**
  * 端到端验证：并发路数只认一个数（`laneCount`），且刚被限流的 worker 会被跳过。
  *
- * 复现的是真实现场：主模型在云端、只配了 1 个云端 worker。改动前系统提示按
- * 「配了几个」判断，教模型「同一轮连写 2～3 个」，执行层上限却是 1 ——
- * 几路只读审查排队串行，还全撞在同一家限流上。
+ * 复现的是真实现场：主模型在云端、只配了 1 个云端 worker。以前并发上限按
+ * 「池里几条配置」算，于是 1 条云端 worker 被当成只能跑 1 路 —— 几路只读审查
+ * 排队串行，还全撞在同一家限流上。现在按容量算：云端一条默认 3 路，
+ * 提示和执行层的开闸用的是同一个数。
  *
  * 这里跑真引擎 + 两个假服务（主模型正常、worker 恒 429），检查：
- * 1. 首轮发给模型的 system 提示里说的是「只放得下 1 路」，不是「能真正并行」；
- * 2. 自动派发文案也只让派 1 个；
+ * 1. 首轮 system 提示说的是「能真正并行 3 路」，不是「只放得下 1 路」；
+ * 2. 自动派发文案跟着放宽到「2～3 个」；
  * 3. worker 429 后子任务自动回落到主模型，任务仍能完成（不白跑一轮）；
  * 4. 回落之后 workerPool 已把这家标成冷却，下一批活不会再压给它。
  *
@@ -231,10 +232,13 @@ async function main() {
     }
 
     const sys = systemPrompts[0] ?? ''
-    check('system 提示说「只放得下 1 路」', sys.includes('本次同时只放得下 1 路'))
-    check('system 提示不再说「可以真正并行」', !sys.includes('可以真正并行'))
-    check('拆分规则改成「拆成几个 task」而非「一起派出去」', sys.includes('就拆成几个 task 派出去'))
-    check('自动派发文案只让派 1 个', /派 1 个/.test(delegateNotes[0] ?? '') && !/2～3 个/.test(delegateNotes[0] ?? ''))
+    check('1 条云端 worker 按 3 路算（改动前被算成串行）', sys.includes('本次能真正并行 3 路'))
+    check('system 提示不再说「只放得下 1 路」', !sys.includes('本次同时只放得下'))
+    check('拆分规则允许同一轮连写 3 个', sys.includes('同一轮连写 3 个'))
+    check(
+      '自动派发文案跟着放宽（2～3 个而不是 1 个）',
+      /2～3 个/.test(delegateNotes[0] ?? '') && !/派 1 个 `task/.test(delegateNotes[0] ?? '')
+    )
     check('worker 真被打了（不是没派过去）', workerRequests >= 1, `${workerRequests} 次`)
     check('worker 429 后子任务自动回落主模型', childOnMain >= 1)
     check('子任务最终成功收工', subEnd.some((e) => e.task.status === 'ok'), subEnd.map((e) => e.task.status).join(','))

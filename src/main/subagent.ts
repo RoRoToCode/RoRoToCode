@@ -5,8 +5,10 @@ import type {
   FileChange,
   ProviderConfig,
   SubAgentTask,
+  TokenUsage,
   ToolCall
 } from '../shared/types'
+import { estimateCost } from '../shared/pricing'
 import type { ToolSpec } from './tools/spec'
 import { toolSpecs } from './tools/spec'
 import { RAW_ARG_KEY, settleToolArgs } from '../shared/toolargs'
@@ -20,6 +22,7 @@ import type { RiskInfo } from './tools'
 import { loadProjectPermissions } from './permissions'
 import { parseTextToolCalls } from './parse'
 import { recordChange } from './changes'
+import { acquireFileLeases } from './lease'
 import { diffLines, diffStats } from './diff'
 import { runHooks } from './hooks'
 
@@ -221,6 +224,16 @@ export interface SubAgentOptions {
   instructions?: string | null
   /** 这次为什么用/没用工作模型（并行是否生效），随任务一起带给界面 */
   note?: string
+  /**
+   * 用量回执：子 agent 烧的是父会话同一个额度。
+   *
+   * 以前整条子 agent 链路没有任何 usage 处理，只有主循环在累 runTokens / dayTokens。
+   * 后果不是「数字不好看」：界面上的花费、单次运行上限、每日配额、软预警
+   * 全都按「这一轮没花钱」在算 —— 线上并行三路时，报出来的账不到真实值的一半。
+   *
+   * 必须是 await：父会话那边是「读会话文件 → 改 → 写回」，并行几路同时记会互相覆盖。
+   */
+  onUsage?: (delta: TokenUsage) => void | Promise<void>
   /** 需要用户批准时回调；父 agent 用自己的审批弹窗 */
   approve: (
     tool: string,
@@ -278,10 +291,42 @@ export async function runSubAgent(opts: SubAgentOptions): Promise<SubAgentTask> 
   // 嵌套封顶：depth >= 1 的孙 agent 不再拿到 task，最多往下派一层
   const tools = filterSubagentTools(opts.tools, opts.mode, opts.depth ?? 0)
 
+  /**
+   * 把这一次请求的用量记到父会话账上。
+   *
+   * 本地服务不一定给 usage，没有就跳过 —— 不编数字（和主链路同一口径）。
+   * 成本按**这条子任务实际用的模型**算：worker 和主模型价差可以到十倍，
+   * 拿主模型的价去估子 agent，账单会错得离谱。
+   */
+  const billUsage = async (usage?: TokenUsage): Promise<void> => {
+    if (!usage || !(usage.prompt || usage.completion)) return
+    if (!opts.onUsage) return
+    try {
+      await opts.onUsage({ ...usage, costUsd: estimateCost(opts.provider.model, usage) })
+    } catch {
+      // 记账失败不能影响子任务本身
+    }
+  }
+
+  /**
+   * 当前这一轮工具调用持有的写租约（见 main/lease.ts）。
+   *
+   * 放在循环外声明、在 finally 里兜底释放：写入中途抛异常（钩子、快照落库、
+   * LSP 诊断都可能抛）时不能让锁留在表里 —— 一旦泄漏，同批其它子任务改同一个
+   * 文件就会一直等到超时。
+   *
+   * 释放时机选在「下一轮工具调用开始前」而不是紧跟着写完：这样不用把整段
+   * 执行逻辑再包一层 try/finally，行为上只多占住几百毫秒。
+   */
+  let releaseLease: (() => void) | null = null
+
   try {
     for (let step = 0; step < opts.maxSteps; step++) {
       if (opts.signal.aborted) throw new Error('已取消')
       task.steps = step + 1
+      // 上一轮的工具已经做完（快照也落库了），先把锁放掉再开始这一轮
+      releaseLease?.()
+      releaseLease = null
 
       const result = await chat({
         provider: opts.provider,
@@ -306,9 +351,26 @@ export async function runSubAgent(opts: SubAgentOptions): Promise<SubAgentTask> 
           provider: opts.provider,
           messages,
           calls,
-          signal: opts.signal
+          signal: opts.signal,
+          /**
+           * 续写同样是真请求，同样烧 token。主链路把它并进 result.usage 再一起记账，
+           * 子 agent 这里照做 —— 否则「一次写整份文件被截断、续写三轮」这种
+           * 最常见的场景，账上只记了第一轮。
+           */
+          onUsage: (u) => {
+            const cur = result.usage
+            result.usage = {
+              prompt: (cur?.prompt ?? 0) + u.prompt,
+              completion: (cur?.completion ?? 0) + u.completion,
+              cached: (cur?.cached ?? 0) + (u.cached ?? 0) || undefined,
+              promptN: cur?.promptN,
+              promptMs: cur?.promptMs
+            }
+          }
         })
       }
+      // 放在 heal 之后：续写的用量已经并进 result.usage，这里一次记全
+      await billUsage(result.usage)
 
       // 不再调工具 = 它认为做完了，这句话就是总结
       if (!calls.length) {
@@ -390,7 +452,9 @@ export async function runSubAgent(opts: SubAgentOptions): Promise<SubAgentTask> 
             instructions: opts.instructions,
             approve: opts.approve,
             onChange: opts.onChange,
-            onUpdate: opts.onUpdate
+            onUpdate: opts.onUpdate,
+            // 孙 agent 的用量同样要记在父会话账上：它跑的还是同一个额度
+            onUsage: opts.onUsage
           })
           const head = `子任务「${description}」${done.status === 'ok' ? '已完成' : '失败'}（${done.steps} 步 · ${done.tools.length} 次工具调用）`
           const summary = done.status === 'fail' ? `失败原因：${done.error ?? '未知'}` : done.summary
@@ -582,6 +646,39 @@ export async function runSubAgent(opts: SubAgentOptions): Promise<SubAgentTask> 
             // 路径非法：不记快照
           }
         }
+        /**
+         * 写文件先拿锁。
+         *
+         * 一批子任务并行跑时，提示里那句「不要让两个 task 改同一个文件」只是建议 ——
+         * 模型看不到别的子任务在干什么。两路真写到同一个文件，后写的把前一份盖掉，
+         * 而且「改前快照」会串：用户点撤销，撤回来的可能是另一个任务的半成品。
+         * 锁只覆盖写路径，各改各的文件仍然照常并行。
+         */
+        if (targets.length) {
+          try {
+            releaseLease = await acquireFileLeases(targets, { owner: task.id, signal: opts.signal })
+          } catch (err) {
+            messages.push({
+              id: `child-t-${step}-${call.id}`,
+              role: 'tool',
+              content: clip(
+                `[已拦下·文件被占用] ${(err as Error).message}，这次写入没有执行。` +
+                  '换一个文件、或等对方写完再来；不要原样重试同一次写入。'
+              ),
+              toolCallId: call.id,
+              toolName: call.name,
+              toolArgs: call.args,
+              createdAt: Date.now()
+            })
+            task.tools.push({
+              tool: call.name,
+              ok: false,
+              durationMs: Date.now() - started,
+              note: '目标文件被其他子任务占用'
+            })
+            continue
+          }
+        }
         const beforeByTarget = new Map<string, string | null>()
         for (const t of targets) beforeByTarget.set(t, await readOrNull(t))
 
@@ -695,10 +792,65 @@ export async function runSubAgent(opts: SubAgentOptions): Promise<SubAgentTask> 
       opts.onUpdate({ ...task, tools: [...task.tools] })
     }
 
+    /**
+     * 步数用尽时的收尾：撤掉工具，要它用纯文本把已经有的东西交出来。
+     *
+     * 以前这里直接把 status 打成 fail、summary 写成「没有产出总结」——
+     * 它前面读的二十个文件、改的三处代码一个字都不回传，父 agent 只能从头再来一遍。
+     * 30 步跑满时最该做的事恰恰是「把已经知道的倒出来」，所以补一次**不带 tools** 的请求：
+     * 没有可调用的东西，它就只能用文字总结。opencode 在 steps 上限那一步也是这么收的。
+     */
+    const wrapUp = async (): Promise<string> => {
+      if (opts.signal.aborted) return ''
+      try {
+        const next = await chat({
+          provider: opts.provider,
+          messages: [
+            ...trim(messages, opts.budget),
+            {
+              id: 'child-wrap',
+              role: 'user',
+              content:
+                `步数已经用完（${opts.maxSteps} 步），从现在起不能再调用任何工具。` +
+                '用 3-6 句话交代清楚：已经完成了什么、改过哪些文件（写完整相对路径）、' +
+                '还没做完什么、卡在哪里。拿不准的直接说拿不准，不要编造。',
+              createdAt: Date.now()
+            }
+          ],
+          // 空工具表是关键：没有可调的东西，它就只能输出文字
+          tools: [],
+          signal: opts.signal,
+          onText: () => undefined
+        })
+        await billUsage(next.usage)
+        return next.text.trim()
+      } catch {
+        // 收尾请求也失败就退回下面的摘要，至少别再把整轮工作吞掉
+        return ''
+      }
+    }
+
+    /** 收尾也失败时的兜底：把「它做了什么」按工具名统计出来，别只回一句「没有总结」 */
+    const digest = (): string => {
+      const head = `（子任务「${opts.description}」跑了 ${opts.maxSteps} 步仍未给出结论）`
+      if (!task.tools.length) return `${head}，这 ${opts.maxSteps} 步里一次工具都没调成。`
+      const counts = new Map<string, number>()
+      for (const t of task.tools) counts.set(t.tool, (counts.get(t.tool) ?? 0) + 1)
+      const list = [...counts].map(([k, n]) => `${k} ×${n}`).join('、')
+      return `${head}。已执行的工具调用：${list}。改动有没有落到磁盘未知，先 read_file 确认再决定接着做还是重派。`
+    }
+
     if (!task.summary) {
-      task.status = 'fail'
-      task.error = `子 agent 走了 ${opts.maxSteps} 步仍未给出结论`
-      task.summary = `（子任务「${opts.description}」没有产出总结）`
+      const wrap = await wrapUp()
+      if (wrap) {
+        task.status = 'ok'
+        task.summary = `【步数用尽（${opts.maxSteps} 步），以下是收尾总结；没做完的部分需要接着做】\n\n${wrap}`
+        task.note = `${task.note ? `${task.note} · ` : ''}步数用尽，已收尾总结`
+      } else {
+        task.status = 'fail'
+        task.error = `子 agent 走了 ${opts.maxSteps} 步仍未给出结论`
+        task.summary = digest()
+      }
     } else {
       task.status = 'ok'
     }
@@ -706,6 +858,9 @@ export async function runSubAgent(opts: SubAgentOptions): Promise<SubAgentTask> 
     task.status = 'fail'
     task.error = (err as Error).message
     task.summary = `（子任务「${opts.description}」执行失败：${task.error}）`
+  } finally {
+    // 正常收工、失败、被取消、护栏中止都走这里：锁必须归位
+    releaseLease?.()
   }
 
   task.endedAt = Date.now()

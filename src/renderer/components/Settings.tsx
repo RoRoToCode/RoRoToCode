@@ -711,6 +711,47 @@ export function Settings({
     }
   }
 
+  /**
+   * 「备用」开关：主模型失败时要不要切到这条。
+   *
+   * 以前远端模型只有「显式 fallback」一条路，而设置页把这个勾去掉了，运行时
+   * `fallbackCandidates` 又无条件跳过 worker —— 结果是手上配着好几个 key，
+   * 主模型 429 之后却直接掉到本地核心小模型，界面只表现为「回答质量突然变差」。
+   *
+   * 现在子智能体也能勾：白天干活、主模型挂了顶上来，两件事不冲突。
+   * 远端不会因为你「有这条」就自动进链，必须在这里显式点一次 —— 悄悄产生账单
+   * 比切换失败更难查。
+   */
+  async function toggleFallback(p: ProviderConfig) {
+    const cur = draftRef.current
+    if (cur.activeId === p.id || !p.model?.trim()) return
+    const on = p.fallback !== true
+    try {
+      setBusy(true)
+      const next: AppConfig = {
+        ...cur,
+        providers: cur.providers.map((x) =>
+          x.id === p.id ? { ...x, fallback: on ? true : undefined } : x,
+        ),
+      }
+      await onSave(next)
+      setDraft(next)
+      touchedActive.current = false
+      setNote({
+        text: on
+          ? tr('{0} 已设为备用：主模型额度用完 / 连不上时会切到它', {
+              '0': (p.name || p.model || '').trim(),
+            })
+          : tr('{0} 已取消备用', { '0': (p.name || p.model || '').trim() }),
+        kind: 'ok',
+      })
+    } catch (e) {
+      setNote({ text: tr('设置备用失败：{0}', { '0': (e as Error).message }), kind: 'err' })
+    } finally {
+      setBusy(false)
+    }
+  }
+
   /** 顶部「刷新」：重扫本地模型 + 各供应商状态，任何标签页都可用 */
   async function refreshAll() {
     setRefreshing(true)
@@ -1359,6 +1400,33 @@ export function Settings({
                         </button>
                       </span>
                       {/**
+                       * 备用：主模型额度用完 / 连不上时切到这条。
+                       *
+                       * 单独一段而不是并进「主 / 子」：那两段说的是「平时谁干活」，
+                       * 这一段说的是「出事时谁来顶」，语义不同，混在一起会让人以为
+                       * 只能二选一。子智能体同样可以当备胎 —— 多 key 容灾就靠它。
+                       */}
+                      {!isMain && (
+                        <span className="role-seg" role="group" aria-label={tr('备用')}>
+                          <button
+                            type="button"
+                            className={`role-seg-btn${p.fallback === true ? ' on' : ''}`}
+                            disabled={!p.model || busy}
+                            title={
+                              p.fallback === true
+                                ? tr('已是备用：主模型报错时会自动切到这条（可以同时是子智能体）')
+                                : tr('设为备用：主模型额度用完 / 连不上时切到这条，即使它是子智能体')
+                            }
+                            onClick={(e) => {
+                              e.stopPropagation()
+                              void toggleFallback(p)
+                            }}
+                          >
+                            {tr('备')}
+                          </button>
+                        </span>
+                      )}
+                      {/**
                        * 这个按钮就是这条模型（这条本地服务）唯一的开关：
                        * - 没跑 → 「启动」（顺带设为当前使用，因为启动就等于要用它）
                        * - 在跑 → 「停止」（停服务、释放显存）
@@ -1518,6 +1586,38 @@ export function Settings({
                               }
                             />
                           </div>
+                          {/**
+                           * 并行路数：这条配置能**同时**接几个子任务。
+                           *
+                           * 只对云端开放：本地 llama 一次只能跑一个请求，填了也不生效
+                           * （`capacityOf` 直接按 1 算），摆个改不动的数字只会误导。
+                           * 留空 = 默认 3，和「没配子智能体时云端能跑 3 路」的老行为一致；
+                           * 限流严格的供应商可以填 1 压回串行。
+                           */}
+                          {!isLlamaProvider(p) && (
+                            <div className="field">
+                              <label
+                                title={tr(
+                                  '这条配置能同时跑几个子任务。留空默认 3；限流严格的供应商可以填 1 压回串行。总路数上限 8。'
+                                )}
+                              >
+                                {tr('并行路数')}
+                              </label>
+                              <input
+                                type="number"
+                                min={1}
+                                max={8}
+                                value={p.lanes ?? ''}
+                                placeholder={tr('留空默认 3')}
+                                onChange={(e) => {
+                                  const v = Math.round(Number(e.target.value))
+                                  patchProvider(p.id, {
+                                    lanes: v >= 1 ? Math.min(8, v) : undefined,
+                                  })
+                                }}
+                              />
+                            </div>
+                          )}
                           {/**
                            * 采样参数（top_p / repeat_penalty）与 JSON 输出格式不再暴露：
                            * 留空即由服务端按模型给默认值，程序不替服务端做主。

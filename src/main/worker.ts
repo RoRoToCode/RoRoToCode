@@ -6,6 +6,7 @@ import type {
 } from '../shared/types'
 import { isLlamaProvider } from '../shared/providers'
 import {
+  capacityOf,
   describeIsolation,
   laneCount,
   pickSubAgentPool,
@@ -113,20 +114,27 @@ export async function parallelLanes(main: ProviderConfig, config: AppConfig): Pr
   const key = [
     main.id,
     main.model ?? '',
-    ...config.providers.map((p) => `${p.id}:${p.role ?? ''}:${p.model ?? ''}`)
+    main.lanes ?? '',
+    ...config.providers.map((p) => `${p.id}:${p.role ?? ''}:${p.model ?? ''}:${p.lanes ?? ''}`)
   ].join('|')
   const now = Date.now()
   if (laneMemo && laneMemo.key === key && now - laneMemo.at < LANE_TTL_MS) return laneMemo.lanes
   const lines = await workerPool(main, config).catch(() => null)
-  const lanes = laneCount(lines?.pool.length ?? 0, isLlamaProvider(main))
+  const lanes = laneCount(
+    lines?.pool.map((m) => m.provider) ?? [],
+    main
+  )
   laneMemo = { key, at: now, lanes }
   return lanes
 }
 
-/** 人能看懂的池结论：没配 / 全部不可用 / 几条就绪，都说清楚 */
-function poolReason(r: WorkerPoolResult): string {
+/** 人能看懂的池结论：没配 / 全部不可用 / 几条就绪 / 最多几路，都说清楚 */
+function poolReason(r: WorkerPoolResult, main: ProviderConfig): string {
   if (r.configuredCount === 0) {
-    return '没有子智能体（在「④ 模型列表」把模型设为「子」才生效），子代理沿用当前模型'
+    const lanes = capacityOf(main)
+    return lanes > 1
+      ? `没有子智能体（在「④ 模型列表」把模型设为「子」才生效），子代理沿用当前模型，最多同时跑 ${lanes} 路`
+      : '没有子智能体（在「④ 模型列表」把模型设为「子」才生效），子代理沿用当前模型'
   }
   if (r.pool.length === 0) {
     const why = r.skipped[0]?.reason ?? '子智能体都不可用'
@@ -135,7 +143,19 @@ function poolReason(r: WorkerPoolResult): string {
     }
     return `子智能体 ${r.configuredCount} 个都不可用：${why}。本次用主模型`
   }
-  if (r.configuredCount === 1) return r.pool[0].reason
+  const lanes = laneCount(
+    r.pool.map((m) => m.provider),
+    main
+  )
+  /**
+   * 把路数直接写进这句话。
+   *
+   * 「就绪 3 个」和「最多同时跑 3 路」在云端是两件事：一个 key 配一条也能跑 3 路，
+   * 四条配置各算 3 路却会被总上限截到 8。用户看子任务卡片时应该一眼知道
+   * 到底几路是真并行，而不是自己按条数猜。
+   */
+  const laneNote = lanes > 1 ? `，最多同时跑 ${lanes} 路` : '，串行执行'
+  if (r.configuredCount === 1) return `${r.pool[0].reason}${laneNote}`
 
   const cards = r.pool
     .slice(0, 4)
@@ -143,7 +163,7 @@ function poolReason(r: WorkerPoolResult): string {
     .join('、')
   const more = r.pool.length > 4 ? ` 等 ${r.pool.length} 张卡` : ''
   const skipped = r.skipped.length ? `；${r.skipped.length} 个暂不可用` : ''
-  return `子智能体：${r.pool.length}/${r.configuredCount} 个就绪（${cards}${more}），子任务按忙闲分派${skipped}`
+  return `子智能体：${r.pool.length}/${r.configuredCount} 个就绪（${cards}${more}）${laneNote}，子任务按忙闲分派${skipped}`
 }
 
 /**
@@ -162,7 +182,7 @@ export async function workerPlan(
     isolation: head?.isolation ?? 'none',
     parallel: r.pool.length > 0,
     ready: r.pool.length > 0,
-    reason: poolReason(r),
+    reason: poolReason(r, main),
     pool: r.pool,
     skipped: r.skipped,
     configuredCount: r.configuredCount

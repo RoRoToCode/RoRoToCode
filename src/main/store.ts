@@ -465,8 +465,19 @@ export async function persist(session: Session): Promise<void> {
   await fs.rename(tmp, fileOf(session.id))
 }
 
-/** 累加一次调用的用量，返回累计值（会话标题栏 / 状态栏显示用） */
-export async function bumpUsage(id: string, delta: TokenUsage): Promise<TokenUsage> {
+/**
+ * 同一会话的用量累加必须排队。
+ *
+ * bumpUsage 是「读整份会话文件 → 加一笔 → 写回」，不是原子操作。以前只有主循环
+ * 调它，天然串行；现在并行三路子 agent 也各自记账（subagent.ts 的 onUsage），
+ * 三个同时读到同一份文件就会后写覆盖前写 —— 表现是「明明派了三路，账上只有一路」，
+ * 比不记账更糟：数字看着有，但偏小且无从察觉。
+ *
+ * 用 promise 链做会话级互斥：同会话串行，不同会话互不影响。
+ */
+const usageQueue = new Map<string, Promise<void>>()
+
+async function bumpUsageNow(id: string, delta: TokenUsage): Promise<TokenUsage> {
   const session = await loadSession(id)
   const cur = session.usage ?? { prompt: 0, completion: 0 }
   const next: TokenUsage = {
@@ -478,6 +489,24 @@ export async function bumpUsage(id: string, delta: TokenUsage): Promise<TokenUsa
   session.usage = next
   await persist(session)
   return next
+}
+
+/** 累加一次调用的用量，返回累计值（会话标题栏 / 状态栏显示用） */
+export async function bumpUsage(id: string, delta: TokenUsage): Promise<TokenUsage> {
+  const prev = usageQueue.get(id) ?? Promise.resolve()
+  const run = prev.then(() => bumpUsageNow(id, delta))
+  // 尾指针永远不 reject：某一笔失败不该把后续记账一起堵死
+  const tail = run.then(
+    () => undefined,
+    () => undefined
+  )
+  usageQueue.set(id, tail)
+  try {
+    return await run
+  } finally {
+    // 后面没人排队了才清理，避免 map 随会话数无限增长
+    if (usageQueue.get(id) === tail) usageQueue.delete(id)
+  }
 }
 
 /** 从某条消息起全部丢掉（重新生成 / 编辑重发用） */

@@ -35,19 +35,43 @@ export interface SubAgentPick {
   skipped: Array<{ provider: ProviderConfig; reason: string }>
 }
 
+/** 远端 API 默认能同时接几路子任务 */
+export const DEFAULT_REMOTE_LANES = 3
+/** 单条配置的车道上限：再多就是在拿同一家的限流赌运气 */
+export const MAX_LANES_PER_PROVIDER = 8
+/** 一次派活的总路数上限：防止模型一次拆出十几路把闸门塞满 */
+export const MAX_LANES = 8
+
 /**
- * 本次真能同时跑几路子任务。
+ * 一条配置能同时接几个子任务。
+ *
+ * 本地 llama 恒 1：一个 llama-server 只有一个推理槽，多开只会排队 + 各自重付 prefill，
+ * 而且同一块卡上同时加载两个还会互相顶掉。
+ * 远端按 `lanes`，留空用 3 —— 这就是改动前「没配 worker 时的云端回落值」，
+ * 所以不填 `lanes` 的老配置行为不变。
+ */
+export function capacityOf(p: ProviderConfig): number {
+  if (isLlamaProvider(p)) return 1
+  const n = Math.round(Number(p.lanes) || 0)
+  if (n <= 0) return DEFAULT_REMOTE_LANES
+  return Math.min(MAX_LANES_PER_PROVIDER, n)
+}
+
+/**
+ * 本次真能同时跑几路子任务 = 各成员车道数之和；池子空时就是主模型自己的车道数。
  *
  * 这个数有三个消费者：系统提示里的拆分规则、自动派发文案、`runTaskBatch` 的并发上限。
  * 以前三处各算各的 —— 提示看「配置里标了几个子」，执行看「池里几个就绪」——
  * 配了 1 个 worker 时提示教它「连写 2～3 个」、执行上限却是 1，几路只读审查排队串行，
  * 还全撞在同一家限流上。现在算式只此一份，三处都从这儿取。
  *
- * 算式沿用执行层原来那条（它本来就是对的）：池里有几个就并行几个；没池子时
- * 本地单槽只能 1 路、远端 API 保持 3 路。上限 8 是防止一次派出十几路把闸门塞满。
+ * 改成「按容量求和」而不是「数条目」，修的是云端那半：一个 key 能接多个请求，
+ * 不该因为列表里只有一行就被算成串行。
  */
-export function laneCount(poolSize: number, mainIsLocal: boolean): number {
-  return Math.min(8, Math.max(1, poolSize || (mainIsLocal ? 1 : 3)))
+export function laneCount(members: ProviderConfig[], main: ProviderConfig): number {
+  const list = members.length ? members : [main]
+  const total = list.reduce((n, p) => n + capacityOf(p), 0)
+  return Math.min(MAX_LANES, Math.max(1, total))
 }
 
 /**
@@ -198,27 +222,41 @@ export interface DispatchableWorker {
 }
 
 /**
- * 一批子任务的分派器：每次返回「当前最闲」的一条实例。
+ * 一批子任务的分派器：每次返回「当前最闲、且还没满员」的一条实例。
  *
  * `load` 只是派活那一刻的快照，本批刚分出去的任务还没进闸门，所以用
  * `assigned` 补上这一批已分给它的数量。两者之和最小的优先，平手时自然轮转 ——
  * 否则一批 3 个子任务会全落到配置里的第一条，第二条依旧白占显存。
+ *
+ * 满员判断按 `capacityOf` 来：本地恒 1（所以照旧一人一个），远端默认 3。
+ * 少了这道判断，「本地 1 条 + 云端 1 条」这种混合池会按忙闲把活平均分下去 ——
+ * 本地那条明明只有一个推理槽，却拿到两个任务，第二个只能在闸门里空等，
+ * 让「几路并行」这个数名不副实。
+ *
+ * 分派器是**每批新建**的（调用方在每批开头重建）：`assigned` 是批内计数，
+ * 跨批累积会让第二批看到「上一批已经占满」而误判没容量。
  */
 export function createSubAgentDispatcher<T extends DispatchableWorker>(
-  pool: T[]
+  pool: T[],
+  capacity: (p: ProviderConfig) => number = capacityOf
 ): () => T | null {
   const assigned = new Map<string, number>()
   return () => {
     if (!pool.length) return null
-    let best = pool[0]
+    let best: T | null = null
     let bestScore = Infinity
     for (const m of pool) {
-      const score = m.load + (assigned.get(m.provider.id) ?? 0)
+      const mine = assigned.get(m.provider.id) ?? 0
+      const cap = capacity(m.provider)
+      // 已经排满的这条不再接活；全部满员时返回 null，本批剩下的等下一批
+      if (m.load + mine >= cap) continue
+      const score = m.load + mine
       if (score < bestScore) {
         bestScore = score
         best = m
       }
     }
+    if (!best) return null
     assigned.set(best.provider.id, (assigned.get(best.provider.id) ?? 0) + 1)
     return best
   }

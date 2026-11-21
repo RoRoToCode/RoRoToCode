@@ -127,15 +127,17 @@ test('保活：没标「子」的本地实例不参与，也不会被整池拖�
 })
 
 test('分派：按忙闲摊平，一批子任务不会全落在第一条', () => {
-  const m = main()
   const [w1, w2] = subs('CUDA1', 'CUDA2')
   assert.equal(createSubAgentDispatcher([])(), null)
   const pick = createSubAgentDispatcher([
     { provider: w1, load: 0 },
     { provider: w2, load: 0 }
   ])
-  const seq = [pick(), pick(), pick(), pick()].map((x) => x.provider.id)
-  assert.deepEqual(seq, ['w1', 'w2', 'w1', 'w2'])
+  // 两个本地实例各只有 1 个推理槽：前两路摊平，第三路起就没有容量了
+  // （执行层按 laneCount=2 分批，不会真的派出第三路；这里守的是分派器自己也不超卖）
+  const seq = [pick(), pick()].map((x) => x.provider.id)
+  assert.deepEqual(seq, ['w1', 'w2'])
+  assert.equal(pick(), null, '两条本地实例都占满后不能再分派')
 })
 
 test('分派：忙的那条让位给闲的', () => {

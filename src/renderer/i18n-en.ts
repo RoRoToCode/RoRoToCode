@@ -682,6 +682,10 @@ export const EN: Record<string, string> = {
   "自动压缩": "Auto-compress",
   "自动压缩早期对话": "Auto-compress earlier messages",
   "并发槽位": "Parallel slots",
+  "并行路数": "Parallel lanes",
+  "留空默认 3": "Defaults to 3",
+  "这条配置能同时跑几个子任务。留空默认 3；限流严格的供应商可以填 1 压回串行。总路数上限 8。":
+    "How many subtasks this entry can run at once. Blank = 3; set 1 for strict rate-limited providers. Total capped at 8.",
   "{0} 个槽位": "{0} slots",
   "交给 llama.cpp 按可用显存决定": "Let llama.cpp decide from free VRAM",
   "llama.cpp 同时处理几个请求。子代理并行时调 2 以上；不改就按显存自动。": "Parallel requests llama.cpp handles. Use 2+ for parallel sub-agents; Auto fits VRAM.",
