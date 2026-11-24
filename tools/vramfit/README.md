@@ -311,7 +311,7 @@ tok/s ≈ 带宽(GB/s) × 效率 ÷ 权重体积(GB)
 | 情况 | 去哪 |
 |---|---|
 | 算错 / 崩了 / 模型认不出来 | [GitHub Issues](https://github.com/RoRoToCode/vramfit/issues) |
-| 安全问题 / 商用合作 | <su@roroto.com>（安全别开 Issue） |
+| 安全问题 / 商用合作 | <RoRoToCode@gmail.com>（安全别开 Issue） |
 | 想自己改 | [CONTRIBUTING.md](CONTRIBUTING.md) |
 
 提 Issue 带上三样：模型链接、显卡型号和显存、`node check.mjs --about` 的输出。

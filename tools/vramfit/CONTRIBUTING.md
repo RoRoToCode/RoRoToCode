@@ -124,7 +124,7 @@ npm publish
 
 - 不确定某个方向该不该做（比如「要不要支持 safetensors」），先开个
   [Issue](https://github.com/RoRoToCode/vramfit/issues) 聊，别先写一版再被拒。
-- 发现安全问题，发邮件到 <su@roroto.com>，不要公开开 Issue。
+- 发现安全问题，发邮件到 <RoRoToCode@gmail.com>，不要公开开 Issue。
 - 觉得用法没说清楚，也是 Issue —— 那是文档的问题，不是你的问题。
 
 ## 许可

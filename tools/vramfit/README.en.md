@@ -312,7 +312,7 @@ So:
 | Case | Where |
 |---|---|
 | Wrong result / crash / unrecognized model | [GitHub Issues](https://github.com/RoRoToCode/vramfit/issues) |
-| Security / commercial use | <su@roroto.com> (please don't file a security issue) |
+| Security / commercial use | <RoRoToCode@gmail.com> (please don't file a security issue) |
 | Want to contribute | [CONTRIBUTING.md](CONTRIBUTING.md) |
 
 Include three things: the model link, your GPU and VRAM, and the output of `node check.mjs --about`.

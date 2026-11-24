@@ -12,7 +12,7 @@ type: software
 authors:
   - name: "RoRoToCode"
     website: "https://www.roroto.com"
-    email: "su@roroto.com"
+    email: "RoRoToCode@gmail.com"
 repository-code: "https://github.com/RoRoToCode/vramfit"
 url: "https://www.roroto.com/tools/vramfit/"
 license: MIT
