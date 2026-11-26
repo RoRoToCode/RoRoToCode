@@ -196,6 +196,8 @@ agent 工具调用与子代理并行、diff 预览与逐块审阅、计划模式
 
 `npm test` 463 项全过，`npm run typecheck` 与 `npm run lint` 零报错；`.github/workflows/ci.yml` 在每次 push / PR 上固化这三道门（Windows 跑全量，macOS / Linux 跑类型检查与 lint）。测试数随提交变化，以本地实跑为准。
 
+**联系：** [RoRoToCode@gmail.com](mailto:RoRoToCode@gmail.com)
+
 ## 许可与第三方组件
 
 本项目源码为 **MIT**（见 `LICENSE`）。运行时会下载或依赖不属于本项目的组件，各自适用其条款：[llama.cpp](https://github.com/ggml-org/llama.cpp)（MIT）、NVIDIA CUDA / cuBLAS / cudart（NVIDIA 专有许可）、LLVM OpenMP（Apache-2.0 WITH LLVM-exception）、以及每个 GGUF 模型自身的模型许可。**本源码仓库不包含这些二进制与模型文件**；若通过 Releases 获取便携包，请一并遵守上述条款。
